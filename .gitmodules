@@ -1,0 +1,24 @@
+[submodule "cgbn"]
+	path = cgbn
+	url = https://github.com/cmpute/cgbn
+	branch = perf-min
+[submodule "gmp-ecm"]
+	path = gmp-ecm
+	url = https://github.com/cmpute/gmp-ecm
+	branch = perf-min
+[submodule "gpuecm2"]
+	path = gpuecm2
+	url = https://github.com/ebranger/gpuecm2
+	branch = main
+[submodule "cuda-mpqs"]
+	path = cuda-mpqs
+	url = https://github.com/drjanosch42/cuda-mpqs
+	branch = main
+[submodule "cuda-sieve"]
+	path = cuda-sieve
+	url = https://github.com/kyleaskine/cuda-sieve
+	branch = main
+[submodule "msieve-cuda"]
+	path = msieve-cuda
+	url = https://github.com/cmpute/msieve-cuda/
+	branch = msieve-lacuda-nfsathome
