@@ -10,3 +10,12 @@ venv/
 /dist/
 /bin/
 *.log
+
+# local agent config
+.zcodeignore
+
+# benchmark run artifacts (multi-GB relation files, logs); keep the
+# reproducible inputs and results JSONs only
+benchmarks/*
+!benchmarks/numbers.json
+!benchmarks/results.json
