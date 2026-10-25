@@ -13,12 +13,12 @@ from yagfu.params import (
 
 def test_mpqs_lp1():
     assert mpqs_lp1_bound(70) is None
-    assert mpqs_lp1_bound(75) is None
+    assert mpqs_lp1_bound(79) is None
+    assert mpqs_lp1_bound(80) == 150_000_000
     assert mpqs_lp1_bound(85) == 150_000_000
-    assert mpqs_lp1_bound(95) == 300_000_000
+    assert mpqs_lp1_bound(89) == 150_000_000
+    assert mpqs_lp1_bound(90) == 300_000_000
     assert mpqs_lp1_bound(110) == 300_000_000
-    v = mpqs_lp1_bound(90)
-    assert 150_000_000 < v <= 300_000_000
 
 
 def test_nfs_params_anchors_exact():

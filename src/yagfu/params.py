@@ -8,27 +8,23 @@ relation target anyway.
 from __future__ import annotations
 
 # --------------------------------------------------------------------------
-# cuda-mpqs (SIQS): single-large-prime variant bound.  The user guide says
-# "always enable large primes for inputs > 80 digits, starting bound
-# 10*F..100*F"; below ~75 digits the plain 2LP-free variant wins.
+# cuda-mpqs (SIQS): single-large-prime variant bound.
+#
+# The upstream README warns "single large prime below ~85 digits causes
+# 100% sqrt failure", but on this build (1.0.8, git b1a9c45) LP1=150M
+# measures fine — and faster — down to c76 (c80: 5.8s vs 7.4s without).
+# We enable it from 80 digits, which matches the bench_factor.py
+# measurement points (80: 150M, 90/100: 300M) and keeps a margin below
+# the smallest verified size.
 # --------------------------------------------------------------------------
-
-_MPQS_LP1_ANCHORS = ((75, 0), (85, 150_000_000), (95, 300_000_000), (1 << 30, 300_000_000))
 
 
 def mpqs_lp1_bound(digits: int) -> int | None:
-    prev_d, prev_v = _MPQS_LP1_ANCHORS[0]
-    for d, v in _MPQS_LP1_ANCHORS[1:]:
-        if digits <= d:
-            if prev_v == 0 and v == 0:
-                return None
-            if prev_v == 0:
-                # linear ramp from the point where LP1 first turns on
-                return None if digits <= prev_d else int(v)
-            t = (digits - prev_d) / (d - prev_d)
-            return int(prev_v + t * (v - prev_v))
-        prev_d, prev_v = d, v
-    return _MPQS_LP1_ANCHORS[-1][1]
+    if digits < 80:
+        return None
+    if digits < 90:
+        return 150_000_000
+    return 300_000_000
 
 
 # --------------------------------------------------------------------------
