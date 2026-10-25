@@ -149,9 +149,13 @@ class Engine:
 
     # ------------------------------------------------------------- pipeline
 
-    def _factor_rec(self, m: int, wd: Path, res: FactorResult,
-                    depth: int) -> None:
-        """Factor composite m (> 1); primes accumulate into res.factors."""
+    def _factor_rec(self, m: int, wd: Path, res: FactorResult, depth: int,
+                    ledger: EcmLedger | None = None) -> None:
+        """Factor composite m (> 1); primes accumulate into res.factors.
+
+        `ledger` pre-seeds the ECM work ledger — curves run on an ancestor
+        number count for its cofactors, so a re-plan after an overlap split
+        continues from the work already spent instead of re-climbing."""
         ctx = self.ctx
         if m == 1:
             return
@@ -214,7 +218,8 @@ class Engine:
         ctx.check_deadline()
 
         # -- GPU ECM ladder (+ background NFS polyselect when NFS-bound) --
-        ledger = EcmLedger()
+        if ledger is None:
+            ledger = EcmLedger()
         job = self._maybe_start_poly(m, wd)
         try:
             if ctx.no_ecm:
@@ -229,7 +234,7 @@ class Engine:
                 if m != orig:
                     # split during the pretest: the polyselect (if any) was
                     # for the original number — drop it, re-plan the cofactor
-                    self._replan_after_split(job, m, wd, res, depth)
+                    self._replan_after_split(job, m, wd, res, depth, ledger)
                     return
                 if job is not None and job.running():
                     t = time.monotonic()
@@ -238,7 +243,7 @@ class Engine:
                     if self._ecm_done(m, res):
                         return
                     if m != orig:
-                        self._replan_after_split(job, m, wd, res, depth)
+                        self._replan_after_split(job, m, wd, res, depth, ledger)
                         return
             ctx.check_deadline()
 
@@ -283,14 +288,20 @@ class Engine:
         return False
 
     def _replan_after_split(self, job, cofactor: int, wd: Path,
-                            res: FactorResult, depth: int) -> None:
+                            res: FactorResult, depth: int,
+                            ledger: EcmLedger) -> None:
         """ECM split the number while background polyselect was running:
         that polynomial was for the original number, so drop it and re-plan
-        the (smaller) cofactor from scratch."""
+        the (smaller) cofactor — keeping the ECM ledger, since curves run
+        on a number count for its cofactors, and letting the cofactor's own
+        (smaller, digit-based) polyselect budget apply."""
+        ctx = self.ctx
         if job is not None:
+            ctx.log("nfs: discarding background polyselect "
+                    "(number was split by ECM)")
             job.cancel()
         if cofactor > 1:
-            self._factor_rec(cofactor, wd, res, depth + 1)
+            self._factor_rec(cofactor, wd, res, depth + 1, ledger)
 
     def _poly_overlap_ecm(self, m: int, wd: Path, res: FactorResult,
                           depth: int, ledger: EcmLedger, job) -> int:

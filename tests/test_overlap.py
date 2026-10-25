@@ -129,6 +129,30 @@ def test_overlap_split_during_ladder_replans(monkeypatch, tmp_path):
     assert job.cancelled >= 1          # poly dropped before re-planning
 
 
+def test_replan_carries_ledger_and_logs_discard(monkeypatch, tmp_path,
+                                                capsys):
+    """A bonus-window split must (a) log that the polyselect is discarded,
+    (b) hand the ECM ledger to the re-planned cofactor so it does not
+    re-climb levels already paid for."""
+    job = FakeJob(polls=5)
+    calls = _patch(monkeypatch, job, found_on={3})   # P1 found in bonus
+
+    started = []
+
+    def fake_start(self, m, wd):
+        started.append(m)
+        return job if len(started) == 1 else None   # cofactor: no poly job
+
+    monkeypatch.setattr(Engine, "_maybe_start_poly", fake_start)
+    eng = Engine(RunContext(xover=60))
+    res = eng.factor(N, tmp_path)
+    assert res.complete, res.error
+    assert len(calls["b1"]) == 3        # original ladder + one bonus call;
+                                        # the cofactor inherited the ledger
+    assert job.cancelled >= 1
+    assert "discarding background polyselect" in capsys.readouterr().err
+
+
 def test_overlap_keyboard_interrupt_cancels_job(monkeypatch, tmp_path):
     job = FakeJob(polls=5)
     _patch(monkeypatch, job, fail_calls={3})
