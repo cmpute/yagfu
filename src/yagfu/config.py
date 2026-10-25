@@ -56,9 +56,14 @@ class RunContext:
             raise TimeoutError(f"per-number timeout of {self.timeout_s:.0f}s exceeded")
 
 
-def cleanup_workdir(ctx: RunContext, wd: Path, ok: bool) -> None:
-    """Remove a per-number workdir unless kept or a failure needs it."""
-    if ctx.keep_workdir or not ok:
+def cleanup_workdir(ctx: RunContext, wd: Path, keep: bool) -> None:
+    """Remove a per-number workdir.
+
+    Scratch is scratch: a number that finished — successfully or not —
+    always cleans up; the workdir is kept only when the run was interrupted
+    (post-mortem material) or --keep was given.
+    """
+    if ctx.keep_workdir or keep:
         return
     if wd.exists():
         shutil.rmtree(wd, ignore_errors=True)

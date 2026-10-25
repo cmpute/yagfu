@@ -105,6 +105,7 @@ class EcmRunResult:
     wall_s: float = 0.0
     stage1_s: float = 0.0
     stage2_s: float = 0.0
+    b2: int | None = None            # effective stage-2 B2 (GMP-ECM default)
     error: str | None = None
 
 
@@ -138,9 +139,39 @@ def _stage1(n: int, b1: int, curves: int, ctx: RunContext, wd: Path,
     return rc, factors, ran, wall, None
 
 
+def parse_stage2_log(log: str, b1: int, n: int
+                     ) -> tuple[dict[int, EcmProvenance], int | None]:
+    """(factors, effective B2) from a gpuecm2 -v log for n at B1.
+
+    Every curve prints a ``Using B1=..., B2=..., sigma=3:X`` header before
+    its result, so a factor's sigma is the most recent header's.  The first
+    header's B2 is the effective default B2 for this B1 (all curves share
+    it unless -maxmem forced different parameters).
+    """
+    factors: dict[int, EcmProvenance] = {}
+    sigma = b2 = None
+    b2_used = None
+    for line in log.splitlines():
+        m = _RE_STEP2_HDR.search(line)
+        if m:
+            b2 = int(m.group(2))
+            if b2_used is None:
+                b2_used = b2
+            sigma = int(m.group(4)) if m.group(4) else None
+            continue
+        m = _RE_STEP2_FACTOR.search(line)
+        if m:
+            f = int(m.group(2))
+            if f != n:  # "found the input number" is not a factorization
+                factors.setdefault(f, EcmProvenance(
+                    b1=b1, stage=int(m.group(1)), sigma=sigma, b2=b2))
+    return factors, b2_used
+
+
 def _stage2(n: int, b1: int, res_path: Path, ctx: RunContext, wd: Path,
-            tag: str, maxmem: int | None) -> tuple[dict[int, EcmProvenance], float, str | None]:
-    """gpuecm2 on the saved residues; returns (factors, wall, error)."""
+            tag: str, maxmem: int | None
+            ) -> tuple[dict[int, EcmProvenance], float, str | None, int | None]:
+    """gpuecm2 on the saved residues; returns (factors, wall, error, b2)."""
     g2 = find_bin("gpuecm2", ctx.bin_dir)
     log_path = wd / f"ecm-{tag}.stage2.log"
     cmd = [g2, "-v"]
@@ -151,29 +182,16 @@ def _stage2(n: int, b1: int, res_path: Path, ctx: RunContext, wd: Path,
     try:
         rc, _ = run_cmd(cmd, wd, log_path, timeout=max(600, 4 * 86400))
     except Exception as e:  # noqa: BLE001
-        return {}, time.monotonic() - t0, f"gpuecm2 failed to run: {e!r}"
+        return {}, time.monotonic() - t0, f"gpuecm2 failed to run: {e!r}", None
     wall = time.monotonic() - t0
     log = read_log(log_path)
 
     if _RE_UNSUPPORTED.search(log):
         raise EcmUnsupported(log.strip().splitlines()[-1])
 
-    factors: dict[int, EcmProvenance] = {}
-    sigma = b2 = None
-    for line in log.splitlines():
-        m = _RE_STEP2_HDR.search(line)
-        if m:
-            b2 = int(m.group(2))
-            sigma = int(m.group(4)) if m.group(4) else None
-            continue
-        m = _RE_STEP2_FACTOR.search(line)
-        if m:
-            f = int(m.group(2))
-            if f != n:  # "found the input number" is not a factorization
-                factors.setdefault(f, EcmProvenance(
-                    b1=b1, stage=int(m.group(1)), sigma=sigma, b2=b2))
+    factors, b2 = parse_stage2_log(log, b1, n)
     err = None if rc in (0, 2, 6, 8, 10, 14) else f"gpuecm2 rc={rc}"
-    return factors, wall, err
+    return factors, wall, err, b2
 
 
 def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
@@ -209,12 +227,14 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
         res_path = wd / f"ecm-{tag}.{inv}.residues"
         if not res_path.exists() or count_lines(res_path) == 0:
             return out  # no residues: nothing to resume
-        facts2, wall2, err2 = _stage2(n, b1, res_path, ctx, wd, f"{tag}.{inv}",
-                                      maxmem)
+        facts2, wall2, err2, b2 = _stage2(n, b1, res_path, ctx, wd,
+                                          f"{tag}.{inv}", maxmem)
         out.stage2_s += wall2
         if err2:
             out.error = err2
             return out
+        if b2 is not None and out.b2 is None:
+            out.b2 = b2
         out.factors.update({f: p for f, p in facts2.items() if n % f == 0})
         done += ran
     out.wall_s = out.stage1_s + out.stage2_s

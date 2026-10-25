@@ -41,9 +41,12 @@ the first ECM batch costs ~0.4 s and covers more ground than any of it.
 `ecm_data_param3` curve table (the GPU forces parametrization 3, so that — not the
 param-0 table — is the right one here). The achieved depth is `t[i-1] + 5·s[i]`
 for the first incomplete level i. The target depth is `plan × digits`
-(light 2/9, **normal 4/13**, deep 1/3); the ledger survives cofactor splits, with
-the target recomputed for the smaller cofactor. B2 is never pinned — gpuecm2 uses
-GMP-ECM's default, which maximizes the per-curve find probability.
+(light 2/9, **normal 4/13**, deep 1/3). When ECM splits the number, the ledger
+and the ladder position carry over to the cofactor unchanged — a curve run on a
+number is equally a curve on each of its divisors — so only the number being
+factored is swapped, never the work already spent. B2 is never pinned — gpuecm2
+uses GMP-ECM's default (logged per batch), which maximizes the per-curve find
+probability.
 
 Two deliberate deviations from yafu: P−1 / P+1 / Fermat are skipped entirely, and
 at least one B1=2000 batch always runs even when yafu would jump straight to the
@@ -106,7 +109,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band |
 | `--ecm-stage2-maxmem MB` | 90% of VRAM | gpuecm2 stage-2 memory cap — limits dF via GMP-ECM's memory model (smaller blocks, same B2 coverage); `0` = no cap |
 | `--timeout S` | none | per-number wall budget |
-| `--workdir DIR` | temp dir | scratch directory (kept on failure; `--keep` always) |
+| `--workdir DIR` | temp dir | scratch base directory; per-number workdirs are auto-removed when a number finishes, kept on Ctrl+C (`--keep` keeps always) |
 | `--bin-dir DIR` | — | backend binary directory |
 | `--json` | off | one JSON object per input on stdout |
 | `--db-token FILE` | `~/.factordb_token` | factordb token file (one line) |
@@ -119,16 +122,18 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 Results go to stdout, one primary line per input; YAFU-style progress logs go
 to stderr by default (banner, trial-division summary, every factor found with
 its `P##`/`PRP##` tag and the stage that found it, ECM batch progress with
-t-levels, sieve start/finish). `-v` adds detail (memory caps, per-band sieve
-updates), `-q` silences stderr entirely:
+B1/B2, per-curve rate and a level-completion ETA, NFS sieve rounds with
+relation rate and ETA, and msieve's own `linear algebra at X%, ETA` lines
+forwarded live during the matrix step). `-v` adds detail (memory caps,
+per-band sieve updates), `-q` silences stderr entirely:
 
 ```
 $ yagfu 3946068388498480527218916724621611671856950960754487550101128852810403
 [20:33:52] fac: factoring 3946068388498480527218916724621611671856950960754487550101128852810403 (c70)
 [20:33:53] ecm: c70, plan=normal, target=t21.5
-[20:33:53] ecm: B1=2,000, 128 curves -> t15.37 (target t21.54)
-[20:33:54] ecm: B1=11,000, 128 curves -> t20.27 (target t21.54)
-[20:33:55] ecm: B1=50,000, 128 curves -> t22.72 (target t21.54)
+[20:33:53] ecm: B1=2,000, B2=147,396, 128 curves, 3.3ms/curve -> t15.37 (target t21.54)
+[20:33:54] ecm: B1=11,000, B2=1.87M, 128 curves, 4.1ms/curve -> t20.27 (target t21.54)
+[20:33:55] ecm: B1=50,000, B2=12.7M, 128 curves, 8.4ms/curve -> t22.72 (target t21.54)
 [20:33:55] siqs: cuda-mpqs on c70 (lp1=None)
 [20:33:56] siqs: rc=0 in 1.6s (ok)
 [20:33:56] fac: PRP35 = 47360480608224695728619362875791753 (siqs)
@@ -255,10 +260,13 @@ All binaries are staged into `bin/`: `ecm`, `gpuecm2`, `cuda-mpqs`,
 ## Development
 
 ```sh
-PYTHONPATH=src python3 -m pytest tests/      # 82 unit tests, no GPU needed
+PYTHONPATH=src python3 -m pytest tests/      # 109 unit tests, no GPU needed
 PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli -v <N>   # live run
 scripts/build_wheel.sh --no-stage            # rebuild wheel without re-staging
 ```
 
-Per-number workdirs (ECM residue files, sieve bands, msieve logs) are kept on
-failure for post-mortem and removed on success; `--keep` / `--workdir` overrides.
+Per-number workdirs (ECM residue files, sieve bands, msieve logs) are scratch:
+they are removed as soon as a number finishes, whether it factored completely,
+failed, or crashed — only a Ctrl+C keeps the workdir for post-mortem, together
+with the base scratch dir (its path is printed). `--keep` disables the
+auto-removal entirely.

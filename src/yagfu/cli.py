@@ -57,9 +57,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="concurrent cuda-sieve processes per band (default 1)")
     ap.add_argument("--bin-dir", help="directory with the backend binaries")
     ap.add_argument("--workdir", help="base scratch directory "
-                                      "(default: a temp dir, removed on success)")
+                                      "(default: a temp dir). Per-number "
+                                      "workdirs are auto-removed when a "
+                                      "number finishes; kept on Ctrl+C or "
+                                      "with --keep")
     ap.add_argument("--keep", action="store_true",
-                    help="keep per-number workdirs even on success")
+                    help="keep per-number workdirs even when a number "
+                         "finishes normally")
     ap.add_argument("--timeout", type=float, default=None,
                     help="per-number wall-clock budget in seconds")
     ap.add_argument("--ecm-only", action="store_true",
@@ -292,7 +296,7 @@ def main(argv=None) -> int:
         xover=args.xover,
         verbose=args.verbose,
         quiet=args.quiet,
-        keep_workdir=args.keep or bool(args.workdir),
+        keep_workdir=args.keep,
         timeout_s=args.timeout,
         force_method=args.force,
         ecm_only=args.ecm_only,
@@ -333,41 +337,47 @@ def main(argv=None) -> int:
             ctx.log(f"=== [{idx + 1}/{len(numbers)}] c{len(str(n))} "
                     f"workdir {wd} ===")
             t0 = time.monotonic()
+            stopped = False   # this number ended via Ctrl+C: keep its wd
             try:
                 if fdb_client is not None:
                     res, merged, fdb_info = factor_with_db(
                         n, fdb_client, engine, wd,
                         report=not args.db_no_report)
                     ok = emit(n, res, merged, fdb_info, time.monotonic() - t0,
-                              args.json,
-                              str(wd) if not _merged_complete(n, merged) else None,
+                              args.json, str(wd) if res.interrupted else None,
                               args.quiet)
                 else:
                     res = engine.factor(n, wd)
                     ok = emit(n, res, None, None, time.monotonic() - t0,
-                              args.json,
-                              str(wd) if not res.complete else None,
+                              args.json, str(wd) if res.interrupted else None,
                               args.quiet)
-                cleanup_workdir(ctx, wd, ok)
                 if not ok:
                     failures += 1
                 if res.interrupted:
                     interrupted = True
+                    stopped = True
                     break
             except KeyboardInterrupt:
                 interrupted = True
+                stopped = True
                 break
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 print(f"{n}: CRASHED: {e!r}", flush=True)
+            finally:
+                # scratch is scratch: a finished number (success, failure,
+                # crash) cleans up; only an interrupted one is kept
+                cleanup_workdir(ctx, wd, stopped)
     except KeyboardInterrupt:
         interrupted = True  # e.g. between numbers, or during fdb calls
     finally:
         if interrupted:
             print("yagfu: interrupted by user; partial results above",
                   file=sys.stderr, flush=True)
-        if owns_base and not interrupted:
-            if base.exists():
+        if owns_base:
+            if interrupted:
+                ctx.log(f"yagfu: interrupted-run workdirs kept under {base}")
+            elif not ctx.keep_workdir:
                 shutil.rmtree(base, ignore_errors=True)
 
     if interrupted:

@@ -22,13 +22,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..config import RunContext
+from ..fmt import fmt_count, fmt_dur
 from ..params import (
     NFS_MSIEVE_POLY_MIN_DIGITS,
     nfs_params,
     poly_budget,
 )
 from . import find_bin
-from .runner import count_lines, read_log, run_cmd, run_cmd_wall_cap
+from .runner import (
+    count_lines,
+    read_log,
+    run_cmd,
+    run_cmd_progress,
+    run_cmd_wall_cap,
+)
 
 NP_TIMEOUT_S = 2 * 3600
 SIEVE_TIMEOUT_S = 6 * 3600
@@ -138,11 +145,13 @@ def _job_to_msieve_fb(job_text: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
-                       timeout: float):
+                       timeout: float, beat=None, beat_s: float = 120.0):
     """Split one q band into n_procs chunks running concurrently on the GPU.
 
     cmd_base ends with a (q_lo, q_hi) placeholder tuple for --qrange.
-    Returns (rc, wall, [relation file names]).
+    `beat(elapsed_s)` fires every beat_s while the band runs (long bands
+    would otherwise be silent for minutes).  Returns (rc, wall,
+    [relation file names]).
     """
     q_lo, q_hi = cmd_base[-1]
     base = cmd_base[:-1]
@@ -167,15 +176,27 @@ def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
             cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT)
         procs.append(p)
     deadline = t0 + timeout
+    next_beat = t0 + beat_s
     try:
-        for p in procs:
-            p.wait(timeout=max(1.0, deadline - time.monotonic()))
+        while any(p.poll() is None for p in procs):
+            if time.monotonic() > deadline:
+                raise subprocess.TimeoutExpired(str(cmd_base[0]), timeout)
+            if beat and time.monotonic() >= next_beat:
+                beat(time.monotonic() - t0)
+                next_beat += beat_s
+            time.sleep(2.0)
     except BaseException:  # incl. KeyboardInterrupt: never orphan sievers
         for p in procs:
             try:
                 p.terminate()
             except OSError:
                 pass
+        for p in procs:
+            try:
+                p.wait(10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
         raise
     rc = max(p.returncode for p in procs)
     return rc, time.monotonic() - t0, names
@@ -214,6 +235,7 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
     t = time.monotonic()
     if digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
         budget = poly_budget(digits, ctx.poly_budget_s)
+        ctx.log(f"nfs: polyselect (msieve -np, budget {fmt_dur(budget)})")
         cmd = [msieve, "-np", "-t", nproc, "-v", str(n)]
         if budget > 0:
             run_cmd_wall_cap(cmd, wd, wd / "np.log", cap_s=budget,
@@ -282,15 +304,18 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
             q_cap += 2 * q_first  # relax the duplicate-control window
             qhi = min(q_next + width, q_cap)
             ctx.log(f"nfs: q window exhausted, cap relaxed to {q_cap}")
-        if bands:
-            ctx.log(f"nfs: round {round_idx}: q {q_next}:{qhi} "
-                    f"(have {have_raw:,}, target {target_raw:,})")
+        ctx.log(f"nfs: round {round_idx}{' (probe)' if not bands else ''}: "
+                f"q {q_next}:{qhi}"
+                + (f" (have {have_raw:,}, target {target_raw:,})"
+                   if bands else ""))
         base = [cuda_sieve, "--pipeline", "--cofactor",
                 "--poly", job_path.name, "--logI", logI, "--region",
                 min(logI, 14), "--device", ctx.device, (q_next, qhi)]
         try:
-            rc, wall, relnames = _run_band_parallel(base, wd, ctx.sieve_procs,
-                                                    round_idx, SIEVE_TIMEOUT_S)
+            rc, wall, relnames = _run_band_parallel(
+                base, wd, ctx.sieve_procs, round_idx, SIEVE_TIMEOUT_S,
+                beat=lambda el: ctx.log(f"nfs: sieving round {round_idx}, "
+                                        f"{fmt_dur(el)} elapsed"))
         except subprocess.TimeoutExpired:
             res.error = "sieve band timed out"
             ctx.log(f"nfs: {res.error}")
@@ -304,6 +329,16 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
         bands.append((q_next, qhi, relnames, cnt, 0.0))
         have_raw += cnt
         q_next = qhi
+        rate = cnt / wall if wall > 0 else 0.0
+        if rate > 0 and target_raw > have_raw:
+            ctx.log(f"nfs: +{cnt:,} rels in {fmt_dur(wall)} "
+                    f"({fmt_count(rate)}/s); have {fmt_count(have_raw)} / "
+                    f"target {fmt_count(target_raw)}, "
+                    f"ETA {fmt_dur((target_raw - have_raw) / rate)}")
+        elif rate > 0:
+            ctx.log(f"nfs: +{cnt:,} rels in {fmt_dur(wall)} "
+                    f"({fmt_count(rate)}/s); have {fmt_count(have_raw)}, "
+                    f"filtering")
 
         with open(wd / "msieve.dat", "wb") as out:
             for _, _, files, _, _ in bands:
@@ -340,16 +375,30 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
             wd, wd / "nc2-mat.stdout", timeout=NC_TIMEOUT_S)
     res.stages["matbuild_s"] = time.monotonic() - t
     t = time.monotonic()
-    try:
-        rc, _ = run_cmd([msieve, "-s", "msieve.dat", "-l", "nc2-la.log",
-                         "-nc2", "-t", nproc, "-v"], wd, wd / "nc2-la.stdout",
-                        timeout=LA_TIMEOUT_S,
-                         env_extra={"CUDA_VISIBLE_DEVICES": ctx.device})
-    except subprocess.TimeoutExpired:
+    # msieve prints its own "linear algebra completed ... (X%, ETA ...)"
+    # updates (carriage-return paced) while it runs; forward them live —
+    # throttled to one per minute — instead of sitting silent for hours
+    last_la = [0.0]
+
+    def _la_lines(lines):
+        for l in lines:
+            if "linear algebra" not in l:
+                continue
+            if l.startswith("commencing") or time.monotonic() - last_la[0] >= 60:
+                ctx.log(f"nfs: {l.strip()}")
+                last_la[0] = time.monotonic()
+
+    rc, _ = run_cmd_progress(
+        [msieve, "-s", "msieve.dat", "-l", "nc2-la.log",
+         "-nc2", "-t", nproc, "-v"], wd, wd / "nc2-la.stdout",
+        timeout=LA_TIMEOUT_S, every_s=30,
+        env_extra={"CUDA_VISIBLE_DEVICES": ctx.device},
+        on_lines=_la_lines)
+    res.stages["linalg_s"] = time.monotonic() - t
+    if rc == -9:
         res.error = "linear algebra timed out"
         ctx.log(f"nfs: {res.error}")
         return res
-    res.stages["linalg_s"] = time.monotonic() - t
     if rc != 0:
         res.error = f"linear algebra failed (rc={rc})"
         ctx.log(f"nfs: {res.error}")
