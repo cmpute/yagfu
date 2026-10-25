@@ -59,9 +59,9 @@ class RunContext:
 def cleanup_workdir(ctx: RunContext, wd: Path, keep: bool) -> None:
     """Remove a per-number workdir.
 
-    Scratch is scratch: a number that finished — successfully or not —
-    always cleans up; the workdir is kept only when the run was interrupted
-    (post-mortem material) or --keep was given.
+    Only a number that factored completely cleans up after itself;
+    a failure keeps the workdir for post-mortem, as does an interrupt
+    and --keep.
     """
     if ctx.keep_workdir or keep:
         return

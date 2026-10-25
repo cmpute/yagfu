@@ -107,15 +107,45 @@ def test_cleanup_workdir(tmp_path):
 
     ctx = RunContext()
     wd = mk()
-    cleanup_workdir(ctx, wd, keep=True)     # interrupted run: kept
+    cleanup_workdir(ctx, wd, keep=True)     # failed/interrupted: kept
     assert wd.exists()
     wd = mk()
-    cleanup_workdir(ctx, wd, keep=False)    # finished run: removed
+    cleanup_workdir(ctx, wd, keep=False)    # complete success: removed
     assert not wd.exists()
     keepall = RunContext(keep_workdir=True)
     wd = mk()
     cleanup_workdir(keepall, wd, keep=False)
     assert wd.exists()                      # --keep always wins
+
+
+def test_cli_keeps_workdir_on_failure(tmp_path, monkeypatch, capsys):
+    from yagfu import cli
+    from yagfu.engine import Engine, FactorResult
+
+    def fake_factor(self, n, wd):
+        (wd / "scratch.txt").write_text("x")
+        return FactorResult(n=n, complete=False, error="boom")
+
+    monkeypatch.setattr(Engine, "factor", fake_factor)
+    rc = cli.main(["--workdir", str(tmp_path), "1000000007"])
+    assert rc == 1
+    assert list(tmp_path.glob("000-*/scratch.txt")), "failure keeps logs"
+
+
+def test_cli_removes_workdir_on_success(tmp_path, monkeypatch, capsys):
+    from yagfu import cli
+    from yagfu.engine import Engine, FactorResult, FoundFactor
+
+    def fake_factor(self, n, wd):
+        (wd / "scratch.txt").write_text("x")
+        res = FactorResult(n=n, complete=True)
+        res.factors.append(FoundFactor(n, "td", True))
+        return res
+
+    monkeypatch.setattr(Engine, "factor", fake_factor)
+    rc = cli.main(["--workdir", str(tmp_path), "1000000007"])
+    assert rc == 0
+    assert not list(tmp_path.glob("000-*")), "success cleans up"
 
 
 # ------------------------------------------------------ run_cmd_progress

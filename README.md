@@ -109,7 +109,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band |
 | `--ecm-stage2-maxmem MB` | 90% of VRAM | gpuecm2 stage-2 memory cap — limits dF via GMP-ECM's memory model (smaller blocks, same B2 coverage); `0` = no cap |
 | `--timeout S` | none | per-number wall budget |
-| `--workdir DIR` | temp dir | scratch base directory; per-number workdirs are auto-removed when a number finishes, kept on Ctrl+C (`--keep` keeps always) |
+| `--workdir DIR` | temp dir | scratch base directory; a number's workdir is removed only when it factors completely, kept on failure/Ctrl+C (`--keep` keeps always) |
 | `--bin-dir DIR` | — | backend binary directory |
 | `--json` | off | one JSON object per input on stdout |
 | `--db-token FILE` | `~/.factordb_token` | factordb token file (one line) |
@@ -265,8 +265,7 @@ PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli -v <N>   # live run
 scripts/build_wheel.sh --no-stage            # rebuild wheel without re-staging
 ```
 
-Per-number workdirs (ECM residue files, sieve bands, msieve logs) are scratch:
-they are removed as soon as a number finishes, whether it factored completely,
-failed, or crashed — only a Ctrl+C keeps the workdir for post-mortem, together
-with the base scratch dir (its path is printed). `--keep` disables the
-auto-removal entirely.
+Per-number workdirs (ECM residue files, sieve bands, msieve logs) are removed
+only when a number factors completely. A failed, crashed, or interrupted run
+keeps its workdir for post-mortem, together with the base scratch dir (its
+path is printed). `--keep` disables the removal entirely.
