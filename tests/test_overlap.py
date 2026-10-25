@@ -49,7 +49,7 @@ def _patch(monkeypatch, job, found_on=(), fail_calls=()):
     def fake_start(self, m, wd):
         return job
 
-    def fake_ecm(n, b1, total, ctx, wd, tag):
+    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
         calls["b1"].append(b1)
         if len(calls["b1"]) in fail_calls:
             raise KeyboardInterrupt
@@ -108,7 +108,7 @@ def test_overlap_split_during_bonus_replans(monkeypatch, tmp_path):
     calls = _patch(monkeypatch, job)
     # find P1 on call 3 (inside the bonus window) -> cofactor P2*P3 is
     # composite -> re-plan via recursion, NFS never sees the stale poly
-    def fake_ecm(n, b1, total, ctx, wd, tag):
+    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
         calls["b1"].append((b1, n))
         out = EcmRunResult(curves_done=total, wall_s=0.001 * total)
         if len(calls["b1"]) == 3:
@@ -157,6 +157,47 @@ def test_replan_carries_ledger_and_logs_discard(monkeypatch, tmp_path,
     err = capsys.readouterr().err
     assert "discarding background polyselect" in err
     assert "budget 60s" in err and "ran 12s" in err
+
+
+def test_bonus_aborts_when_poly_done(monkeypatch, tmp_path, capsys):
+    """Polyselect finishing mid-batch aborts the bonus ECM immediately:
+    the partial batch is dropped (with a log line) and NFS proceeds."""
+    job = FakeJob(polls=5)
+    calls = _patch(monkeypatch, job)
+
+    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
+        calls["b1"].append((b1, stop_check is not None))
+        out = EcmRunResult(curves_done=total, wall_s=0.001 * total)
+        if len(calls["b1"]) == 4:      # first bonus batch: poly just ended
+            out.aborted = True
+            out.curves_done = 0
+        return out
+
+    monkeypatch.setattr(engine_mod, "run_ecm_curves", fake_ecm)
+    eng = Engine(RunContext(xover=60))
+    res = eng.factor(N, tmp_path)
+    assert res.complete, res.error
+    assert calls["b1"][3][1] is True    # bonus batches carry the stop hook
+    assert calls["nfs_poly"] == [job]   # NFS entered without waiting
+    assert "dropping the partial bonus batch" in capsys.readouterr().err
+
+
+def test_polyselect_budget_adopts_msieve_deadline(tmp_path, capsys):
+    from yagfu.backends.nfs import PolyselectJob
+
+    job = object.__new__(PolyselectJob)     # no process, logic only
+    job.wd = tmp_path
+    job.ctx = RunContext(threads=13)
+    job.user_budget = False
+    job.budget = 60.0
+    (tmp_path / "np.log").write_text("poly select deadline: 15209\n")
+    job._maybe_extend_budget()
+    assert abs(job.budget - (15209 / 13 + 120)) < 1.0
+    assert "extended" in capsys.readouterr().err
+    job.user_budget = True              # explicit --poly-budget wins
+    job.budget = 60.0
+    job._maybe_extend_budget()
+    assert job.budget == 60.0
 
 
 def test_overlap_keyboard_interrupt_cancels_job(monkeypatch, tmp_path):

@@ -307,12 +307,18 @@ class Engine:
     def _poly_overlap_ecm(self, m: int, wd: Path, res: FactorResult,
                           depth: int, ledger: EcmLedger, job) -> int:
         """Bonus ECM while background polyselect holds the CPUs: keep
-        filling level budgets above the plan target.  A factor ends the
-        overlap (the caller re-plans the cofactor); no target applies —
-        the window itself is the budget."""
+        filling level budgets above the plan target.  The moment the
+        polyselect finishes, the running stage-1 batch is killed and
+        discarded (bonus curves are free; waiting for them is not) and the
+        NFS stage proceeds.  A factor found here (even in a killed batch's
+        log) ends the overlap — the caller re-plans the cofactor."""
         ctx = self.ctx
         ctx.log("ecm: polyselect running in background, climbing bonus "
                 "levels")
+
+        def _poly_done() -> bool:
+            return not job.running()
+
         j = 0
         inv = 0
         while job.running():
@@ -324,7 +330,7 @@ class Engine:
             want = min(ledger.level_budget_left(j), ctx.ecm_maxcurves)
             inv += 1
             r = run_ecm_curves(m, B1_LADDER[j], want, ctx, wd,
-                               tag=f"o{j}-{inv}")
+                               tag=f"o{j}-{inv}", stop_check=_poly_done)
             res.bump("ecm_invocations")
             if r.error:
                 raise FactorError(f"ecm: {r.error}")
@@ -334,7 +340,7 @@ class Engine:
                     + f", {r.curves_done:,} curves (polyselect overlap) "
                     f"-> t{ledger.depth():.2f}"
                     + (f"; {len(r.factors)} factor(s)!" if r.factors else ""))
-            if r.curves_done == 0 and not r.factors:
+            if r.curves_done == 0 and not r.factors and not r.aborted:
                 raise FactorError("ecm made no progress")
             if r.factors:
                 for f in sorted(r.factors, key=lambda x: -len(str(x))):
@@ -344,6 +350,11 @@ class Engine:
                     self._collect(f, "ecm", wd, res, depth, ecm=r.factors[f])
                     m //= f
                 return m
+            if r.aborted:
+                if r.curves_done == 0:
+                    ctx.log("ecm: polyselect finished mid-batch; dropping "
+                            "the partial bonus batch")
+                break
         return m
 
     def _ecm_stage(self, m: int, wd: Path, res: FactorResult, depth: int,

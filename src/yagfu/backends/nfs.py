@@ -217,6 +217,10 @@ class PolyselectJob:
                 pass
         self.n, self.ctx, self.wd = n, ctx, wd
         self.budget = poly_budget(len(str(n)), ctx.poly_budget_s)
+        # an explicit --poly-budget (other than 0 = msieve's own) is
+        # never extended
+        self.user_budget = (ctx.poly_budget_s is not None
+                            and ctx.poly_budget_s > 0)
         self.fb: dict[str, str] | None = None
         self.poly_e: float | None = None
         self.poly_method: str | None = None
@@ -244,10 +248,38 @@ class PolyselectJob:
         finally:
             f.close()
 
+    def _maybe_extend_budget(self) -> None:
+        """Adopt msieve's own poly-select deadline when it exceeds our
+        heuristic cap.  msieve prints it (CPU-seconds) right after start;
+        capping earlier would SIGINT before the first confirmed candidate
+        and force the uncapped retry anyway.  An explicit --poly-budget is
+        never overridden."""
+        if self.user_budget:
+            return
+        try:
+            log = read_log(self.wd / "np.log")
+        except OSError:
+            return
+        m = _RE_MSIEVE_DEADLINE.search(log)
+        if not m:
+            return
+        wall = min(int(m.group(1)) / max(1, self.ctx.threads) + 120,
+                   2 * 3600)
+        if wall > self.budget:
+            self.budget = wall
+            self.ctx.log(f"nfs: polyselect budget extended to "
+                         f"{fmt_dur(wall)} (msieve's own deadline)")
+
     def _budget_watch(self) -> None:
+        t0 = time.monotonic()
+        # msieve prints its deadline within the first seconds: adopt it
+        # before the cap can fire
+        while time.monotonic() - t0 < 30 and self._p.poll() is None:
+            self._maybe_extend_budget()
+            time.sleep(2)
         p = self._p
         try:
-            p.wait(timeout=self.budget)
+            p.wait(timeout=max(self.budget - (time.monotonic() - t0), 5.0))
             return
         except subprocess.TimeoutExpired:
             pass
@@ -288,6 +320,16 @@ class PolyselectJob:
                 and not (self.wd / "msieve.fb").exists()):
             # the SIGINT arrived before any candidate was saved
             self._retried = True
+            est = ""
+            try:
+                m = _RE_MSIEVE_DEADLINE.search(read_log(self.wd / "np.log"))
+                if m:
+                    est = (f", msieve's own deadline ~{fmt_dur(
+                        int(m.group(1)) / max(1, self.ctx.threads))}")
+            except OSError:
+                pass
+            self.ctx.log(f"nfs: no polynomial within {fmt_dur(self.budget)};"
+                         f" retrying uncapped{est}")
             self._spawn(find_bin("msieve", self.ctx.bin_dir))
             try:
                 self._p.wait(timeout=NP_TIMEOUT_S)
@@ -336,6 +378,8 @@ def _append_band_rels(wd: Path, relnames: list[str]) -> None:
 
 
 _NFS_STATE = "nfs-state.json"
+
+_RE_MSIEVE_DEADLINE = re.compile(r"poly select deadline: (\d+)")
 
 
 def _save_nfs_state(wd: Path, n: int, **kv) -> None:

@@ -26,7 +26,13 @@ from pathlib import Path
 from ..config import RunContext
 from ..fmt import fmt_count, fmt_dur
 from . import find_bin
-from .runner import read_log, run_cmd, run_procs_parallel
+from .runner import (
+    KILLED_RC,
+    read_log,
+    run_cmd,
+    run_cmd_progress,
+    run_procs_parallel,
+)
 
 #: gpuecm2 default build limit
 GPUECM2_MAX_BITS = 8192
@@ -107,6 +113,7 @@ class EcmRunResult:
     stage1_s: float = 0.0
     stage2_s: float = 0.0
     b2: int | None = None            # effective stage-2 B2 (GMP-ECM default)
+    aborted: bool = False            # stopped early on request (not an error)
     error: str | None = None
 
 
@@ -125,9 +132,14 @@ def _parse_stage1_log(log: str, b1: int, requested: int
 
 
 def _stage1(n: int, b1: int, curves: int, ctx: RunContext, wd: Path,
-            tag: str, device: str
+            tag: str, device: str, stop_check=None
             ) -> tuple[int, dict[int, EcmProvenance], int, float, str | None]:
-    """One GPU stage-1 invocation; returns (rc, factors, curves, wall, error)."""
+    """One GPU stage-1 invocation; returns (rc, factors, curves, wall, error).
+
+    With stop_check, the process is polled and killed when it fires; a
+    killed batch never wrote its residues, so it reports ran=0 (any factor
+    lines already printed are still kept — a free factor is a free factor).
+    """
     ecm = find_bin("ecm", ctx.bin_dir)
     res_path = wd / f"ecm-{tag}.residues"
     log_path = wd / f"ecm-{tag}.stage1.log"
@@ -135,12 +147,20 @@ def _stage1(n: int, b1: int, curves: int, ctx: RunContext, wd: Path,
            "-gpucurves", curves, str(b1), "1"]
     t0 = time.monotonic()
     try:
-        rc, _ = run_cmd(cmd, wd, log_path, input_bytes=f"{n}\n".encode(),
-                        timeout=max(600, 4 * 86400))
+        if stop_check is None:
+            rc, _ = run_cmd(cmd, wd, log_path, input_bytes=f"{n}\n".encode(),
+                            timeout=max(600, 4 * 86400))
+        else:
+            rc, _ = run_cmd_progress(
+                cmd, wd, log_path, timeout=max(600, 4 * 86400),
+                every_s=1.0, input_bytes=f"{n}\n".encode(),
+                stop=stop_check)
     except Exception as e:  # noqa: BLE001
         return -1, {}, 0, time.monotonic() - t0, f"ecm failed to run: {e!r}"
     wall = time.monotonic() - t0
     factors, ran = _parse_stage1_log(read_log(log_path), b1, curves)
+    if rc == KILLED_RC:
+        ran = 0
     return rc, factors, ran, wall, None
 
 
@@ -182,12 +202,15 @@ def _bump_rates(ctx: RunContext, shards: list[_Shard]) -> None:
 
 
 def _stage1_shards(n: int, b1: int, counts: list[int], devices: tuple,
-                   ctx: RunContext, wd: Path, tag: str) -> list[_Shard]:
+                   ctx: RunContext, wd: Path, tag: str,
+                   stop_check=None) -> list[_Shard]:
     """One stage-1 process per device with a nonzero count, all concurrent.
 
     Counts are requested as-is: gmp-ecm rounds each process's -gpucurves
     up to that card's own granularity, and the parsed per-log `ran` keeps
-    the accounting exact on heterogeneous cards."""
+    the accounting exact on heterogeneous cards.  With stop_check, all
+    shards are killed when it fires and report ran=0 (their factors, if
+    any, are kept)."""
     ecm = find_bin("ecm", ctx.bin_dir)
     jobs, metas = [], []
     for i, (dev, cnt) in enumerate(zip(devices, counts)):
@@ -199,7 +222,8 @@ def _stage1_shards(n: int, b1: int, counts: list[int], devices: tuple,
                "-gpucurves", cnt, str(b1), "1"]
         jobs.append((cmd, wd / f"ecm-{stag}.stage1.log", f"{n}\n".encode()))
         metas.append((i, str(dev), cnt, res_path))
-    results = run_procs_parallel(jobs, wd, max(600, 4 * 86400))
+    results = run_procs_parallel(jobs, wd, max(600, 4 * 86400),
+                                 poll_s=1.0, stop=stop_check)
     shards = []
     for (rc, wall), (i, dev, cnt, res_path) in zip(results, metas):
         try:
@@ -207,6 +231,8 @@ def _stage1_shards(n: int, b1: int, counts: list[int], devices: tuple,
         except OSError:
             log = ""
         factors, ran = _parse_stage1_log(log, b1, cnt)
+        if rc == KILLED_RC:
+            ran = 0
         shards.append(_Shard(dev, factors, ran, wall, res_path))
         ctx.logv(f"ecm: shard {i} (device {dev}): {ran:,} curves in "
                  f"{fmt_dur(wall)} "
@@ -288,7 +314,7 @@ def _stage2(n: int, b1: int, res_path: Path, ctx: RunContext, wd: Path,
 
 
 def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
-                   wd: Path, tag: str) -> EcmRunResult:
+                   wd: Path, tag: str, stop_check=None) -> EcmRunResult:
     """Run up to total_curves curves at B1 in GPU batches; stop at first
     round that finds a factor (subsequent curves are pointless then).
 
@@ -296,6 +322,13 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
     devices each round fans stage 1 out one process per card (counts
     split by learned per-card throughput), the residues are merged, and a
     single gpuecm2 stage 2 runs on the first device.
+
+    stop_check () -> bool is polled while stage 1 runs; when it fires the
+    running stage-1 batch is killed and discarded (aborted=True, its
+    curves count as 0) — used by the polyselect overlap so bonus ECM
+    yields immediately when the background polyselect finishes.  A stage 2
+    that already has residues always runs to completion so its round's
+    work is kept.
     """
     if n.bit_length() > GPUECM2_MAX_BITS:
         raise EcmUnsupported(f"{n.bit_length()} bits > gpuecm2 limit of {GPUECM2_MAX_BITS}")
@@ -311,6 +344,9 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
     done = 0
     inv = 0
     while done < total_curves and not out.factors:
+        if stop_check is not None and stop_check():
+            out.aborted = True
+            return out
         inv += 1
         remaining = total_curves - done
         round_ran = 0
@@ -319,7 +355,8 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
             want = min(((want + _CURVES_GRANULARITY - 1) // _CURVES_GRANULARITY)
                        * _CURVES_GRANULARITY, ctx.ecm_maxcurves)
             rc, facts, ran, wall, err = _stage1(n, b1, want, ctx, wd,
-                                                f"{tag}.{inv}", s2_dev)
+                                                f"{tag}.{inv}", s2_dev,
+                                                stop_check=stop_check)
             out.stage1_s += wall
             out.curves_done += ran
             round_ran = ran
@@ -338,7 +375,7 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
             counts = [min(c, ctx.ecm_maxcurves)
                       for c in _split_curves(remaining, weights)]
             shards = _stage1_shards(n, b1, counts, devices, ctx, wd,
-                                    f"{tag}.{inv}")
+                                    f"{tag}.{inv}", stop_check=stop_check)
             if not shards:
                 return out
             _bump_rates(ctx, shards)
@@ -355,6 +392,9 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
         merged = wd / f"ecm-{tag}.{inv}.merged"
         n_res = _merge_residues(res_paths, merged)
         if n_res == 0:
+            if stop_check is not None and stop_check():
+                out.aborted = True       # killed batch: discard its curves
+                out.curves_done -= round_ran
             return out  # no residues: nothing to resume
         env2 = ({"CUDA_VISIBLE_DEVICES": str(s2_dev)} if not single else None)
         facts2, wall2, err2, b2 = _stage2(n, b1, merged, ctx, wd,
@@ -368,5 +408,8 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
             out.b2 = b2
         out.factors.update({f: p for f, p in facts2.items() if n % f == 0})
         done += round_ran
+        if stop_check is not None and stop_check():
+            out.aborted = True           # round kept (stage 2 finished)
+            return out
     out.wall_s = out.stage1_s + out.stage2_s
     return out
