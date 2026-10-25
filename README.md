@@ -40,14 +40,17 @@ trial division  ->  pollard rho  ->  ECM / P-1         ->  SIQS / NFS
 which enable the branch-free warp-uniform CGBN optimisations in `cgbn_stage1.cu`
 (see the `perf-min` branch commit history for details).
 
-Build outputs:
+Every backend's final binary is staged into the unified `bin/` directory (gitignored),
+so the Python wheel can package them from a single place:
 
 ```
-gmp-ecm/ecm
-gpuecm2/build/gpuecm2
-cuda-mpqs/build/tests/cuda-mpqs
-cuda-sieve/bench/bench
-msieve-cuda/msieve
+bin/ecm          # gmp-ecm,  GPU stage 1
+bin/gpuecm2      # gpuecm2,  GPU stage 2
+bin/cuda-mpqs    # cuda-mpqs, SIQS/MPQS
+bin/cuda-sieve   # cuda-sieve, NFS relation collection (renamed from bench/bench)
+bin/fbgen        # cuda-sieve, CPU factor-base generator
+bin/fbgen_gpu    # cuda-sieve, GPU factor-base generator
+bin/msieve       # msieve-cuda, NFS post-processing
 ```
 
 ## Cloning fresh

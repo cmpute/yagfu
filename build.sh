@@ -12,26 +12,31 @@
 # Usage: ./build.sh [options]
 #   -a, --arch NN       CUDA compute capability (default: detect from the GPU
 #                       in this machine, e.g. 89 for sm_89 / RTX 4090)
-#   -j, --jobs N        parallel build jobs (default: number of CPUs)
+#   -j, --jobs N        parallel build jobs (default: CPU count - 2)
 #   --max-bits B        largest modulus gpuecm2 compiles stage-2 kernels for
 #                       (default 8192; 32768 for the full set, slower to build)
 #   --only LIST         comma-separated subset, e.g. "gmp-ecm,gpuecm2"
 #   -h, --help          show this help
 #
-# The generated binaries are the inputs yagfu drives:
-#   gmp-ecm/ecm                         (GPU stage 1,  -gpu  -save)
-#   gpuecm2/build/gpuecm2               (GPU stage 2,  -resume)
-#   cuda-mpqs/build/tests/cuda-mpqs     (SIQS/MPQS)
-#   cuda-sieve/bench/bench              (NFS relation collection)
-#   msieve-cuda/msieve                  (NFS post-processing)
+# Every backend's final binary is staged into ./bin (gitignored) so the Python
+# wheel can collect them from one place:
+#   bin/ecm          gmp-ecm      GPU stage 1  (-gpu -save)
+#   bin/gpuecm2      gpuecm2      GPU stage 2  (-resume)
+#   bin/cuda-mpqs    cuda-mpqs    SIQS/MPQS
+#   bin/cuda-sieve   cuda-sieve   NFS relation collection (built as bench/bench)
+#   bin/fbgen        cuda-sieve   factor-base generator (CPU)
+#   bin/fbgen_gpu    cuda-sieve   factor-base generator (GPU)
+#   bin/msieve       msieve-cuda  NFS filtering / linear algebra / sqrt
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$ROOT/bin"       # unified output dir consumed by the Python wheel
 
 # ---------------------------------------------------------------------------
 # defaults / option parsing
 # ---------------------------------------------------------------------------
 JOBS="$(nproc 2>/dev/null || echo 4)"
+JOBS=$(( JOBS > 2 ? JOBS - 2 : 1 ))   # leave two cores free for the host
 SM=""                 # empty => auto-detect the native GPU
 MAXBITS="8192"        # gpuecm2 largest modulus size
 ONLY=""               # empty => build everything
@@ -39,7 +44,15 @@ ONLY=""               # empty => build everything
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
 
-usage() { sed -n '2,20p' "$0"; }
+# copy a built binary into the unified bin/ dir and make it executable
+install_bin() {  # <src> <name>
+  mkdir -p "$BIN"
+  cp -f "$1" "$BIN/$2"
+  chmod +x "$BIN/$2"
+  log "  staged $BIN/$2"
+}
+
+usage() { sed -n '2,27p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -112,7 +125,7 @@ build_gmp_ecm() {
     CPPFLAGS="-DECM_CGBN_ADDCONV -DECM_CGBN_NORMCONV -DECM_CGBN_NORMDROP"
 
   make -j"$JOBS"
-  log "gmp-ecm built: $ROOT/gmp-ecm/ecm"
+  install_bin "$ROOT/gmp-ecm/ecm" ecm
 }
 
 build_gpuecm2() {
@@ -133,7 +146,11 @@ build_gpuecm2() {
     -DCMAKE_CUDA_ARCHITECTURES="$SM" \
     -DGPUECM2_MAX_BITS="$MAXBITS"
   cmake --build build -j"$JOBS"
-  log "gpuecm2 built: $ROOT/gpuecm2/build/gpuecm2"
+
+  # The gpuecm2 binary links gpuecm2core + cudart statically, so it is
+  # self-contained (only system libgmp/libcuda are needed at run time).
+  # libgpuecm2.so / gpuecm2.h are the C API and only needed for the -gpu2 build.
+  install_bin "$ROOT/gpuecm2/build/gpuecm2" gpuecm2
 }
 
 build_cuda_mpqs() {
@@ -141,21 +158,23 @@ build_cuda_mpqs() {
   cd "$ROOT/cuda-mpqs"
   cmake -B build -DGPU_TARGET="$SM" -DCMAKE_BUILD_TYPE=Release
   cmake --build build -j"$JOBS"
-  log "cuda-mpqs built: $ROOT/cuda-mpqs/build/tests/cuda-mpqs"
+  install_bin "$ROOT/cuda-mpqs/build/tests/cuda-mpqs" cuda-mpqs
 }
 
 build_cuda_sieve() {
   log "building cuda-sieve (NFS relation collection)"
   cd "$ROOT/cuda-sieve"
   make -C bench -j"$JOBS" GPU_ARCH="$SM"
-  log "cuda-sieve built: $ROOT/cuda-sieve/bench/bench"
+  install_bin "$ROOT/cuda-sieve/bench/bench" cuda-sieve
+  install_bin "$ROOT/cuda-sieve/bench/fbgen" fbgen
+  install_bin "$ROOT/cuda-sieve/bench/fbgen_gpu" fbgen_gpu
 }
 
 build_msieve() {
   log "building msieve-cuda (NFS post-processing, sm_${SM})"
   cd "$ROOT/msieve-cuda"
   make -j"$JOBS" all CUDA="$SM"
-  log "msieve built: $ROOT/msieve-cuda/msieve"
+  install_bin "$ROOT/msieve-cuda/msieve" msieve
 }
 
 # ---------------------------------------------------------------------------
@@ -179,4 +198,5 @@ for c in "${COMPONENTS[@]}"; do
   esac
 done
 
-log "done"
+log "done; binaries staged in $BIN:"
+[ -d "$BIN" ] && ls -1 "$BIN" | sed 's/^/  /'

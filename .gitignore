@@ -8,4 +8,5 @@ venv/
 # local build/test artifacts at the top level
 /build/
 /dist/
+/bin/
 *.log
