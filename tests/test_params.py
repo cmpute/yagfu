@@ -1,6 +1,7 @@
 import pytest
 
 from yagfu.backends import find_bin
+from yagfu.backends.siqs import _narrow_bug_params
 from yagfu.params import (
     NFS_PARAMS_ANCHORS,
     mpqs_lp1_bound,
@@ -56,6 +57,24 @@ def test_poly_budget():
 def test_sieve_time_estimate_anchors():
     assert sieve_time_estimate(100) == pytest.approx(59.0)
     assert sieve_time_estimate(90) == pytest.approx(19.67, abs=0.5)
+
+
+_NARROW_LOG = """\
+[Stage 500: Tuning] [Tuning] Small-N adaptive config: shc_dim=6 totalPolys=32 totalIntervals=16 metaB=32
+[Stage 1000: Sieve] [Sieve] [Config] VALIDATION ERROR: NARROW interval coverage must equal 2M. numIntervals(16) * sievingBlockSize(65536) = 1048576 >
+                                                    2M(524288). Sieving past [-M,M) is fast per position and barren in relations. Required: numIntervals = 8 (--params field 2).
+"""
+
+
+def test_narrow_bug_params():
+    # tuple in the shape the internal Small-N path would have used
+    assert _narrow_bug_params(_NARROW_LOG) == "32,8,1,8,32,256,32,256"
+
+
+def test_narrow_bug_params_needs_both_matches():
+    assert _narrow_bug_params("Required: numIntervals = 8") is None
+    assert _narrow_bug_params("totalPolys=32") is None
+    assert _narrow_bug_params("unrelated") is None
 
 
 def test_find_bin_order(tmp_path, monkeypatch):
