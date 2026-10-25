@@ -32,7 +32,14 @@ from .arith import perfect_power, pollard_rho, trial_divide
 from .backends.ecm import EcmProvenance, EcmUnsupported, run_ecm_curves
 from .backends.siqs import run_siqs
 from .config import RunContext
-from .ecmledger import B1_LADDER, CURVES, NUM_LEVELS, EcmLedger, target_depth
+from .ecmledger import (
+    B1_LADDER,
+    CURVES,
+    NUM_LEVELS,
+    T_LEVELS,
+    EcmLedger,
+    target_depth,
+)
 from .primes import SPRP_2761_LIMIT, is_probable_prime
 
 #: curve count per endless top-level batch in ecm-only mode
@@ -225,26 +232,26 @@ class Engine:
 
     # --------------------------------------------------------------- stages
 
-    def _ecm_target(self, m: int) -> float:
-        if self.ctx.ecm_only:
-            return 65.0
-        return min(target_depth(_digits(m), self.ctx.plan), 65.0)
-
     def _ecm_stage(self, m: int, wd: Path, res: FactorResult,
                    depth: int) -> int:
         """GPU ECM ladder with the YAFU work ledger; returns the cofactor.
 
         The ledger survives cofactor splits: after dividing out a found
         factor the (fresh) ladder restarts on the smaller cofactor.  In
-        ecm-only mode every level runs to its full budget and the top
-        level is then sampled forever until the number factors or the
-        user interrupts.
+        ecm-only mode there is no target: every level runs to its full
+        budget and the top level is then sampled forever until the number
+        factors or the user interrupts.
         """
         ctx = self.ctx
         ledger = EcmLedger()
-        target = self._ecm_target(m)
-        plan = "ecm-only" if ctx.ecm_only else ctx.plan
-        ctx.log(f"ecm: c{_digits(m)}, plan={plan}, target=t{target:.1f}")
+        top = NUM_LEVELS - 1
+        if ctx.ecm_only:
+            ctx.log(f"ecm: c{_digits(m)}, ecm-only: every level to full "
+                    f"budget, then endless t65")
+        else:
+            target = min(target_depth(_digits(m), ctx.plan), 65.0)
+            ctx.log(f"ecm: c{_digits(m)}, plan={ctx.plan}, "
+                    f"target=t{target:.1f}")
 
         j = 0
         inv = 0
@@ -252,21 +259,23 @@ class Engine:
             if j >= NUM_LEVELS:
                 if not ctx.ecm_only:
                     break
-                j = NUM_LEVELS - 1          # park at t65 forever
+                j = top                        # park at t65 forever
             elif not ctx.ecm_only and j > 0 and (
                     ledger.depth() >= target
                     or (_digits(m) <= 45 and target < 15.0)):
                 break  # target reached, or YAFU's trivial-pretest skip
-            want = min(ledger.curves_for_target(j, target),
-                       ledger.level_budget_left(j))
-            if j == 0 and not ctx.ecm_only:
-                want = max(want, CURVES[0][0])  # the always-run first batch
-            if want <= 0:
-                if ctx.ecm_only and j == NUM_LEVELS - 1:
+            if ctx.ecm_only:
+                want = ledger.level_budget_left(j)
+                if want <= 0 and j == top:
                     want = ECM_ONLY_TOPUP_CURVES  # budget spent: keep going
-                else:
-                    j += 1
-                    continue
+            else:
+                want = min(ledger.curves_for_target(j, target),
+                           ledger.level_budget_left(j))
+                if j == 0:
+                    want = max(want, CURVES[0][0])  # always-run first batch
+            if want <= 0:
+                j += 1
+                continue
             inv += 1
             ctx.check_deadline()
             r = run_ecm_curves(m, B1_LADDER[j], want, ctx, wd,
@@ -275,8 +284,14 @@ class Engine:
             if r.error:
                 raise FactorError(f"ecm: {r.error}")
             ledger.add(j, r.curves_done)
+            if ctx.ecm_only and ledger.level_budget_left(j) <= 0 and j == top:
+                status = f"(t65 sampling, {ledger.done_curves[j]:,} curves)"
+            elif ctx.ecm_only:
+                status = f"(level t{T_LEVELS[j]})"
+            else:
+                status = f"(target t{target:.2f})"
             ctx.log(f"ecm: B1={B1_LADDER[j]:,}, {r.curves_done} curves "
-                    f"-> t{ledger.depth():.2f} (target t{target:.2f})"
+                    f"-> t{ledger.depth():.2f} {status}"
                     + (f"; {len(r.factors)} factor(s)!" if r.factors else ""))
             if r.curves_done == 0 and not r.factors:
                 raise FactorError("ecm made no progress")
@@ -290,10 +305,9 @@ class Engine:
                     if m == 1 or is_probable_prime(m):
                         return m
                 ledger = EcmLedger()        # fresh ladder for the cofactor
-                target = self._ecm_target(m)
                 j = 0
                 ctx.log(f"ecm: cofactor now c{_digits(m)}, "
-                        f"target=t{target:.1f}")
+                        f"restarting ladder")
                 continue
             j += 1
         return m
