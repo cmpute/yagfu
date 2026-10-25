@@ -19,3 +19,7 @@ venv/
 benchmarks/*
 !benchmarks/numbers.json
 !benchmarks/results.json
+
+# wheel staging: backend binaries copied into the package by build_wheel.sh
+/src/yagfu/bin/
+.zcode/

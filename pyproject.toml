@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yagfu"
+version = "0.1.0"
+description = "yagfu — yet another GPU factorization utility (TD -> rho -> GPU ECM -> GPU SIQS/NFS)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Jacob Zhong" }]
+keywords = ["factorization", "ECM", "SIQS", "NFS", "GPU"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+# stdlib only: the wheel must install offline on air-gapped clones of this
+# machine's environment.  The GPU backend binaries are bundled into
+# yagfu/bin/ by scripts/build_wheel.sh (see package-data below).
+
+[project.scripts]
+yagfu = "yagfu.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+yagfu = ["bin/*"]

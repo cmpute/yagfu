@@ -1,0 +1,324 @@
+"""GNFS backend: msieve polyselect -> cuda-sieve sieving -> msieve postproc.
+
+Ported from bench_factor.py's run_nfs (validated on this hardware), with
+the per-size parameter tables generalized by interpolation (params.py).
+Pipeline shape:
+
+* polyselect: msieve -np with a wall-clock budget (SIGINT cooperative cap)
+  for >= 85 digits; classic base-m polynomial below that (this msieve
+  build emits no GPU stage-1 candidates under ~85 digits).
+* sieving: cuda-sieve bands with an adaptive width, special-q from alim/2,
+  merged into msieve.dat; msieve -nc1 verdict drives the loop.
+* postprocessing: -nc2 matbuild, GPU Lanczos -nc2, sqrt -nc3.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+import subprocess
+import time
+from pathlib import Path
+
+from ..config import RunContext
+from ..params import (
+    NFS_MSIEVE_POLY_MIN_DIGITS,
+    nfs_params,
+    poly_budget,
+)
+from . import find_bin
+from .runner import count_lines, read_log, run_cmd, run_cmd_wall_cap
+
+NP_TIMEOUT_S = 2 * 3600
+SIEVE_TIMEOUT_S = 6 * 3600
+NC_TIMEOUT_S = 2 * 3600
+LA_TIMEOUT_S = 12 * 3600
+SQRT_TIMEOUT_S = 2 * 3600
+
+
+# ---------------------------------------------------------------------------
+# polynomials
+# ---------------------------------------------------------------------------
+
+def _degree(coeffs: list[int]) -> int:
+    for i in range(len(coeffs) - 1, -1, -1):
+        if coeffs[i]:
+            return i
+    return 0
+
+
+def _iroot(n: int, k: int) -> int:
+    x = 1 << ((n.bit_length() + k - 1) // k + 1)
+    while True:
+        y = ((k - 1) * x + n // x ** (k - 1)) // k
+        if y >= x:
+            break
+        x = y
+    while x ** k > n:
+        x -= 1
+    return x
+
+
+def base_m_poly(n: int, degree: int) -> tuple[list[int], int]:
+    """Classic base-m polynomial: write n in base m ~ n^(1/degree).
+
+    Tries a handful of m near the exact root and keeps the one whose
+    coefficient profile is flattest under the natural skew.
+    """
+    best = None
+    m0 = _iroot(n, degree)
+    for m in range(m0 - 2, m0 + 3):
+        if m < 2:
+            continue
+        coeffs, t = [], n
+        while t:
+            coeffs.append(t % m)
+            t //= m
+        if len(coeffs) > degree + 1:
+            continue
+        coeffs += [0] * (degree + 1 - len(coeffs))
+        if coeffs[degree] == 0:
+            continue
+        skew = (abs(coeffs[0]) / abs(coeffs[degree])) ** (1.0 / degree)
+        spread = max(math.log2(max(1, abs(c) * skew ** (degree - i)))
+                     for i, c in enumerate(coeffs))
+        if best is None or spread < best[0]:
+            best = (spread, coeffs, m)
+    _, coeffs, m = best
+    return coeffs, m
+
+
+def _parse_msieve_fb(text: str) -> dict[str, str]:
+    fb = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            fb[parts[0]] = parts[1]
+    return fb
+
+
+def _fb_to_job(fb: dict[str, str], rlim: int, alim: int, lpb: int) -> str:
+    deg = max(int(k[1:]) for k in fb if k[0] == "A" and k[1:].isdigit())
+    lines = [f"n: {fb['N']}", f"skew: {fb['SKEW']}"]
+    for i in range(deg, -1, -1):
+        lines.append(f"c{i}: {fb.get('A' + str(i), '0')}")
+    lines += [f"Y0: {fb['R0']}", f"Y1: {fb['R1']}"]
+    lines += [
+        f"rlim: {rlim}", f"alim: {alim}",
+        f"lpbr: {lpb}", f"lpba: {lpb}",
+        f"mfbr: {2 * lpb}", f"mfba: {2 * lpb}",
+        "rlambda: 2.5", "alambda: 2.5",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _job_to_msieve_fb(job_text: str) -> tuple[str, str]:
+    """GGNFS .job -> (msieve.fb text, worktodo.ini text)."""
+    kv: dict[str, str] = {}
+    deg = 0
+    for line in job_text.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            kv[parts[0].rstrip(":")] = parts[1]
+    for k in kv:
+        m = re.fullmatch(r"c(\d+)", k)
+        if m:
+            deg = max(deg, int(m.group(1)))
+    fb = [f"N {kv['n']}", f"SKEW {kv['skew']}", f"R0 {kv['Y0']}", f"R1 {kv['Y1']}"]
+    for i in range(deg + 1):
+        fb.append(f"A{i} {kv.get('c' + str(i), '0')}")
+    fb += [f"FRMAX {kv['rlim']}", f"FAMAX {kv['alim']}",
+           f"SRLPMAX {1 << int(kv['lpbr'])}", f"SALPMAX {1 << int(kv['lpba'])}"]
+    return "\n".join(fb) + "\n", kv["n"] + "\n"
+
+
+# ---------------------------------------------------------------------------
+# sieving helpers
+# ---------------------------------------------------------------------------
+
+def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
+                       timeout: float):
+    """Split one q band into n_procs chunks running concurrently on the GPU.
+
+    cmd_base ends with a (q_lo, q_hi) placeholder tuple for --qrange.
+    Returns (rc, wall, [relation file names]).
+    """
+    q_lo, q_hi = cmd_base[-1]
+    base = cmd_base[:-1]
+    width = q_hi - q_lo
+    n_procs = max(1, min(n_procs, width // 1500 or 1))
+    chunk = width // n_procs
+    ranges = []
+    for i in range(n_procs):
+        a = q_lo + i * chunk
+        b = q_hi if i == n_procs - 1 else a + chunk
+        ranges.append((a, b))
+    t0 = time.monotonic()
+    procs, names = [], []
+    for i, (a, b) in enumerate(ranges):
+        rels = f"band{round_idx}.{i}.rels"
+        names.append(rels)
+        log = open(cwd / f"band{round_idx}.{i}.stdout", "wb")
+        p = subprocess.Popen(
+            [str(c) for c in base] + ["--qrange", f"{a}:{b}",
+                                      "--relations", rels,
+                                      "--log", f"band{round_idx}.{i}.log"],
+            cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT)
+        procs.append(p)
+    deadline = t0 + timeout
+    for p in procs:
+        p.wait(timeout=max(1.0, deadline - time.monotonic()))
+    rc = max(p.returncode for p in procs)
+    return rc, time.monotonic() - t0, names
+
+
+# ---------------------------------------------------------------------------
+# the pipeline
+# ---------------------------------------------------------------------------
+
+def run_nfs(n: int, ctx: RunContext, wd: Path) -> list[int]:
+    """Factor n with GNFS inside wd; returns factors (empty on failure)."""
+    msieve = find_bin("msieve", ctx.bin_dir)
+    cuda_sieve = find_bin("cuda-sieve", ctx.bin_dir)
+    wd.mkdir(parents=True, exist_ok=True)
+    digits = len(str(n))
+    nproc = str(ctx.threads)
+    rlim, alim, lpb, logI, initial_raw = nfs_params(digits)
+    ctx.log(f"nfs: c{digits}, rlim={rlim:,}, alim={alim:,}, lpb={lpb}, "
+            f"logI={logI}, target_raw~{initial_raw:,}")
+
+    # ---- stage 1: polynomial selection ---------------------------------
+    if digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
+        budget = poly_budget(digits, ctx.poly_budget_s)
+        cmd = [msieve, "-np", "-t", nproc, "-v", str(n)]
+        if budget > 0:
+            rc, _ = run_cmd_wall_cap(cmd, wd, wd / "np.log", cap_s=budget,
+                                     timeout=NP_TIMEOUT_S)
+            if not (wd / "msieve.fb").exists():
+                # SIGINT before any candidate is saved: retry uncapped
+                run_cmd(cmd, wd, wd / "np.log", timeout=NP_TIMEOUT_S)
+        else:
+            run_cmd(cmd, wd, wd / "np.log", timeout=NP_TIMEOUT_S)
+        if not (wd / "msieve.fb").exists():
+            ctx.log("nfs: polyselect failed (np.log)")
+            return []
+        fb = _parse_msieve_fb(read_log(wd / "msieve.fb"))
+        np_log = read_log(wd / "np.log")
+        m = re.search(r"combined = ([\d.e+-]+)", np_log)
+        ctx.log(f"nfs: poly E={m.group(1)} (msieve -np, budget {budget:.0f}s)"
+                if m else f"nfs: msieve -np poly (budget {budget:.0f}s)")
+    else:
+        degree = 3 if digits < 80 else 4
+        coeffs, mm = base_m_poly(n, degree)
+        fb = {"N": str(n),
+              "SKEW": f"{(abs(coeffs[0]) / abs(coeffs[_degree(coeffs)])) ** 0.25:.2f}",
+              "R0": str(-mm), "R1": "1"}
+        for i, c in enumerate(coeffs):
+            fb[f"A{i}"] = str(c)
+        ctx.log(f"nfs: base-m degree-{degree} poly (m={mm})")
+
+    # ---- stage 2: job file + msieve.fb/worktodo.ini ---------------------
+    job_text = _fb_to_job(fb, rlim, alim, lpb)
+    job_path = wd / f"c{digits}.job"
+    job_path.write_text(job_text)
+    fb_text, ini_text = _job_to_msieve_fb(job_text)
+    (wd / "msieve.fb").write_text(fb_text)
+    (wd / "worktodo.ini").write_text(ini_text)
+
+    # ---- stage 3: sieving + filtering feedback loop ----------------------
+    bands: list[tuple[int, int, list[str], int, float]] = []
+    q_next = alim // 2
+    q_first = q_next
+    q_cap = 6 * q_first
+    target_raw = initial_raw
+    have_raw = 0
+    round_idx = 0
+    while True:
+        ctx.check_deadline()
+        round_idx += 1
+        if bands:
+            qlo_, qhi_, _, cnt, _ = bands[-1]
+            per_int = max(cnt / (qhi_ - qlo_), 1e-9)
+            need = target_raw - have_raw
+            width = int(need / per_int * 1.05) + 2000
+        else:
+            width = 30_000  # probe band
+        qhi = min(q_next + width, q_cap)
+        if qhi <= q_next:
+            q_cap += 2 * q_first  # relax the duplicate-control window
+            qhi = min(q_next + width, q_cap)
+            ctx.log(f"nfs: q window exhausted, cap relaxed to {q_cap}")
+        if bands:
+            ctx.log(f"nfs: round {round_idx}: q {q_next}:{qhi} "
+                    f"(have {have_raw:,}, target {target_raw:,})")
+        base = [cuda_sieve, "--pipeline", "--cofactor",
+                "--poly", job_path.name, "--logI", logI, "--region",
+                min(logI, 14), "--device", ctx.device, (q_next, qhi)]
+        try:
+            rc, _, relnames = _run_band_parallel(base, wd, ctx.sieve_procs,
+                                                 round_idx, SIEVE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            ctx.log("nfs: sieve band timed out")
+            return []
+        if rc != 0:
+            ctx.log(f"nfs: sieve band {round_idx} failed (rc={rc})")
+            return []
+        cnt = sum(count_lines(wd / f) for f in relnames)
+        bands.append((q_next, qhi, relnames, cnt, 0.0))
+        have_raw += cnt
+        q_next = qhi
+
+        with open(wd / "msieve.dat", "wb") as out:
+            for _, _, files, _, _ in bands:
+                for f in files:
+                    out.write((wd / f).read_bytes())
+        rc, _ = run_cmd([msieve, "-s", "msieve.dat", "-l",
+                         f"nc1-r{round_idx}.log", "-nc1", "-t", nproc, "-v"],
+                        wd, wd / f"nc1-r{round_idx}.stdout",
+                        timeout=NC_TIMEOUT_S)
+        out_text = read_log(wd / f"nc1-r{round_idx}.stdout")
+        m = re.search(r"found (\d+) cycles, need (\d+)", out_text)
+        if m and int(m.group(1)) >= int(m.group(2)) \
+                and "too few cycles" not in out_text:
+            break
+        m = re.search(r"filtering wants (\d+) more relations", out_text)
+        if m and round_idx < 10:
+            deficit = int(m.group(1))
+            # msieve's hint is a floor; cycles grow superlinearly — grow the
+            # target geometrically (YAFU's filt-bump analog)
+            target_raw = have_raw + max(int(deficit * 1.2),
+                                        int(have_raw * ctx.topup_frac))
+            continue
+        ctx.log("nfs: filtering did not converge")
+        return []
+
+    # ---- stage 4: matrix build + Lanczos + sqrt ---------------------------
+    run_cmd([msieve, "-s", "msieve.dat", "-l", "nc2-mat.log",
+             "-nc2", "only_matbuild=1", "-t", nproc, "-v"],
+            wd, wd / "nc2-mat.stdout", timeout=NC_TIMEOUT_S)
+    try:
+        rc, _ = run_cmd([msieve, "-s", "msieve.dat", "-l", "nc2-la.log",
+                         "-nc2", "-t", nproc, "-v"], wd, wd / "nc2-la.stdout",
+                        timeout=LA_TIMEOUT_S,
+                        env_extra={"CUDA_VISIBLE_DEVICES": ctx.device})
+    except subprocess.TimeoutExpired:
+        ctx.log("nfs: linear algebra timed out")
+        return []
+    if rc != 0:
+        ctx.log(f"nfs: linear algebra failed (rc={rc})")
+        return []
+    try:
+        rc, _ = run_cmd([msieve, "-s", "msieve.dat", "-l", "nc3.log",
+                         "-nc3", "-t", nproc, "-v"], wd, wd / "nc3.stdout",
+                        timeout=SQRT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        ctx.log("nfs: sqrt timed out")
+        return []
+    log3 = read_log(wd / "nc3.stdout")
+    factors = [int(x) for x in re.findall(r"p\d+ factor: (\d+)", log3)]
+    if not factors:
+        factors = [int(x) for x in re.findall(r"Found [a-z]+ factor of \d+ digits: (\d+)", log3)]
+    factors = [f for f in factors if n % f == 0]
+    ctx.log(f"nfs: complete, {len(factors)} factor(s), "
+            f"{len(bands)} sieve band(s), {have_raw:,} relations")
+    return factors
