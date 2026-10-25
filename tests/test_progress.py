@@ -148,6 +148,37 @@ def test_cli_removes_workdir_on_success(tmp_path, monkeypatch, capsys):
     assert not list(tmp_path.glob("000-*")), "success cleans up"
 
 
+# ------------------------------------------------------------- --no-ecm
+
+def test_no_ecm_skips_ladder_to_sieve(monkeypatch, tmp_path):
+    from yagfu.backends.siqs import SiqsResult
+
+    def fail_ecm(*a, **k):
+        raise AssertionError("ECM must not run with --no-ecm")
+
+    monkeypatch.setattr(engine_mod, "run_ecm_curves", fail_ecm)
+    monkeypatch.setattr(engine_mod, "pollard_rho", lambda m: ([], m))
+
+    p, q = 1_000_000_007, 1_000_000_009
+    sieved = []
+
+    def fake_siqs(m, ctx, wd):
+        sieved.append(m)
+        return SiqsResult(factors=[p, q], ok=True, rc=0, wall_s=0.1)
+
+    monkeypatch.setattr(engine_mod, "run_siqs", fake_siqs)
+    eng = Engine(RunContext(no_ecm=True))
+    res = eng.factor(p * q, tmp_path)
+    assert res.complete, res.error
+    assert sieved == [p * q]          # went straight to the sieve
+
+
+def test_no_ecm_and_ecm_only_are_exclusive(capsys):
+    from yagfu.cli import build_parser
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--ecm-only", "--no-ecm", "42"])
+
+
 # ------------------------------------------------------ run_cmd_progress
 
 def test_run_cmd_progress_forwards_lines(tmp_path):

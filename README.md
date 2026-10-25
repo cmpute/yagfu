@@ -103,6 +103,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `-db, --factor-db` | off | factordb fetch + report (see below) |
 | `--plan {light,normal,deep}` | `normal` | ECM target depth (2/9, 4/13, 1/3 of digits) |
 | `--ecm-only` | off | never run SIQS/NFS: climb every ECM level to its full budget, then sample t65 forever until the number factors or Ctrl+C |
+| `--no-ecm` | off | skip the ECM stage entirely: TD → rho → SIQS/NFS (rerun convenience when the pretest is known useless) |
 | `--xover N` | 105 | SIQS → NFS crossover in digits |
 | `--device N` | 0 | CUDA device |
 | `--threads N` | nproc−2 | CPU threads for msieve stages |
@@ -260,7 +261,7 @@ All binaries are staged into `bin/`: `ecm`, `gpuecm2`, `cuda-mpqs`,
 ## Development
 
 ```sh
-PYTHONPATH=src python3 -m pytest tests/      # 109 unit tests, no GPU needed
+PYTHONPATH=src python3 -m pytest tests/      # 113 unit tests, no GPU needed
 PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli -v <N>   # live run
 scripts/build_wheel.sh --no-stage            # rebuild wheel without re-staging
 ```

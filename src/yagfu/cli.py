@@ -65,10 +65,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="keep per-number workdirs even on success")
     ap.add_argument("--timeout", type=float, default=None,
                     help="per-number wall-clock budget in seconds")
-    ap.add_argument("--ecm-only", action="store_true",
-                    help="never run SIQS/NFS: keep raising the ECM level "
-                         "until the number factors or Ctrl+C (the t65 level "
-                         "is sampled forever once reached)")
+    ecm_mode = ap.add_mutually_exclusive_group()
+    ecm_mode.add_argument("--ecm-only", action="store_true",
+                          help="never run SIQS/NFS: keep raising the ECM "
+                               "level until the number factors or Ctrl+C "
+                               "(the t65 level is sampled forever once "
+                               "reached)")
+    ecm_mode.add_argument("--no-ecm", action="store_true",
+                          help="skip the ECM stage entirely: TD -> rho -> "
+                               "SIQS/NFS (handy for reruns when the ECM "
+                               "pretest is known to be useless)")
     ap.add_argument("--force", choices=("siqs", "nfs"), default=None,
                     help=argparse.SUPPRESS)  # debug: skip the selector
     ap.add_argument("--ecm-stage2-maxmem", type=int, default=None, metavar="MB",
@@ -299,6 +305,7 @@ def main(argv=None) -> int:
         timeout_s=args.timeout,
         force_method=args.force,
         ecm_only=args.ecm_only,
+        no_ecm=args.no_ecm,
         topup_frac=args.topup_frac,
     )
     if args.threads:

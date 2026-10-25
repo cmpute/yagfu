@@ -213,16 +213,19 @@ class Engine:
         ctx.check_deadline()
 
         # -- GPU ECM ladder ----------------------------------------------------
-        t = time.monotonic()
-        m = self._ecm_stage(m, wd, res, depth)
-        res.spend("ecm", time.monotonic() - t)
-        if m == 1:
-            return
-        if is_probable_prime(m):
-            ff = FoundFactor(m, "ecm", m < SPRP_2761_LIMIT)
-            res.factors.append(ff)
-            self._note_factor(ff, " (ecm cofactor)")
-            return
+        if ctx.no_ecm:
+            ctx.log("ecm: skipped (--no-ecm)")
+        else:
+            t = time.monotonic()
+            m = self._ecm_stage(m, wd, res, depth)
+            res.spend("ecm", time.monotonic() - t)
+            if m == 1:
+                return
+            if is_probable_prime(m):
+                ff = FoundFactor(m, "ecm", m < SPRP_2761_LIMIT)
+                res.factors.append(ff)
+                self._note_factor(ff, " (ecm cofactor)")
+                return
         ctx.check_deadline()
 
         # -- sieves --------------------------------------------------------------

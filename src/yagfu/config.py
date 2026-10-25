@@ -31,6 +31,7 @@ class RunContext:
     timeout_s: float | None = None       # per-number wall budget
     force_method: str | None = None      # debug: "siqs" | "nfs"
     ecm_only: bool = False               # no sieves: ECM ladder forever
+    no_ecm: bool = False                 # skip the ECM stage entirely (reruns)
     ecm_maxcurves: int = 8192            # curves per GPU stage-1 invocation
     ecm_stage2_maxmem_mb: int | None = None     # gpuecm2 -maxmem; None = 90% of VRAM,
                                          # 0 = no cap (gpuecm2's own free-mem check)
