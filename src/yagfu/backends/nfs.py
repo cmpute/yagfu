@@ -14,6 +14,7 @@ Pipeline shape:
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import signal
@@ -317,6 +318,60 @@ class PolyselectJob:
                     pass
 
 
+def _append_band_rels(wd: Path, relnames: list[str]) -> None:
+    """Append one round's band files into msieve.dat, then delete them:
+    relations live in exactly one copy on disk."""
+    with open(wd / "msieve.dat", "ab") as out:
+        for f in relnames:
+            out.write((wd / f).read_bytes())
+    for f in relnames:
+        try:
+            (wd / f).unlink()
+        except OSError:
+            pass
+
+
+_NFS_STATE = "nfs-state.json"
+
+
+def _save_nfs_state(wd: Path, n: int, **kv) -> None:
+    kv["n"] = str(n)
+    (wd / _NFS_STATE).write_text(json.dumps(kv))
+
+
+def _load_nfs_state(wd: Path, n: int) -> dict | None:
+    """Checkpoint of the sieve loop for this exact n, or None."""
+    p = wd / _NFS_STATE
+    if not p.exists():
+        return None
+    try:
+        s = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    if s.get("n") != str(n) or "q_next" not in s:
+        return None
+    return s
+
+
+def _poly_e_from_log(wd: Path) -> float | None:
+    """Best-polynomial score from a polyselect log, if present."""
+    p = wd / "np.log"
+    if not p.exists():
+        return None
+    m = re.search(r"combined = ([\d.e+-]+)", read_log(p))
+    return float(m.group(1)) if m else None
+
+
+def nfs_resume_pending(wd: Path, n: int) -> bool:
+    """True when a previous run left a reusable polynomial for n in wd —
+    the engine then skips starting a background polyselect on top of it."""
+    job = wd / f"c{len(str(n))}.job"
+    try:
+        return f"n: {n}" in job.read_text()
+    except OSError:
+        return False
+
+
 def run_nfs(n: int, ctx: RunContext, wd: Path,
             poly: PolyselectJob | None = None) -> NfsResult:
     """Factor n with GNFS inside wd.
@@ -334,25 +389,52 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
     ctx.log(f"nfs: c{digits}, rlim={rlim:,}, alim={alim:,}, lpb={lpb}, "
             f"logI={logI}, target_raw~{initial_raw:,}")
 
-    # ---- stage 1: polynomial selection ---------------------------------
+    # ---- stage 1: polynomial selection (or reuse from a previous run) ----
     t = time.monotonic()
-    if digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
-        if poly is None:
-            poly = PolyselectJob(n, ctx, wd, background=False)
-        poly.wait()
-        res.stages["polyselect_s"] = poly.wall_s
-        if poly.fb is None:
-            res.error = poly.error
-            ctx.log(f"nfs: {res.error}")
-            return res
-        fb = poly.fb
-        res.poly_e, res.poly_method = poly.poly_e, poly.poly_method
-        if poly.poly_e is not None:
-            ctx.log(f"nfs: poly E={poly.poly_e:g} "
-                    f"(msieve -np, {fmt_dur(poly.wall_s)})")
-        else:
-            ctx.log(f"nfs: msieve -np poly ({fmt_dur(poly.wall_s)})")
-    else:
+    job_path = wd / f"c{digits}.job"
+    reused = False
+    if job_path.exists():
+        job_text = job_path.read_text()
+        if f"n: {n}" in job_text:
+            reused = True
+            if poly is not None:
+                poly.cancel()      # engine could not have known; stop it
+            res.poly_method = "msieve -np (resumed)"
+            e = _poly_e_from_log(wd)
+            if e is not None:
+                res.poly_e = e
+            ctx.log("nfs: reusing polynomial from workdir"
+                    + (f" (E={res.poly_e:g})" if res.poly_e else ""))
+    if not reused and digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
+        fb = None
+        if (wd / "msieve.fb").exists():
+            # polyselect finished (or was budget-capped) but the job file
+            # never got written — the fb is still usable
+            cand = _parse_msieve_fb(read_log(wd / "msieve.fb"))
+            if cand.get("N") == str(n):
+                fb = cand
+                res.poly_method = "msieve -np (resumed)"
+                e = _poly_e_from_log(wd)
+                if e is not None:
+                    res.poly_e = e
+                ctx.log("nfs: reusing msieve.fb from workdir"
+                        + (f" (E={res.poly_e:g})" if res.poly_e else ""))
+        if fb is None:
+            if poly is None:
+                poly = PolyselectJob(n, ctx, wd, background=False)
+            poly.wait()
+            if poly.fb is None:
+                res.error = poly.error
+                ctx.log(f"nfs: {res.error}")
+                return res
+            fb = poly.fb
+            res.poly_e, res.poly_method = poly.poly_e, poly.poly_method
+            if res.poly_e is not None:
+                ctx.log(f"nfs: poly E={res.poly_e:g} "
+                        f"(msieve -np, {fmt_dur(poly.wall_s)})")
+            else:
+                ctx.log("nfs: msieve -np poly")
+    if not reused and digits < NFS_MSIEVE_POLY_MIN_DIGITS:
         degree = 3 if digits < 80 else 4
         coeffs, mm = base_m_poly(n, degree)
         fb = {"N": str(n),
@@ -362,31 +444,52 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
             fb[f"A{i}"] = str(c)
         res.poly_method = f"base-m deg-{degree}"
         ctx.log(f"nfs: base-m degree-{degree} poly (m={mm})")
-        res.stages["polyselect_s"] = time.monotonic() - t
-
+    res.stages["polyselect_s"] = 0.0 if reused else time.monotonic() - t
 
     # ---- stage 2: job file + msieve.fb/worktodo.ini ---------------------
-    job_text = _fb_to_job(fb, rlim, alim, lpb)
-    job_path = wd / f"c{digits}.job"
-    job_path.write_text(job_text)
+    if not reused:
+        job_text = _fb_to_job(fb, rlim, alim, lpb)
+        job_path.write_text(job_text)
     fb_text, ini_text = _job_to_msieve_fb(job_text)
     (wd / "msieve.fb").write_text(fb_text)
     (wd / "worktodo.ini").write_text(ini_text)
 
     # ---- stage 3: sieving + filtering feedback loop ----------------------
-    bands: list[tuple[int, int, list[str], int, float]] = []
-    q_next = alim // 2
-    q_first = q_next
-    q_cap = 6 * q_first
-    target_raw = initial_raw
-    have_raw = 0
-    round_idx = 0
+    # resumable: the polynomial (job file) and every sieved relation
+    # (msieve.dat) survive a kill; nfs-state.json pins q_next/target/have
+    state = _load_nfs_state(wd, n)
+    if state is not None and not (wd / "msieve.dat").exists():
+        state = None                # checkpoint without its relations: redo
+    q_first = alim // 2
+    if state is None:
+        q_next = q_first
+        q_cap = 6 * q_first
+        target_raw = initial_raw
+        have_raw = 0
+        round_idx = 0
+        bands_count = 0
+        last_cnt = last_width = 0
+        try:
+            (wd / "msieve.dat").unlink()   # stateless leftovers: restart
+        except OSError:
+            pass
+    else:
+        q_next = int(state["q_next"])
+        q_cap = int(state.get("q_cap", 6 * q_first))
+        target_raw = int(state["target_raw"])
+        have_raw = int(state["have_raw"])
+        round_idx = int(state.get("round_idx", 0))
+        bands_count = int(state.get("bands", 0))
+        last_cnt = int(state.get("last_cnt", 0))
+        last_width = int(state.get("last_width", 0))
+        ctx.log(f"nfs: resuming: {have_raw:,} relations in msieve.dat "
+                f"(round {round_idx}, q from {q_next:,}, "
+                f"target {target_raw:,})")
     while True:
         ctx.check_deadline()
         round_idx += 1
-        if bands:
-            qlo_, qhi_, _, cnt, _ = bands[-1]
-            per_int = max(cnt / (qhi_ - qlo_), 1e-9)
+        if bands_count:
+            per_int = max(last_cnt / last_width, 1e-9)
             need = target_raw - have_raw
             width = int(need / per_int * 1.05) + 2000
         else:
@@ -396,18 +499,20 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
             q_cap += 2 * q_first  # relax the duplicate-control window
             qhi = min(q_next + width, q_cap)
             ctx.log(f"nfs: q window exhausted, cap relaxed to {q_cap}")
-        ctx.log(f"nfs: round {round_idx}{' (probe)' if not bands else ''}: "
+        ctx.log(f"nfs: round {round_idx}{' (probe)' if not bands_count else ''}: "
                 f"q {q_next}:{qhi}"
                 + (f" (have {have_raw:,}, target {target_raw:,})"
-                   if bands else ""))
+                   if bands_count else ""))
         base = [cuda_sieve, "--pipeline", "--cofactor",
                 "--poly", job_path.name, "--logI", logI, "--region",
                 min(logI, 14), "--device", ctx.device, (q_next, qhi)]
+        for stale in wd.glob(f"band{round_idx}.*"):
+            # a killed run may have left this round's partial outputs; the
+            # same round index repeats on resume, so never append to them
+            stale.unlink(missing_ok=True)
         try:
             rc, wall, relnames = _run_band_parallel(
-                base, wd, ctx.sieve_procs, round_idx, SIEVE_TIMEOUT_S,
-                beat=lambda el: ctx.log(f"nfs: sieving round {round_idx}, "
-                                        f"{fmt_dur(el)} elapsed"))
+                base, wd, ctx.sieve_procs, round_idx, SIEVE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             res.error = "sieve band timed out"
             ctx.log(f"nfs: {res.error}")
@@ -418,9 +523,15 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
             ctx.log(f"nfs: {res.error}")
             return res
         cnt = sum(count_lines(wd / f) for f in relnames)
-        bands.append((q_next, qhi, relnames, cnt, 0.0))
+        _append_band_rels(wd, relnames)     # one copy on disk, then delete
+        last_cnt, last_width = cnt, qhi - q_next
         have_raw += cnt
         q_next = qhi
+        bands_count += 1
+        _save_nfs_state(wd, n, q_next=q_next, q_cap=q_cap,
+                        target_raw=target_raw, have_raw=have_raw,
+                        round_idx=round_idx, bands=bands_count,
+                        last_cnt=last_cnt, last_width=last_width)
         rate = cnt / wall if wall > 0 else 0.0
         if rate > 0 and target_raw > have_raw:
             ctx.log(f"nfs: +{cnt:,} rels in {fmt_dur(wall)} "
@@ -432,10 +543,6 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
                     f"({fmt_count(rate)}/s); have {fmt_count(have_raw)}, "
                     f"filtering")
 
-        with open(wd / "msieve.dat", "wb") as out:
-            for _, _, files, _, _ in bands:
-                for f in files:
-                    out.write((wd / f).read_bytes())
         t = time.monotonic()
         rc, _ = run_cmd([msieve, "-s", "msieve.dat", "-l",
                          f"nc1-r{round_idx}.log", "-nc1", "-t", nproc, "-v"],
@@ -455,6 +562,10 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
             # target geometrically (YAFU's filt-bump analog)
             target_raw = have_raw + max(int(deficit * 1.2),
                                         int(have_raw * ctx.topup_frac))
+            _save_nfs_state(wd, n, q_next=q_next, q_cap=q_cap,
+                            target_raw=target_raw, have_raw=have_raw,
+                            round_idx=round_idx, bands=bands_count,
+                            last_cnt=last_cnt, last_width=last_width)
             continue
         res.error = "filtering did not converge"
         ctx.log(f"nfs: {res.error}")
@@ -512,7 +623,7 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
     res.factors = [f for f in factors if n % f == 0]
     res.ok = bool(res.factors)
     res.raw_relations = have_raw
-    res.bands = len(bands)
+    res.bands = bands_count
     ctx.log(f"nfs: complete, {len(res.factors)} factor(s), "
-            f"{len(bands)} sieve band(s), {have_raw:,} relations")
+            f"{bands_count} sieve band(s), {have_raw:,} relations")
     return res

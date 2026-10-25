@@ -349,9 +349,8 @@ def main(argv=None) -> int:
     try:
         for idx, n in enumerate(numbers):
             wd = base / f"{idx:03d}-{str(n)[:12]}"
-            if wd.exists():
-                shutil.rmtree(wd)
-            wd.mkdir(parents=True)
+            # an existing workdir is a resume candidate, never wiped
+            wd.mkdir(parents=True, exist_ok=True)
             ctx.log(f"=== [{idx + 1}/{len(numbers)}] c{len(str(n))} "
                     f"workdir {wd} ===")
             t0 = time.monotonic()

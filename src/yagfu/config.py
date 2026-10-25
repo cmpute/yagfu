@@ -41,20 +41,44 @@ class RunContext:
                                          # 0 = no cap (gpuecm2's own free-mem check)
     poly_budget_s: float | None = None   # NFS polyselect override
     topup_frac: float = 1.0          # geometric growth per filter round; GPU sieve is cheap, -nc1 passes are not
+    log_file: Path = field(default_factory=lambda: Path("yagfu.log"))
+                                         # complete run log, appended (cwd)
 
     # per-number state (reset by engine)
     workdir: Path = field(default_factory=lambda: Path("."))
     deadline: float | None = None
 
+    def _tee(self, line: str) -> None:
+        """Append the line to the run log (cwd/yagfu.log)."""
+        fh = self.__dict__.get("_log_fh")
+        if fh is None:
+            try:
+                fh = self.log_file.open("a", encoding="utf-8")
+            except OSError:
+                fh = False        # unusable log file must never kill a run
+            self.__dict__["_log_fh"] = fh
+        if fh:
+            try:
+                fh.write(line + "\n")
+                fh.flush()
+            except OSError:
+                pass
+
     def log(self, msg: str) -> None:
-        """Key progress info — shown by default (YAFU-style), silenced by -q."""
+        """Key progress info — shown by default (YAFU-style), silenced by -q.
+        Always appended to the run log file."""
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        self._tee(line)
         if not self.quiet:
-            print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+            print(line, file=sys.stderr, flush=True)
 
     def logv(self, msg: str) -> None:
         """Extra detail — only with -v."""
-        if self.verbose > 0:
-            print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+        if self.verbose <= 0:
+            return
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        self._tee(line)
+        print(line, file=sys.stderr, flush=True)
 
     def check_deadline(self) -> None:
         if self.deadline is not None and time.monotonic() > self.deadline:

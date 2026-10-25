@@ -123,7 +123,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band |
 | `--ecm-stage2-maxmem MB` | 90% of VRAM | gpuecm2 stage-2 memory cap — limits dF via GMP-ECM's memory model (smaller blocks, same B2 coverage); `0` = no cap |
 | `--timeout S` | none | per-number wall budget |
-| `--workdir DIR` | temp dir | scratch base directory; a number's workdir is removed only when it factors completely, kept on failure/Ctrl+C (`--keep` keeps always) |
+| `--workdir DIR` | temp dir | scratch base directory; a number's workdir is removed only when it factors completely, kept on failure/Ctrl+C (`--keep` keeps always). An NFS workdir is a resume checkpoint: rerun the same number with the same `--workdir` to continue a killed job |
 | `--bin-dir DIR` | — | backend binary directory |
 | `--json` | off | one JSON object per input on stdout |
 | `--db-token FILE` | `~/.factordb_token` | factordb token file (one line) |
@@ -139,7 +139,9 @@ its `P##`/`PRP##` tag and the stage that found it, ECM batch progress with
 B1/B2, per-curve rate and a level-completion ETA, NFS sieve rounds with
 relation rate and ETA, and msieve's own `linear algebra at X%, ETA` lines
 forwarded live during the matrix step). `-v` adds detail (memory caps,
-per-band sieve updates), `-q` silences stderr entirely:
+per-band sieve updates), `-q` silences stderr entirely. The complete log is
+also appended to `yagfu.log` in the working directory (in append mode, kept
+across runs):
 
 ```
 $ yagfu 3946068388498480527218916724621611671856950960754487550101128852810403
@@ -274,7 +276,7 @@ All binaries are staged into `bin/`: `ecm`, `gpuecm2`, `cuda-mpqs`,
 ## Development
 
 ```sh
-PYTHONPATH=src python3 -m pytest tests/      # 123 unit tests, no GPU needed
+PYTHONPATH=src python3 -m pytest tests/      # 132 unit tests, no GPU needed
 PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli -v <N>   # live run
 scripts/build_wheel.sh --no-stage            # rebuild wheel without re-staging
 ```
@@ -283,3 +285,14 @@ Per-number workdirs (ECM residue files, sieve bands, msieve logs) are removed
 only when a number factors completely. A failed, crashed, or interrupted run
 keeps its workdir for post-mortem, together with the base scratch dir (its
 path is printed). `--keep` disables the removal entirely.
+
+**NFS resume.** An NFS job checkpoints itself inside its per-number workdir:
+the selected polynomial (`c{digits}.job`) and every sieved relation
+(`msieve.dat`, appended incrementally — band files are deleted right after
+appending, so relations occupy exactly one copy on disk) survive a kill, and
+`nfs-state.json` pins the sieve position (next q, relation target/have). To
+continue a killed job, rerun the same number with the same `--workdir`: the
+polyselect and all sieved relations are reused and sieving continues at the
+next unsieved q; only the interrupted band is redone. Resume needs an
+explicit `--workdir` (the default temp dir has a fresh random name each run);
+combine with `--no-ecm` to skip the ECM pretest on the rerun as well.

@@ -266,7 +266,9 @@ class Engine:
         if not (ctx.force_method == "nfs"
                 or (ctx.force_method != "siqs" and digits >= ctx.xover)):
             return None
-        from .backends.nfs import PolyselectJob
+        from .backends.nfs import PolyselectJob, nfs_resume_pending
+        if nfs_resume_pending(wd / "nfs", m):
+            return None    # a previous run's polynomial is already there
         return PolyselectJob(m, ctx, wd / "nfs")
 
     def _ecm_done(self, m: int, res: FactorResult) -> bool:
