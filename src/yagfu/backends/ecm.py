@@ -18,6 +18,7 @@ Validated contract (RTX 4090, gmp-ecm 7.0.6 --enable-gpu + gpuecm2 0.1.0):
 from __future__ import annotations
 
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +48,45 @@ _RE_UNSUPPORTED = re.compile(
 
 class EcmUnsupported(Exception):
     """The number cannot run on the GPU ECM pipeline (too large for kernels)."""
+
+
+# --------------------------------------------------------------------- maxmem
+
+#: fraction of total VRAM granted to gpuecm2 stage 2 by default
+DEFAULT_MAXMEM_FRAC = 0.9
+
+_GPU_MEM_CACHE: dict[str, int | None] = {}
+
+
+def gpu_total_mem_mb(device: str = "0") -> int | None:
+    """Total VRAM of `device` in MB via nvidia-smi (cached; None if unknown)."""
+    if device in _GPU_MEM_CACHE:
+        return _GPU_MEM_CACHE[device]
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits", "-i", str(device)],
+            capture_output=True, text=True, timeout=30)
+        mb = int(out.stdout.strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        mb = None
+    _GPU_MEM_CACHE[device] = mb
+    return mb
+
+
+def resolve_maxmem(explicit: int | None, device: str = "0") -> int | None:
+    """gpuecm2 -maxmem value in MB.
+
+    explicit wins (0 disables the cap); otherwise 90% of the card's total
+    VRAM; None if the capacity cannot be determined (gpuecm2 then falls
+    back to its own free-memory budgeting).
+    """
+    if explicit is not None:
+        return explicit or None
+    total = gpu_total_mem_mb(device)
+    if not total:
+        return None
+    return int(total * DEFAULT_MAXMEM_FRAC)
 
 
 @dataclass
@@ -99,11 +139,14 @@ def _stage1(n: int, b1: int, curves: int, ctx: RunContext, wd: Path,
 
 
 def _stage2(n: int, b1: int, res_path: Path, ctx: RunContext, wd: Path,
-            tag: str) -> tuple[dict[int, EcmProvenance], float, str | None]:
+            tag: str, maxmem: int | None) -> tuple[dict[int, EcmProvenance], float, str | None]:
     """gpuecm2 on the saved residues; returns (factors, wall, error)."""
     g2 = find_bin("gpuecm2", ctx.bin_dir)
     log_path = wd / f"ecm-{tag}.stage2.log"
-    cmd = [g2, "-v", "-resume", res_path.name, str(b1)]
+    cmd = [g2, "-v"]
+    if maxmem:
+        cmd += ["-maxmem", maxmem]
+    cmd += ["-resume", res_path.name, str(b1)]
     t0 = time.monotonic()
     try:
         rc, _ = run_cmd(cmd, wd, log_path, timeout=max(600, 4 * 86400))
@@ -140,6 +183,10 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
     if n.bit_length() > GPUECM2_MAX_BITS:
         raise EcmUnsupported(f"{n.bit_length()} bits > gpuecm2 limit of {GPUECM2_MAX_BITS}")
 
+    maxmem = resolve_maxmem(ctx.ecm_maxmem_mb, ctx.device)
+    if maxmem:
+        ctx.log(f"ecm: gpuecm2 -maxmem {maxmem} MB"
+                + ("" if ctx.ecm_maxmem_mb else " (90% of VRAM)"))
     out = EcmRunResult()
     done = 0
     inv = 0
@@ -162,7 +209,8 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
         res_path = wd / f"ecm-{tag}.{inv}.residues"
         if not res_path.exists() or count_lines(res_path) == 0:
             return out  # no residues: nothing to resume
-        facts2, wall2, err2 = _stage2(n, b1, res_path, ctx, wd, f"{tag}.{inv}")
+        facts2, wall2, err2 = _stage2(n, b1, res_path, ctx, wd, f"{tag}.{inv}",
+                                      maxmem)
         out.stage2_s += wall2
         if err2:
             out.error = err2

@@ -103,6 +103,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--device N` | 0 | CUDA device |
 | `--threads N` | nproc−2 | CPU threads for msieve stages |
 | `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band |
+| `--ecm-maxmem MB` | 90% of VRAM | gpuecm2 stage-2 memory cap — limits dF via GMP-ECM's memory model (smaller blocks, same B2 coverage); `0` = no cap |
 | `--timeout S` | none | per-number wall budget |
 | `--workdir DIR` | temp dir | scratch directory (kept on failure; `--keep` always) |
 | `--bin-dir DIR` | — | backend binary directory |
