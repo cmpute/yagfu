@@ -183,10 +183,10 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
     if n.bit_length() > GPUECM2_MAX_BITS:
         raise EcmUnsupported(f"{n.bit_length()} bits > gpuecm2 limit of {GPUECM2_MAX_BITS}")
 
-    maxmem = resolve_maxmem(ctx.ecm_maxmem_mb, ctx.device)
+    maxmem = resolve_maxmem(ctx.ecm_stage2_maxmem_mb, ctx.device)
     if maxmem:
         ctx.log(f"ecm: gpuecm2 -maxmem {maxmem} MB"
-                + ("" if ctx.ecm_maxmem_mb else " (90% of VRAM)"))
+                + ("" if ctx.ecm_stage2_maxmem_mb else " (90% of VRAM)"))
     out = EcmRunResult()
     done = 0
     inv = 0

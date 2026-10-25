@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="per-number wall-clock budget in seconds")
     ap.add_argument("--force", choices=("siqs", "nfs"), default=None,
                     help=argparse.SUPPRESS)  # debug: skip the selector
-    ap.add_argument("--ecm-maxmem", type=int, default=None, metavar="MB",
+    ap.add_argument("--ecm-stage2-maxmem", type=int, default=None, metavar="MB",
                     help="gpuecm2 stage-2 GPU memory cap in MB (default: 90%% "
                          "of the GPU's total VRAM; 0 = no cap, gpuecm2's own "
                          "free-memory budgeting)")
@@ -290,8 +290,8 @@ def main(argv=None) -> int:
     )
     if args.threads:
         kwargs["threads"] = args.threads
-    if args.ecm_maxmem is not None:
-        kwargs["ecm_maxmem_mb"] = args.ecm_maxmem
+    if args.ecm_stage2_maxmem is not None:
+        kwargs["ecm_stage2_maxmem_mb"] = args.ecm_stage2_maxmem
     if args.poly_budget is not None:
         kwargs["poly_budget_s"] = args.poly_budget
     ctx = RunContext(**kwargs)
