@@ -143,7 +143,12 @@ def load_numbers(args) -> list[int]:
 # ---------------------------------------------------------------------------
 
 def _db_factor_list(client: FactorDbClient, n: int, fid: str | None):
-    """Prime factors factordb already knows for n (decimals)."""
+    """Prime factors factordb already knows for n (decimals).
+
+    A CF record may store composite factors (e.g. n = p * c131); those must
+    stay in the remainder for the engine to factor, never count as known
+    primes — otherwise the remainder hits 1, the engine never runs, and the
+    composite in the merged list reads as a permanent "incomplete"."""
     if fid is None:
         return []
     decs = client.get_factor_decimals(fid)
@@ -153,7 +158,7 @@ def _db_factor_list(client: FactorDbClient, n: int, fid: str | None):
             v = int(d)
         except ValueError:
             continue
-        if 1 < v < n and n % v == 0:
+        if 1 < v < n and n % v == 0 and is_probable_prime(v):
             out.append(v)
     return out
 
