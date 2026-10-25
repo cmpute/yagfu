@@ -1,107 +1,120 @@
 # yagfu — yet another GPU factorization utility
 
-A [yafu](https://github.com/bbuhrow/yafu)-style integer factorization driver whose
-backend is entirely GPU programs. The driver is a pure-stdlib Python package
-(`yagfu`, installed as the `yagfu` command); the heavy lifting is done by the
-binaries built from the submodules, bundled into a wheel for copy-install on
-same-environment machines.
-
-Pipeline per composite (yafu's three retained modules: fixed prework budget,
-cumulative ECM work ledger, independent final algorithm selector):
+`yagfu` factors integers on NVIDIA GPUs. It is a [yafu](https://github.com/bbuhrow/yafu)-style
+driver — automatic method selection, work accounting, recursive cofactor handling —
+except every heavy stage runs on the GPU. The driver itself is a pure-stdlib Python
+package installed as the `yagfu` command; the seven backend binaries it drives are
+built from the submodules of this repository and can be bundled into a single wheel
+for copy-install on same-environment machines.
 
 ```
-trial division      pollard rho (Brent)   GPU ECM                SIQS / NFS
-all primes < 256    x²+3, x²+2, x²+1      ecm -gpu (stage 1)     cuda-mpqs
-                                         gpuecm2   (stage 2)     msieve + cuda-sieve
+input composite
+   │
+   ├─ trial division           all 54 primes below 256
+   ├─ perfect-power strip      b^e extracted, recursed
+   ├─ Pollard rho (Brent)      x²+3, x²+2, x²+1 in order; rhomax=1000 batch-GCDs
+   ├─ GPU ECM                  gmp-ecm -gpu (stage 1)  →  gpuecm2 (stage 2)
+   │                           B1 ladder 2e3…85e7, YAFU work ledger, default B2
+   └─ final selector           < 105 digits: cuda-mpqs (SIQS)
+                               ≥ 105 digits: msieve polyselect + cuda-sieve
+                                             sieving + msieve filter/LA/sqrt
+                               (each is the other's fallback)
 ```
 
-Deviations from yafu (by design): no P−1 / P+1 / Fermat; trial division stops at
-256 (not 10 000); ECM always uses GMP-ECM's default B2 (never pinned); ECM stage
-runs param 3 with the yafu `ecm_data_param3` work table; at least one B1=2000
-GPU batch always runs even when yafu would skip ECM (our prework is lighter);
-primality is our own BPSW (MR base 2 + strong Lucas), with deterministic
-SPRP(2, 7, 61) below 2³².
+Every factor found at any stage is verified for divisibility, classified by a
+self-implemented Baillie–PSW test, and recursed on if composite; a result is only
+reported complete when the collected primes multiply back to the input.
 
-Scheduling summary:
+## Algorithm strategy
 
-* rho: three polynomials in order, `rhomax=1000` batch-GCD rounds each.
-* ECM: target depth = plan × digits (light 2/9, normal 4/13, deep 1/3),
-  t-levels t15..t65 at B1 2e3..85e7, work ledger accumulates across B1 levels
-  and survives cofactor splits, each level capped at its diagonal curve budget.
-* Final selector: cuda-mpqs below the crossover (default 105 digits, measured
-  on RTX 4090), msieve+cuda-sieve GNFS at/above it; each is the other's
-  fallback.
+The scheduler keeps the three ideas that make yafu's `factor()` work, adapted to a
+GPU cost model:
 
-## Submodules
+**Fixed prework budget.** Trial division is deliberately shallow (256, not yafu's
+10 000) and rho runs exactly yafu's three-polynomial sweep with `rhomax=1000`
+(batch-GCD rounds, not squarings). On GPU hardware deeper CPU prework does not pay:
+the first ECM batch costs ~0.4 s and covers more ground than any of it.
 
-| directory     | repository                           | branch                   | role                          |
-|---------------|--------------------------------------|--------------------------|-------------------------------|
-| `cgbn`        | cmpute/cgbn                          | `perf-min`               | CUDA big-num library (shared) |
-| `gmp-ecm`     | cmpute/gmp-ecm                       | `perf-min`               | ECM/P-1 stage 1 on GPU        |
-| `gpuecm2`     | ebranger/gpuecm2                     | `main`                   | ECM stage 2 on GPU            |
-| `cuda-mpqs`   | drjanosch42/cuda-mpqs                | `main`                   | SIQS/MPQS on GPU              |
-| `cuda-sieve`  | kyleaskine/cuda-sieve                | `main`                   | NFS relation collection       |
-| `msieve-cuda` | cmpute/msieve-cuda                   | `msieve-lacuda-nfsathome`| NFS filtering / LA / sqrt     |
+**Cumulative ECM work ledger.** Eleven levels t15…t65 at B1 = 2e3, 11e3, 5e4, 25e4,
+1e6, 3e6, 11e6, 43e6, 11e7, 26e7, 85e7. Curves run at level j contribute
+`c / M[i][j]` of normalized work toward *every* depth level i, where M is yafu's
+`ecm_data_param3` curve table (the GPU forces parametrization 3, so that — not the
+param-0 table — is the right one here). The achieved depth is `t[i-1] + 5·s[i]`
+for the first incomplete level i. The target depth is `plan × digits`
+(light 2/9, **normal 4/13**, deep 1/3); the ledger survives cofactor splits, with
+the target recomputed for the smaller cofactor. B2 is never pinned — gpuecm2 uses
+GMP-ECM's default, which maximizes the per-curve find probability.
 
-> Note: `gpuecm2` and `cuda-mpqs` have no `master` branch; their default branch is
-> `main` (recorded above).
+Two deliberate deviations from yafu: P−1 / P+1 / Fermat are skipped entirely, and
+at least one B1=2000 batch always runs even when yafu would jump straight to the
+sieve (`target < 15 && digits ≤ 45`) — cheap insurance given the shallower prework.
 
-## Building the backends
+**Independent final selector.** Below the crossover digit count the job goes to
+cuda-mpqs, at or above it to the GNFS pipeline; the default crossover is 105,
+extrapolated from measured total-wall times on an RTX 4090 (mpqs wins through
+c100: 117 s vs 167 s). NFS parameters come from a per-size anchor table
+(c70…c150, piecewise-linear), polyselect gets a wall-clock budget of
+`max(60 s, 8% of predicted sieve time)` enforced by cooperative SIGINT, and the
+sieving loop is closed by msieve's filter verdict ("found N cycles, need M") with
+geometric relation top-ups.
+
+Primality: Baillie–PSW (base-2 strong MR + strong Lucas, Selfridge method A);
+below 2³² a deterministic SPRP(2, 7, 61) is used and such factors are reported as
+proven primes (`P##`) rather than probable primes (`PRP##`).
+
+## Quick start
 
 ```sh
-./build.sh                 # detect the native GPU (sm_89 here) and build everything
-./build.sh -j 8            # limit parallel jobs
-./build.sh -a 89           # explicit compute capability
-./build.sh --max-bits 32768  # gpuecm2 stage-2 kernels for numbers up to 32768 bits
-./build.sh --only gmp-ecm,gpuecm2   # build just the ECM stage
+# 1. build the backends (needs CUDA toolkit; auto-detects the GPU)
+./build.sh                              # binaries land in bin/
+
+# 2. build the wheel (~85 MB compressed, all binaries inside)
+scripts/build_wheel.sh
+
+# 3. install on this machine — or any machine with the same OS/GPU/driver
+pip install dist/yagfu-0.1.0-py3-none-any.whl     # pipx works too
+yagfu 123456789...
 ```
 
-`gmp-ecm` and `gpuecm2` are both compiled against the `cgbn` submodule (`perf-min`).
-`gmp-ecm` is built with `-DECM_CGBN_ADDCONV -DECM_CGBN_NORMCONV -DECM_CGBN_NORMDROP`,
-which enable the branch-free warp-uniform CGBN optimisations in `cgbn_stage1.cu`
-(see the `perf-min` branch commit history for details).
-
-Every backend's final binary is staged into the unified `bin/` directory (gitignored):
-
-```
-bin/ecm          # gmp-ecm,  GPU stage 1
-bin/gpuecm2      # gpuecm2,  GPU stage 2
-bin/cuda-mpqs    # cuda-mpqs, SIQS/MPQS
-bin/cuda-sieve   # cuda-sieve, NFS relation collection (renamed from bench/bench)
-bin/fbgen        # cuda-sieve, CPU factor-base generator
-bin/fbgen_gpu    # cuda-sieve, GPU factor-base generator
-bin/msieve       # msieve-cuda, NFS post-processing
-```
-
-## The yagfu package
+Without a wheel, run from the repository directly:
 
 ```sh
-# dev: run from the repo without installing
 PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli <N>
-
-# tests (unit, no GPU needed; gmpy2 is used as the reference oracle only)
-PYTHONPATH=src python3 -m pytest tests/
-
-# wheel (~85 MB compressed, binaries inside; installs offline)
-scripts/build_wheel.sh          # stages bin/ into src/yagfu/bin/ and builds dist/
-pip install dist/yagfu-*.whl    # then `yagfu` is on PATH (pipx-compatible)
 ```
 
-Binary lookup order: `--bin-dir` > `$YAGFU_BIN` > bundled `yagfu/bin/` > `$PATH`.
+Binary lookup order: `--bin-dir` > `$YAGFU_BIN` > the wheel-bundled `yagfu/bin/`
+> `$PATH`.
 
-### CLI
+## CLI
 
 ```
-yagfu 1234567890...                 # one number
-yagfu -f numbers.txt                # one number per line (# comments OK)
-yagfu -db -f batch.txt              # factordb.com: fetch, factor what's left, report back
+yagfu <number>                 factor one decimal number
+yagfu -f numbers.txt           factor a file: one number per line (# comments OK)
+yagfu -db <number>             consult factordb.com first, report results back
+yagfu -f batch.txt -db --json  batch mode, JSONL output
 ```
 
-Key options: `--plan {light,normal,deep}` (ECM depth), `--xover 105`
-(SIQS→NFS crossover), `--device`, `--threads`, `--sieve-procs`, `--timeout`,
-`--workdir/--keep`, `--json` (JSONL output), `-v` (progress log to stderr).
+| option | default | meaning |
+|---|---|---|
+| `-f, --file FILE` | — | input file, one number per line |
+| `-db, --factor-db` | off | factordb fetch + report (see below) |
+| `--plan {light,normal,deep}` | `normal` | ECM target depth (2/9, 4/13, 1/3 of digits) |
+| `--xover N` | 105 | SIQS → NFS crossover in digits |
+| `--device N` | 0 | CUDA device |
+| `--threads N` | nproc−2 | CPU threads for msieve stages |
+| `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band |
+| `--timeout S` | none | per-number wall budget |
+| `--workdir DIR` | temp dir | scratch directory (kept on failure; `--keep` always) |
+| `--bin-dir DIR` | — | backend binary directory |
+| `--json` | off | one JSON object per input on stdout |
+| `--db-token FILE` | `~/.factordb_token` | factordb token file (one line) |
+| `--db-no-report` | off | with `-db`: query only, never report |
+| `--db-dry-run` | off | with `-db`: print RPC payloads instead of sending |
+| `--poly-budget S` | heuristic | NFS polyselect deadline (0 = msieve's own) |
+| `--topup-frac F` | 0.5 | NFS relation top-up growth on filter failure |
+| `-v / -q` | — | progress log to stderr / mute the detail line |
 
-Output goes to stdout, one result line per input:
+Results go to stdout, one primary line per input, logs to stderr:
 
 ```
 $ yagfu 3946068388498480527218916724621611671856950960754487550101128852810403
@@ -109,28 +122,115 @@ $ yagfu 3946068388498480527218916724621611671856950960754487550101128852810403
   [PRP35 PRP35]  4.3s
 ```
 
-Factors are tagged `P##` (primality proven: trial division or < 2³² SPRP) or
-`PRP##` (BPSW). Exit code 0 only if every input factored completely.
+With `--json`, each input produces one line with `n`, `complete`, `factors`
+(each with `value`/`tag`/`proven`/`source`, plus `ecm: {b1, b2, sigma, stage}`
+provenance for ECM finds), stage timings, and counters. Exit code is 0 only if
+every input factored completely.
 
-### factordb integration (`-db` / `--factor-db`)
+## factordb integration (`-db`)
 
-* Before factoring: `get_number` — `FF`/`P`/`PR` records are answered straight
-  from the database; `CF` records have their known prime factors divided out and
-  only the remaining composite cofactor is factored locally.
-* After factoring: newly found prime/PRP factors are reported
-  (`report_factors`, with credit when `~/.factordb_token` exists), and factors
-  that ECM found (25–100 digits) get their curve parameters submitted
-  (`report_ecm` with param 3, sigma, B1, and the effective default B2).
-* Reporting never blocks the factorization: all failures are logged and skipped.
-  `--db-no-report` queries only; `--db-dry-run` prints payloads instead of
-  sending.
+Before factoring, the number's record is fetched via JSON-RPC
+(`https://factordb.com:4059/rpc`, the same transport and politeness rules as the
+reference `fdb_yafu_loop.py`: ≥0.5 s between calls, exponential backoff on
+429/5xx):
 
-Transport: JSON-RPC 2.0 at `https://factordb.com:4059/rpc`, ≥0.5 s between
-calls, exponential backoff on 429/5xx (same contract as the reference
-`fdb_yafu_loop.py`).
+* `FF` / `P` / `PR` — answered straight from the database, no GPU work;
+* `CF` — known prime factors are divided out and only the remaining composite
+  cofactor is factored locally;
+* `C` / unknown — full local factorization.
 
-## Cloning fresh
+After factoring, newly found prime/PRP factors are submitted
+(`report_factors`, with `credit: true` when a token is configured). Factors that
+ECM found (25–100 digits) additionally get their curve parameters submitted via
+`report_ecm` — param 3, the sigma of the finding curve (parsed from the GPU
+stage-1/stage-2 output), B1, and the effective default B2; factordb accepts
+these as record orders. Reporting failures are logged and skipped; they never
+affect the factorization result or the exit code.
+
+The token is read from `--db-token FILE` (default `~/.factordb_token`, one line)
+and sent in the `X-Fdb-User-Token` header; it is never printed. Without a token
+everything still works, anonymously and without credit.
+
+## Performance
+
+RTX 4090, balanced semiprimes (`benchmarks/numbers.json`, fixed seed), single
+GPU, measured wall times:
+
+| digits | SIQS (cuda-mpqs) | GNFS (msieve + cuda-sieve + msieve) | yagfu auto (incl. pretest) |
+|---:|---:|---:|---:|
+| 70 | 1.6 s | 59.6 s | 4.3 s |
+| 80 | 6.1 s | 95.9 s | ≈7 s * |
+| 90 | 17.2 s | 132 s | 135 s (`--force nfs`) |
+| 100 | 117 s | 167 s | ≈130 s * |
+
+\* measured at c70 and c90; the c80/c100 entries are sums of the measured
+pretest and method times, not separate end-to-end runs.
+
+The ECM pretest itself is cheap: reaching the normal-plan target on a c100
+(t30.8) costs ~17 s across four B1 levels. A 15–30 digit factor anywhere in the
+pipeline is typically found in the first or second batch.
+
+Reproduce with `python3 bench_factor.py run --method all --digits 70,80,90,100`
+(per-method benchmark harness) or by feeding the same numbers to `yagfu`.
+
+## Repository layout
+
+```
+src/yagfu/            the Python package
+  cli.py                CLI, per-number loop, factordb glue
+  engine.py             scheduler: stage chain, recursion, final selector
+  ecmledger.py          YAFU param-3 ECM work ledger (t15…t65)
+  arith.py              trial division, Brent rho, perfect powers, iroot
+  primes.py             BPSW + deterministic SPRP(2,7,61)
+  params.py             NFS/SIQS parameter tables and interpolation
+  fdb.py                factordb JSON-RPC client
+  backends/
+    ecm.py                ecm -gpu -save / gpuecm2 -resume driver, sigma parsing
+    siqs.py               cuda-mpqs wrapper
+    nfs.py                polyselect → sieve bands → filter/LA/sqrt pipeline
+    runner.py             subprocess plumbing
+scripts/build_wheel.sh  stages bin/ into the package and builds the wheel
+tests/                  82 unit tests (no GPU required; gmpy2 is only used
+                        as a reference oracle for the primality tests)
+bench_factor.py         standalone method benchmark (SIQS vs GNFS)
+bin/                    build output (gitignored)
+```
+
+Backends (git submodules):
+
+| directory     | repository            | role                                |
+|---------------|-----------------------|-------------------------------------|
+| `cgbn`        | cmpute/cgbn (`perf-min`) | CUDA big-num library (shared)   |
+| `gmp-ecm`     | cmpute/gmp-ecm (`perf-min`) | ECM stage 1 on GPU              |
+| `gpuecm2`     | ebranger/gpuecm2 (`main`)   | ECM stage 2 on GPU              |
+| `cuda-mpqs`   | drjanosch42/cuda-mpqs (`main`) | SIQS/MPQS on GPU            |
+| `cuda-sieve`  | kyleaskine/cuda-sieve (`main`) | NFS relation collection     |
+| `msieve-cuda` | cmpute/msieve-cuda (`msieve-lacuda-nfsathome`) | NFS polyselect/filter/LA/sqrt |
+
+`gmp-ecm` and `gpuecm2` compile against the `cgbn` submodule; `gmp-ecm` is built
+with `-DECM_CGBN_ADDCONV -DECM_CGBN_NORMCONV -DECM_CGBN_NORMDROP` (branch-free
+warp-uniform CGBN optimisations, see the `perf-min` branch history).
+
+## Building the backends
 
 ```sh
 git clone --recurse-submodules <this repo>
+./build.sh                                   # detect the GPU (sm_89 here), build all
+./build.sh -a 89 -j 8                        # explicit arch, limited jobs
+./build.sh --max-bits 32768                  # gpuecm2 kernels up to 32768-bit inputs
+./build.sh --only gmp-ecm,gpuecm2            # rebuild just the ECM stage
 ```
+
+All binaries are staged into `bin/`: `ecm`, `gpuecm2`, `cuda-mpqs`,
+`cuda-sieve`, `fbgen`, `fbgen_gpu`, `msieve`.
+
+## Development
+
+```sh
+PYTHONPATH=src python3 -m pytest tests/      # 82 unit tests, no GPU needed
+PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli -v <N>   # live run
+scripts/build_wheel.sh --no-stage            # rebuild wheel without re-staging
+```
+
+Per-number workdirs (ECM residue files, sieve bands, msieve logs) are kept on
+failure for post-mortem and removed on success; `--keep` / `--workdir` overrides.
