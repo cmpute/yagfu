@@ -271,6 +271,10 @@ class PolyselectJob:
     def running(self) -> bool:
         return self._p.poll() is None
 
+    def elapsed(self) -> float:
+        """Wall time since launch (even while still running)."""
+        return time.monotonic() - self._t0
+
     def wait(self, timeout: float | None = None) -> "PolyselectJob":
         """Block until polyselect is done (including the uncapped retry
         when the budget expired before any candidate was saved)."""

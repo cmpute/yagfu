@@ -22,7 +22,11 @@ class FakeJob:
         self.polls_left = polls
         self.cancelled = 0
         self.waited = 0
+        self.budget = 60.0
         self.fb = {"N": "1"}          # truthy: cancel() keeps artifacts
+
+    def elapsed(self):
+        return 12.0
 
     def running(self):
         if self.polls_left > 0:
@@ -150,7 +154,9 @@ def test_replan_carries_ledger_and_logs_discard(monkeypatch, tmp_path,
     assert len(calls["b1"]) == 3        # original ladder + one bonus call;
                                         # the cofactor inherited the ledger
     assert job.cancelled >= 1
-    assert "discarding background polyselect" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "discarding background polyselect" in err
+    assert "budget 60s" in err and "ran 12s" in err
 
 
 def test_overlap_keyboard_interrupt_cancels_job(monkeypatch, tmp_path):

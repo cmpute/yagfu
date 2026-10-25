@@ -297,8 +297,9 @@ class Engine:
         (smaller, digit-based) polyselect budget apply."""
         ctx = self.ctx
         if job is not None:
-            ctx.log("nfs: discarding background polyselect "
-                    "(number was split by ECM)")
+            ctx.log(f"nfs: discarding background polyselect (number was "
+                    f"split by ECM; budget {fmt_dur(job.budget)}, "
+                    f"ran {fmt_dur(job.elapsed())})")
             job.cancel()
         if cofactor > 1:
             self._factor_rec(cofactor, wd, res, depth + 1, ledger)
