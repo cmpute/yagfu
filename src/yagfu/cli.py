@@ -62,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="keep per-number workdirs even on success")
     ap.add_argument("--timeout", type=float, default=None,
                     help="per-number wall-clock budget in seconds")
+    ap.add_argument("--ecm-only", action="store_true",
+                    help="never run SIQS/NFS: keep raising the ECM level "
+                         "until the number factors or Ctrl+C (the t65 level "
+                         "is sampled forever once reached)")
     ap.add_argument("--force", choices=("siqs", "nfs"), default=None,
                     help=argparse.SUPPRESS)  # debug: skip the selector
     ap.add_argument("--ecm-stage2-maxmem", type=int, default=None, metavar="MB",
@@ -183,7 +187,8 @@ def factor_with_db(n: int, client: FactorDbClient, engine: Engine, wd: Path,
         prod *= f.value
     merged_complete = prod == n and all(is_probable_prime(f.value) for f in merged)
 
-    if report and res.factors and status not in ("FF", "P", "PR"):
+    if report and res.factors and not res.interrupted \
+            and status not in ("FF", "P", "PR"):
         new_vals = [f.value for f in local_new]
         client.report_factors(fid, n, new_vals)
         fdb_info["reported"] = len(new_vals)
@@ -287,6 +292,7 @@ def main(argv=None) -> int:
         keep_workdir=args.keep or bool(args.workdir),
         timeout_s=args.timeout,
         force_method=args.force,
+        ecm_only=args.ecm_only,
         topup_frac=args.topup_frac,
     )
     if args.threads:
@@ -314,6 +320,7 @@ def main(argv=None) -> int:
         owns_base = True
 
     failures = 0
+    interrupted = False
     try:
         for idx, n in enumerate(numbers):
             wd = base / f"{idx:03d}-{str(n)[:12]}"
@@ -341,13 +348,27 @@ def main(argv=None) -> int:
                 cleanup_workdir(ctx, wd, ok)
                 if not ok:
                     failures += 1
+                if res.interrupted:
+                    interrupted = True
+                    break
+            except KeyboardInterrupt:
+                interrupted = True
+                break
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 print(f"{n}: CRASHED: {e!r}", flush=True)
+    except KeyboardInterrupt:
+        interrupted = True  # e.g. between numbers, or during fdb calls
     finally:
-        if owns_base and base.exists():
-            shutil.rmtree(base, ignore_errors=True)
+        if interrupted:
+            print("yagfu: interrupted by user; partial results above",
+                  file=sys.stderr, flush=True)
+        if owns_base and not interrupted:
+            if base.exists():
+                shutil.rmtree(base, ignore_errors=True)
 
+    if interrupted:
+        return 130  # 128 + SIGINT
     return 1 if failures else 0
 
 

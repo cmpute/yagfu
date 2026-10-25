@@ -166,8 +166,16 @@ def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
             cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT)
         procs.append(p)
     deadline = t0 + timeout
-    for p in procs:
-        p.wait(timeout=max(1.0, deadline - time.monotonic()))
+    try:
+        for p in procs:
+            p.wait(timeout=max(1.0, deadline - time.monotonic()))
+    except BaseException:  # incl. KeyboardInterrupt: never orphan sievers
+        for p in procs:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+        raise
     rc = max(p.returncode for p in procs)
     return rc, time.monotonic() - t0, names
 

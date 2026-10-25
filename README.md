@@ -99,6 +99,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `-f, --file FILE` | — | input file, one number per line |
 | `-db, --factor-db` | off | factordb fetch + report (see below) |
 | `--plan {light,normal,deep}` | `normal` | ECM target depth (2/9, 4/13, 1/3 of digits) |
+| `--ecm-only` | off | never run SIQS/NFS: climb every ECM level to its full budget, then sample t65 forever until the number factors or Ctrl+C |
 | `--xover N` | 105 | SIQS → NFS crossover in digits |
 | `--device N` | 0 | CUDA device |
 | `--threads N` | nproc−2 | CPU threads for msieve stages |
@@ -140,6 +141,10 @@ With `--json`, each input produces one line with `n`, `complete`, `factors`
 (each with `value`/`tag`/`proven`/`source`, plus `ecm: {b1, b2, sigma, stage}`
 provenance for ECM finds), stage timings, and counters. Exit code is 0 only if
 every input factored completely.
+
+Ctrl+C is handled gracefully everywhere (including inside GPU backends and
+parallel cuda-sieve bands): the partial factorization found so far is printed,
+the per-number workdir is kept, and the exit code is 130 — no traceback spam.
 
 ## factordb integration (`-db`)
 

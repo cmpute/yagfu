@@ -12,10 +12,14 @@ budget, cumulative ECM work ledger, independent final algorithm selector):
        digits <= 45 and target < t15)
     -> final selector: cuda-mpqs (SIQS) below the crossover digit count,
        msieve+cuda-sieve (GNFS) at/above it; each is the other's fallback.
+       In ecm-only mode the sieves are never reached: the ladder climbs
+       every level to its full budget and then keeps sampling the t65
+       level forever, until the number is factored or the user interrupts.
 
-Every factor found anywhere is re-verified for divisibility, classified by
-BPSW, and recursed on if composite.  The result is only `complete` when the
-collected factors multiply back to n and all of them are P/PRP.
+Factors accumulate into the FactorResult *as they are found*, so any
+abort — Ctrl+C, --timeout, a backend failure — still yields the partial
+factorization.  A result is only `complete` when the collected factors
+multiply back to n and all of them are P/PRP.
 """
 
 from __future__ import annotations
@@ -30,6 +34,9 @@ from .backends.siqs import run_siqs
 from .config import RunContext
 from .ecmledger import B1_LADDER, CURVES, NUM_LEVELS, EcmLedger, target_depth
 from .primes import SPRP_2761_LIMIT, is_probable_prime
+
+#: curve count per endless top-level batch in ecm-only mode
+ECM_ONLY_TOPUP_CURVES = 1024
 
 
 @dataclass
@@ -49,6 +56,7 @@ class FactorResult:
     n: int
     factors: list[FoundFactor] = field(default_factory=list)
     complete: bool = False
+    interrupted: bool = False
     stages: dict[str, float] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     error: str | None = None
@@ -85,27 +93,33 @@ class Engine:
                              if self.ctx.timeout_s else None)
         self.ctx.log(f"fac: factoring {n} (c{_digits(n)})")
         try:
-            res.factors = self._factor_rec(n, wd, res, depth=0)
-            res.complete = self._verify(n, res.factors)
-            if not res.complete:
-                res.error = res.error or "factors do not multiply back to n"
+            self._factor_rec(n, wd, res, depth=0)
+        except KeyboardInterrupt:
+            # the backend subprocess was killed by subprocess.run's
+            # exception path; report whatever has been collected so far
+            res.error = "interrupted (Ctrl+C)"
+            res.interrupted = True
         except (FactorError, EcmUnsupported, TimeoutError) as e:
             res.error = str(e)
+        res.complete = self._verify(n, res.factors)
+        if not res.complete and not res.error:
+            res.error = "factors do not multiply back to n"
         return res
 
     # -------------------------------------------------------------- helpers
 
     def _collect(self, f: int, source: str, wd: Path, res: FactorResult,
-                 depth: int, ecm: EcmProvenance | None = None) -> list[FoundFactor]:
-        """Classify f; recurse if composite. Returns its prime factors."""
+                 depth: int, ecm: EcmProvenance | None = None) -> None:
+        """Classify f and record it; recurse if composite."""
         if is_probable_prime(f):
             proven = source in ("td", "power") or f < SPRP_2761_LIMIT
             ff = FoundFactor(f, source, proven, ecm)
+            res.factors.append(ff)
             self._note_factor(ff)
-            return [ff]
+            return
         self.ctx.log(f"fac: c{_digits(f)} composite factor from {source}, "
                      f"recursing")
-        return self._factor_rec(f, wd, res, depth + 1)
+        self._factor_rec(f, wd, res, depth + 1)
 
     def _note_factor(self, ff: FoundFactor, note: str = "") -> None:
         """YAFU-style factor announcement (skips trivial TD/small primes)."""
@@ -127,21 +141,20 @@ class Engine:
     # ------------------------------------------------------------- pipeline
 
     def _factor_rec(self, m: int, wd: Path, res: FactorResult,
-                    depth: int) -> list[FoundFactor]:
-        """Factor composite m (> 1) completely into primes."""
+                    depth: int) -> None:
+        """Factor composite m (> 1); primes accumulate into res.factors."""
         ctx = self.ctx
         if m == 1:
-            return []
+            return
         if is_probable_prime(m):
-            return [FoundFactor(m, "trivial", m < SPRP_2761_LIMIT)]
-
-        out: list[FoundFactor] = []
+            res.factors.append(FoundFactor(m, "trivial", m < SPRP_2761_LIMIT))
+            return
 
         # -- trial division (all primes < 256) -----------------------------
         t = time.monotonic()
         small, m = trial_divide(m)
         for p in small:
-            out.append(FoundFactor(p, "td", True))
+            res.factors.append(FoundFactor(p, "td", True))
             res.bump("td_primes")
         if small:
             parts = []
@@ -151,12 +164,12 @@ class Engine:
             ctx.log("fac: td: " + " * ".join(parts))
         res.spend("td", time.monotonic() - t)
         if m == 1:
-            return out
+            return
         if is_probable_prime(m):
             ff = FoundFactor(m, "td", m < SPRP_2761_LIMIT)
+            res.factors.append(ff)
             self._note_factor(ff, " (td cofactor)")
-            out.append(ff)
-            return out
+            return
         ctx.check_deadline()
 
         # -- perfect powers --------------------------------------------------
@@ -166,10 +179,12 @@ class Engine:
             base, e = pp
             res.spend("power", time.monotonic() - t)
             ctx.log(f"power: {m} == base^{e}, recursing")
-            sub = self._collect(base, "power", wd, res, depth)
-            for _ in range(e):
-                out.extend(sub)
-            return out
+            mark = len(res.factors)
+            self._collect(base, "power", wd, res, depth)
+            sub = res.factors[mark:]
+            for _ in range(e - 1):
+                res.factors.extend(sub)
+            return
         ctx.check_deadline()
 
         # -- Pollard rho ------------------------------------------------------
@@ -179,93 +194,112 @@ class Engine:
         for f in fs:
             ctx.log(f"rho: factor {f} ({len(str(f))} digits)")
             res.bump("rho_factors")
-            out.extend(self._collect(f, "rho", wd, res, depth))
+            self._collect(f, "rho", wd, res, depth)
         if m == 1:
-            return out
+            return
         if is_probable_prime(m):
             ff = FoundFactor(m, "rho", m < SPRP_2761_LIMIT)
+            res.factors.append(ff)
             self._note_factor(ff, " (rho cofactor)")
-            out.append(ff)
-            return out
+            return
         ctx.check_deadline()
 
         # -- GPU ECM ladder ----------------------------------------------------
         t = time.monotonic()
-        groups, m = self._ecm_stage(m, wd, res, depth)
+        m = self._ecm_stage(m, wd, res, depth)
         res.spend("ecm", time.monotonic() - t)
-        for g in groups:
-            out.extend(g)
         if m == 1:
-            return out
+            return
         if is_probable_prime(m):
             ff = FoundFactor(m, "ecm", m < SPRP_2761_LIMIT)
+            res.factors.append(ff)
             self._note_factor(ff, " (ecm cofactor)")
-            out.append(ff)
-            return out
+            return
         ctx.check_deadline()
 
         # -- sieves --------------------------------------------------------------
-        return out + self._sieve_stage(m, wd, res, depth)
+        if ctx.ecm_only:
+            raise FactorError(
+                f"ecm-only: c{_digits(m)} not fully factored by ECM")
+        self._sieve_stage(m, wd, res, depth)
 
     # --------------------------------------------------------------- stages
 
-    def _ecm_stage(self, m: int, wd: Path, res: FactorResult,
-                   depth: int) -> tuple[list[list[FoundFactor]], int]:
-        """GPU ECM ladder with the YAFU work ledger.
+    def _ecm_target(self, m: int) -> float:
+        if self.ctx.ecm_only:
+            return 65.0
+        return min(target_depth(_digits(m), self.ctx.plan), 65.0)
 
-        Returns (factor groups, remaining cofactor).  The ledger survives
-        cofactor splits: after dividing out a found factor the target is
-        recomputed for the smaller cofactor while banked work still counts.
+    def _ecm_stage(self, m: int, wd: Path, res: FactorResult,
+                   depth: int) -> int:
+        """GPU ECM ladder with the YAFU work ledger; returns the cofactor.
+
+        The ledger survives cofactor splits: after dividing out a found
+        factor the (fresh) ladder restarts on the smaller cofactor.  In
+        ecm-only mode every level runs to its full budget and the top
+        level is then sampled forever until the number factors or the
+        user interrupts.
         """
         ctx = self.ctx
-        collected: list[list[FoundFactor]] = []
         ledger = EcmLedger()
-        target = min(target_depth(_digits(m), ctx.plan), 65.0)
-        ctx.log(f"ecm: c{_digits(m)}, plan={ctx.plan}, target=t{target:.1f}")
+        target = self._ecm_target(m)
+        plan = "ecm-only" if ctx.ecm_only else ctx.plan
+        ctx.log(f"ecm: c{_digits(m)}, plan={plan}, target=t{target:.1f}")
 
         j = 0
         inv = 0
-        while j < NUM_LEVELS:
-            if j > 0 and (ledger.depth() >= target
-                          or (_digits(m) <= 45 and target < 15.0)):
+        while True:
+            if j >= NUM_LEVELS:
+                if not ctx.ecm_only:
+                    break
+                j = NUM_LEVELS - 1          # park at t65 forever
+            elif not ctx.ecm_only and j > 0 and (
+                    ledger.depth() >= target
+                    or (_digits(m) <= 45 and target < 15.0)):
                 break  # target reached, or YAFU's trivial-pretest skip
             want = min(ledger.curves_for_target(j, target),
                        ledger.level_budget_left(j))
-            if j == 0:
+            if j == 0 and not ctx.ecm_only:
                 want = max(want, CURVES[0][0])  # the always-run first batch
-            if want > 0:
-                inv += 1
-                ctx.check_deadline()
-                r = run_ecm_curves(m, B1_LADDER[j], want, ctx, wd,
-                                   tag=f"l{j}-{inv}")
-                res.bump("ecm_invocations")
-                if r.error:
-                    raise FactorError(f"ecm: {r.error}")
-                ledger.add(j, r.curves_done)
-                ctx.log(f"ecm: B1={B1_LADDER[j]:,}, {r.curves_done} curves "
-                        f"-> t{ledger.depth():.2f} (target t{target:.2f})"
-                        + (f"; {len(r.factors)} factor(s)!" if r.factors else ""))
-                if r.curves_done == 0 and not r.factors:
-                    raise FactorError("ecm made no progress")
-                if r.factors:
-                    for f in sorted(r.factors, key=lambda x: -len(str(x))):
-                        if m % f:
-                            continue
-                        res.bump("ecm_factors")
-                        collected.append(self._collect(
-                            f, "ecm", wd, res, depth, ecm=r.factors[f]))
-                        m //= f
-                        if m == 1 or is_probable_prime(m):
-                            return collected, m
-                    target = min(target_depth(_digits(m), ctx.plan), 65.0)
-                    ctx.log(f"ecm: cofactor now c{_digits(m)}, "
-                            f"target=t{target:.1f}")
-                    continue  # same level, fresh target and budget
+            if want <= 0:
+                if ctx.ecm_only and j == NUM_LEVELS - 1:
+                    want = ECM_ONLY_TOPUP_CURVES  # budget spent: keep going
+                else:
+                    j += 1
+                    continue
+            inv += 1
+            ctx.check_deadline()
+            r = run_ecm_curves(m, B1_LADDER[j], want, ctx, wd,
+                               tag=f"l{j}-{inv}")
+            res.bump("ecm_invocations")
+            if r.error:
+                raise FactorError(f"ecm: {r.error}")
+            ledger.add(j, r.curves_done)
+            ctx.log(f"ecm: B1={B1_LADDER[j]:,}, {r.curves_done} curves "
+                    f"-> t{ledger.depth():.2f} (target t{target:.2f})"
+                    + (f"; {len(r.factors)} factor(s)!" if r.factors else ""))
+            if r.curves_done == 0 and not r.factors:
+                raise FactorError("ecm made no progress")
+            if r.factors:
+                for f in sorted(r.factors, key=lambda x: -len(str(x))):
+                    if m % f:
+                        continue
+                    res.bump("ecm_factors")
+                    self._collect(f, "ecm", wd, res, depth, ecm=r.factors[f])
+                    m //= f
+                    if m == 1 or is_probable_prime(m):
+                        return m
+                ledger = EcmLedger()        # fresh ladder for the cofactor
+                target = self._ecm_target(m)
+                j = 0
+                ctx.log(f"ecm: cofactor now c{_digits(m)}, "
+                        f"target=t{target:.1f}")
+                continue
             j += 1
-        return collected, m
+        return m
 
     def _sieve_stage(self, m: int, wd: Path, res: FactorResult,
-                     depth: int) -> list[FoundFactor]:
+                     depth: int) -> None:
         ctx = self.ctx
         digits = _digits(m)
         want_nfs = ctx.force_method == "nfs" or (
@@ -283,14 +317,16 @@ class Engine:
                     ctx.log(f"siqs: rc={r.rc} in {r.wall_s:.1f}s "
                             f"({r.error or 'ok'})")
                     if r.ok:
-                        return self._absorb(r.factors, m, "siqs", wd, res, depth)
+                        self._absorb(r.factors, m, "siqs", wd, res, depth)
+                        return
                 else:
                     t = time.monotonic()
                     factors = self._nfs(m, wd)
                     res.spend("nfs", time.monotonic() - t)
                     res.bump("nfs_runs")
                     if factors:
-                        return self._absorb(factors, m, "nfs", wd, res, depth)
+                        self._absorb(factors, m, "nfs", wd, res, depth)
+                        return
                     ctx.log("nfs: no factors")
             except TimeoutError:
                 raise
@@ -304,17 +340,15 @@ class Engine:
         raise FactorError(f"both sieves failed on c{digits} (logs in {wd})")
 
     def _absorb(self, raw_factors: list[int], m: int, source: str, wd: Path,
-                res: FactorResult, depth: int) -> list[FoundFactor]:
+                res: FactorResult, depth: int) -> None:
         """Turn a sieve's factor dump into verified prime FoundFactors."""
-        out: list[FoundFactor] = []
         cof = m
         for f in sorted(set(raw_factors)):
             while cof % f == 0:
-                out.extend(self._collect(f, source, wd, res, depth))
+                self._collect(f, source, wd, res, depth)
                 cof //= f
         if cof > 1:
-            out.extend(self._factor_rec(cof, wd, res, depth + 1))
-        return out
+            self._factor_rec(cof, wd, res, depth + 1)
 
     def _nfs(self, n: int, wd: Path) -> list[int]:
         if self._run_nfs is None:
