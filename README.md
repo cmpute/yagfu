@@ -61,6 +61,18 @@ c100: 117 s vs 167 s). NFS parameters come from a per-size anchor table
 sieving loop is closed by msieve's filter verdict ("found N cycles, need M") with
 geometric relation top-ups.
 
+**Overlapped polyselect.** As soon as a number is known to be NFS-bound (≥ 90
+digits and at/above the crossover, or `--force nfs`), `msieve -np` starts in the
+background on the CPUs while the GPU keeps running the ECM ladder — and past the
+plan target, filling higher-level budgets for free until the polyselect budget
+expires. The polyselect wall time is unchanged, the GPU no longer idles during
+it, and the pretest gets extra depth at zero cost; if ECM finds a factor in the
+window the polyselect is cancelled and the cofactor re-planned from scratch.
+`--no-poly-overlap` restores fully serial staging. With several devices
+(`--device 0,1,…`) stage 1 fans out one process per card with counts split by
+learned per-card throughput; the shards' residues are merged into a single
+stage-2 run on the first card.
+
 Primality: Baillie–PSW (base-2 strong MR + strong Lucas, Selfridge method A);
 below 2³² a deterministic SPRP(2, 7, 61) is used and such factors are reported as
 proven primes (`P##`) rather than probable primes (`PRP##`).
@@ -104,6 +116,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--plan {light,normal,deep}` | `normal` | ECM target depth (2/9, 4/13, 1/3 of digits) |
 | `--ecm-only` | off | never run SIQS/NFS: climb every ECM level to its full budget, then sample t65 forever until the number factors or Ctrl+C |
 | `--no-ecm` | off | skip the ECM stage entirely: TD → rho → SIQS/NFS (rerun convenience when the pretest is known useless) |
+| `--no-poly-overlap` | off | run NFS polyselect serially instead of in the background during ECM |
 | `--xover N` | 105 | SIQS → NFS crossover in digits |
 | `--device N[,N…]` | 0 | CUDA device; a comma-separated list fans GPU ECM stage 1 out one process per card (counts split by learned per-card throughput, residues merged into a single stage-2 run on the first card). Sieves use the first device |
 | `--threads N` | nproc−2 | CPU threads for msieve stages |
@@ -261,7 +274,7 @@ All binaries are staged into `bin/`: `ecm`, `gpuecm2`, `cuda-mpqs`,
 ## Development
 
 ```sh
-PYTHONPATH=src python3 -m pytest tests/      # 119 unit tests, no GPU needed
+PYTHONPATH=src python3 -m pytest tests/      # 123 unit tests, no GPU needed
 PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli -v <N>   # live run
 scripts/build_wheel.sh --no-stage            # rebuild wheel without re-staging
 ```

@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import math
 import re
+import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,7 +36,6 @@ from .runner import (
     read_log,
     run_cmd,
     run_cmd_progress,
-    run_cmd_wall_cap,
     run_procs_parallel,
 )
 
@@ -193,8 +194,136 @@ class NfsResult:
     error: str | None = None
 
 
-def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
-    """Factor n with GNFS inside wd."""
+class PolyselectJob:
+    """msieve -np running in the background while GPU ECM continues.
+
+    The engine starts one as soon as a number is known to be NFS-bound;
+    run_nfs later consumes the finished job instead of running its own
+    polyselect.  A watcher thread enforces the wall-clock budget
+    (cooperative SIGINT, then terminate, then kill); Ctrl+C, timeouts and
+    factor-found cancels never leave the msieve process alive.
+    """
+
+    def __init__(self, n: int, ctx: RunContext, wd: Path,
+                 background: bool = True):
+        msieve = find_bin("msieve", ctx.bin_dir)
+        wd.mkdir(parents=True, exist_ok=True)
+        # never inherit a stale poly from an earlier cancelled attempt
+        for name in ("msieve.fb", "np.log"):
+            try:
+                (wd / name).unlink()
+            except OSError:
+                pass
+        self.n, self.ctx, self.wd = n, ctx, wd
+        self.budget = poly_budget(len(str(n)), ctx.poly_budget_s)
+        self.fb: dict[str, str] | None = None
+        self.poly_e: float | None = None
+        self.poly_method: str | None = None
+        self.error: str | None = None
+        self.wall_s = 0.0
+        self._retried = False
+        self._t0 = time.monotonic()
+        self._spawn(msieve)
+        if background:
+            ctx.log(f"nfs: polyselect started in background "
+                    f"(budget {fmt_dur(self.budget)})")
+        else:
+            ctx.log(f"nfs: polyselect (msieve -np, "
+                    f"budget {fmt_dur(self.budget)})")
+        if self.budget > 0:
+            threading.Thread(target=self._budget_watch, daemon=True).start()
+
+    def _spawn(self, msieve) -> None:
+        cmd = [msieve, "-np", "-t", str(self.ctx.threads), "-v", str(self.n)]
+        f = open(self.wd / "np.log", "wb")
+        try:
+            self._p = subprocess.Popen([str(c) for c in cmd],
+                                       cwd=str(self.wd),
+                                       stdout=f, stderr=subprocess.STDOUT)
+        finally:
+            f.close()
+
+    def _budget_watch(self) -> None:
+        p = self._p
+        try:
+            p.wait(timeout=self.budget)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        if p.poll() is None:
+            p.send_signal(signal.SIGINT)
+            try:
+                p.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                self._term_kill()
+
+    def _term_kill(self) -> None:
+        p = self._p
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+
+    def running(self) -> bool:
+        return self._p.poll() is None
+
+    def wait(self, timeout: float | None = None) -> "PolyselectJob":
+        """Block until polyselect is done (including the uncapped retry
+        when the budget expired before any candidate was saved)."""
+        try:
+            self._p.wait(timeout=timeout or NP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            self._term_kill()
+            self._finish()
+            return self
+        if (self.budget > 0 and not self._retried
+                and not (self.wd / "msieve.fb").exists()):
+            # the SIGINT arrived before any candidate was saved
+            self._retried = True
+            self._spawn(find_bin("msieve", self.ctx.bin_dir))
+            try:
+                self._p.wait(timeout=NP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                self._term_kill()
+        self._finish()
+        return self
+
+    def _finish(self) -> None:
+        self.wall_s = time.monotonic() - self._t0
+        fb_path = self.wd / "msieve.fb"
+        if not fb_path.exists():
+            self.error = "polyselect failed (np.log)"
+            return
+        self.fb = _parse_msieve_fb(read_log(fb_path))
+        self.poly_method = "msieve -np"
+        m = re.search(r"combined = ([\d.e+-]+)", read_log(self.wd / "np.log"))
+        if m:
+            self.poly_e = float(m.group(1))
+
+    def cancel(self) -> None:
+        """Stop the polyselect (unless it already produced a polynomial)
+        and drop partial artifacts; idempotent."""
+        p = getattr(self, "_p", None)
+        if p is not None and p.poll() is None:
+            self._term_kill()
+        if p is not None and p.poll() is not None and self.fb is None:
+            for name in ("msieve.fb", "np.log"):
+                try:
+                    (self.wd / name).unlink()
+                except OSError:
+                    pass
+
+
+def run_nfs(n: int, ctx: RunContext, wd: Path,
+            poly: PolyselectJob | None = None) -> NfsResult:
+    """Factor n with GNFS inside wd.
+
+    `poly` is a PolyselectJob the engine started while ECM was still
+    running; its (already computed) polynomial is used instead of running
+    polyselect again."""
     res = NfsResult(params=nfs_params(len(str(n))))
     msieve = find_bin("msieve", ctx.bin_dir)
     cuda_sieve = find_bin("cuda-sieve", ctx.bin_dir)
@@ -208,33 +337,21 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
     # ---- stage 1: polynomial selection ---------------------------------
     t = time.monotonic()
     if digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
-        budget = poly_budget(digits, ctx.poly_budget_s)
-        ctx.log(f"nfs: polyselect (msieve -np, budget {fmt_dur(budget)})")
-        cmd = [msieve, "-np", "-t", nproc, "-v", str(n)]
-        if budget > 0:
-            run_cmd_wall_cap(cmd, wd, wd / "np.log", cap_s=budget,
-                             timeout=NP_TIMEOUT_S)
-            if not (wd / "msieve.fb").exists():
-                # SIGINT before any candidate is saved: retry uncapped
-                run_cmd(cmd, wd, wd / "np.log", timeout=NP_TIMEOUT_S)
-        else:
-            run_cmd(cmd, wd, wd / "np.log", timeout=NP_TIMEOUT_S)
-        if not (wd / "msieve.fb").exists():
-            res.error = "polyselect failed (np.log)"
+        if poly is None:
+            poly = PolyselectJob(n, ctx, wd, background=False)
+        poly.wait()
+        res.stages["polyselect_s"] = poly.wall_s
+        if poly.fb is None:
+            res.error = poly.error
             ctx.log(f"nfs: {res.error}")
-            res.stages["polyselect_s"] = time.monotonic() - t
             return res
-        fb = _parse_msieve_fb(read_log(wd / "msieve.fb"))
-        np_log = read_log(wd / "np.log")
-        m = re.search(r"combined = ([\d.e+-]+)", np_log)
-        if m:
-            res.poly_e = float(m.group(1))
-            res.poly_method = "msieve -np"
-            ctx.log(f"nfs: poly E={m.group(1)} (msieve -np, "
-                    f"budget {budget:.0f}s)")
+        fb = poly.fb
+        res.poly_e, res.poly_method = poly.poly_e, poly.poly_method
+        if poly.poly_e is not None:
+            ctx.log(f"nfs: poly E={poly.poly_e:g} "
+                    f"(msieve -np, {fmt_dur(poly.wall_s)})")
         else:
-            res.poly_method = "msieve -np"
-            ctx.log(f"nfs: msieve -np poly (budget {budget:.0f}s)")
+            ctx.log(f"nfs: msieve -np poly ({fmt_dur(poly.wall_s)})")
     else:
         degree = 3 if digits < 80 else 4
         coeffs, mm = base_m_poly(n, degree)
@@ -245,7 +362,8 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
             fb[f"A{i}"] = str(c)
         res.poly_method = f"base-m deg-{degree}"
         ctx.log(f"nfs: base-m degree-{degree} poly (m={mm})")
-    res.stages["polyselect_s"] = time.monotonic() - t
+        res.stages["polyselect_s"] = time.monotonic() - t
+
 
     # ---- stage 2: job file + msieve.fb/worktodo.ini ---------------------
     job_text = _fb_to_job(fb, rlim, alim, lpb)

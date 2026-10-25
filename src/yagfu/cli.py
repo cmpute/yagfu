@@ -78,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help="skip the ECM stage entirely: TD -> rho -> "
                                "SIQS/NFS (handy for reruns when the ECM "
                                "pretest is known to be useless)")
+    ap.add_argument("--no-poly-overlap", action="store_true",
+                    help="run NFS polyselect serially instead of in the "
+                         "background during ECM")
     ap.add_argument("--force", choices=("siqs", "nfs"), default=None,
                     help=argparse.SUPPRESS)  # debug: skip the selector
     ap.add_argument("--ecm-stage2-maxmem", type=int, default=None, metavar="MB",
@@ -313,6 +316,7 @@ def main(argv=None) -> int:
         force_method=args.force,
         ecm_only=args.ecm_only,
         no_ecm=args.no_ecm,
+        no_poly_overlap=args.no_poly_overlap,
         topup_frac=args.topup_frac,
     )
     if args.threads:
