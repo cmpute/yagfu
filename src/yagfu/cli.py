@@ -50,7 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
                     default="normal", help="ECM pretest depth (default normal)")
     ap.add_argument("--xover", type=int, default=105,
                     help="SIQS -> NFS crossover in digits (default 105)")
-    ap.add_argument("--device", default="0", help="CUDA device (default 0)")
+    ap.add_argument("--device", default="0",
+                    help="CUDA device, or a comma-separated list to fan "
+                         "GPU ECM stage 1 out across cards (e.g. 0,1); "
+                         "sieving and ECM stage 2 use the first device")
     ap.add_argument("--threads", type=int, default=None,
                     help="CPU threads for msieve stages (default nproc-2)")
     ap.add_argument("--sieve-procs", type=int, default=1,
@@ -293,9 +296,13 @@ def main(argv=None) -> int:
     if args.quiet and args.json:
         pass  # json lines still go to stdout; -q only mutes the detail line
     numbers = load_numbers(args)
+    devices = tuple(d.strip() for d in args.device.split(",") if d.strip())
+    if not devices:
+        sys.exit("error: --device needs at least one ordinal")
     kwargs = dict(
         bin_dir=Path(args.bin_dir) if args.bin_dir else None,
-        device=args.device,
+        device=devices[0],
+        devices=devices,
         sieve_procs=args.sieve_procs,
         plan=args.plan,
         xover=args.xover,

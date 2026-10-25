@@ -35,6 +35,7 @@ from .runner import (
     run_cmd,
     run_cmd_progress,
     run_cmd_wall_cap,
+    run_procs_parallel,
 )
 
 NP_TIMEOUT_S = 2 * 3600
@@ -158,48 +159,21 @@ def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
     width = q_hi - q_lo
     n_procs = max(1, min(n_procs, width // 1500 or 1))
     chunk = width // n_procs
-    ranges = []
+    jobs, names = [], []
     for i in range(n_procs):
         a = q_lo + i * chunk
         b = q_hi if i == n_procs - 1 else a + chunk
-        ranges.append((a, b))
-    t0 = time.monotonic()
-    procs, names = [], []
-    for i, (a, b) in enumerate(ranges):
         rels = f"band{round_idx}.{i}.rels"
         names.append(rels)
-        log = open(cwd / f"band{round_idx}.{i}.stdout", "wb")
-        p = subprocess.Popen(
-            [str(c) for c in base] + ["--qrange", f"{a}:{b}",
-                                      "--relations", rels,
-                                      "--log", f"band{round_idx}.{i}.log"],
-            cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT)
-        procs.append(p)
-    deadline = t0 + timeout
-    next_beat = t0 + beat_s
-    try:
-        while any(p.poll() is None for p in procs):
-            if time.monotonic() > deadline:
-                raise subprocess.TimeoutExpired(str(cmd_base[0]), timeout)
-            if beat and time.monotonic() >= next_beat:
-                beat(time.monotonic() - t0)
-                next_beat += beat_s
-            time.sleep(2.0)
-    except BaseException:  # incl. KeyboardInterrupt: never orphan sievers
-        for p in procs:
-            try:
-                p.terminate()
-            except OSError:
-                pass
-        for p in procs:
-            try:
-                p.wait(10)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait()
-        raise
-    rc = max(p.returncode for p in procs)
-    return rc, time.monotonic() - t0, names
+        cmd = [str(c) for c in base] + ["--qrange", f"{a}:{b}",
+                                        "--relations", rels,
+                                        "--log", f"band{round_idx}.{i}.log"]
+        jobs.append((cmd, cwd / f"band{round_idx}.{i}.stdout", None))
+    results = run_procs_parallel(jobs, cwd, timeout, beat=beat,
+                                 beat_s=beat_s)
+    rc = max(rc for rc, _ in results)
+    wall = max(w for _, w in results)
+    return rc, wall, names
 
 
 # ---------------------------------------------------------------------------

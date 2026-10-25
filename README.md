@@ -105,7 +105,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--ecm-only` | off | never run SIQS/NFS: climb every ECM level to its full budget, then sample t65 forever until the number factors or Ctrl+C |
 | `--no-ecm` | off | skip the ECM stage entirely: TD → rho → SIQS/NFS (rerun convenience when the pretest is known useless) |
 | `--xover N` | 105 | SIQS → NFS crossover in digits |
-| `--device N` | 0 | CUDA device |
+| `--device N[,N…]` | 0 | CUDA device; a comma-separated list fans GPU ECM stage 1 out one process per card (counts split by learned per-card throughput, residues merged into a single stage-2 run on the first card). Sieves use the first device |
 | `--threads N` | nproc−2 | CPU threads for msieve stages |
 | `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band |
 | `--ecm-stage2-maxmem MB` | 90% of VRAM | gpuecm2 stage-2 memory cap — limits dF via GMP-ECM's memory model (smaller blocks, same B2 coverage); `0` = no cap |
@@ -261,7 +261,7 @@ All binaries are staged into `bin/`: `ecm`, `gpuecm2`, `cuda-mpqs`,
 ## Development
 
 ```sh
-PYTHONPATH=src python3 -m pytest tests/      # 113 unit tests, no GPU needed
+PYTHONPATH=src python3 -m pytest tests/      # 119 unit tests, no GPU needed
 PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli -v <N>   # live run
 scripts/build_wheel.sh --no-stage            # rebuild wheel without re-staging
 ```

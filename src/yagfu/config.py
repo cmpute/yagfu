@@ -20,7 +20,10 @@ def _nproc() -> int:
 @dataclass
 class RunContext:
     bin_dir: Path | None = None          # explicit --bin-dir
-    device: str = "0"                    # CUDA device ordinal
+    device: str = "0"                    # primary CUDA device (sieves, ECM stage 2)
+    devices: tuple[str, ...] = ("0",)    # ECM stage-1 fan-out set
+    ecm_device_rates: dict = field(default_factory=dict)
+                                         # learned curves/s per device (scratch)
     threads: int = field(default_factory=lambda: max(1, _nproc() - 2))
     sieve_procs: int = 1                 # cuda-sieve processes per band
     plan: str = "normal"                 # light | normal | deep

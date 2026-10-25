@@ -1,6 +1,8 @@
 """Tests for the progress/ETA/cleanup changes: fmt helpers, stage-2 B2
 parsing, the ECM ladder surviving cofactor splits, workdir cleanup policy,
-and the polled run_cmd_progress."""
+the polled run_cmd_progress, and the multi-GPU ECM fan-out."""
+
+import subprocess
 
 import pytest
 
@@ -211,3 +213,104 @@ def test_feed_lines_splits_carriage_returns(tmp_path):
         f.write(b"update 3\rdone\n")
     pos, pending = _feed_lines(log, pos, pending, seen.extend)
     assert seen[-2:] == ["update 3", "done"]
+
+
+# ------------------------------------------------- multi-GPU ECM fan-out
+
+def test_run_procs_parallel(tmp_path):
+    from yagfu.backends.runner import run_procs_parallel
+    beats = []
+    jobs = [(["bash", "-c", "echo a; sleep 0.3"], tmp_path / "a.log", None),
+            (["bash", "-c", "echo b"], tmp_path / "b.log", None)]
+    results = run_procs_parallel(jobs, tmp_path, 30, beat=beats.append,
+                                 beat_s=0.1, poll_s=0.05)
+    assert [rc for rc, _ in results] == [0, 0]
+    walls = [w for _, w in results]
+    assert walls[0] >= 0.25 and 0 <= walls[1] <= walls[0]
+    assert len(beats) >= 2
+
+
+def test_run_procs_parallel_timeout(tmp_path):
+    from yagfu.backends.runner import run_procs_parallel
+    jobs = [(["bash", "-c", "sleep 30"], tmp_path / "a.log", None)]
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_procs_parallel(jobs, tmp_path, 0.4, poll_s=0.05)
+
+
+def test_split_curves():
+    from yagfu.backends.ecm import _split_curves
+    assert _split_curves(100, [1.0, 1.0]) == [50, 50]
+    assert _split_curves(100, [3.0, 1.0]) == [75, 25]
+    assert sum(_split_curves(101, [1.0, 1.0])) == 101
+    assert _split_curves(1, [1.0, 1.0]) in ([1, 0], [0, 1])
+    assert _split_curves(0, [1.0, 1.0]) == [0, 0]
+    assert _split_curves(90, [0.0, 0.0]) == [45, 45]  # degenerate weights
+
+
+def test_merge_residues(tmp_path):
+    from yagfu.backends.ecm import _merge_residues
+    a = tmp_path / "a"; a.write_bytes(b"r1\nr2\n")
+    b = tmp_path / "b"; b.write_bytes(b"")            # factor found: empty
+    c = tmp_path / "c"; c.write_bytes(b"r3\n")
+    out = tmp_path / "merged"
+    assert _merge_residues([a, b, c, tmp_path / "missing"], out) == 3
+    assert out.read_bytes() == b"r1\nr2\nr3\n"
+
+
+def _mk_shards(wd, devs, rans, factors=None, tag="t"):
+    from yagfu.backends.ecm import _Shard
+    shards = []
+    for i, (dev, ran) in enumerate(zip(devs, rans)):
+        p = wd / f"{tag}{i}.res"
+        p.write_bytes(b"SIGMA=1\n" * max(ran // 100, 1))
+        shards.append(_Shard(dev, dict(factors or {}), ran, 1.0, p))
+    return shards
+
+
+def test_run_ecm_curves_fanout_accounting(monkeypatch, tmp_path):
+    import yagfu.backends.ecm as ecm
+
+    ctx = RunContext(devices=("0", "1"))
+    n = P2 * P3
+    calls = {}
+
+    def fake_shards(n_, b1, counts, devices, ctx_, wd, tag):
+        calls["counts"] = counts
+        return _mk_shards(wd, devices, counts)
+
+    def fake_stage2(n_, b1, res_path, ctx_, wd, tag, maxmem, env_extra=None):
+        calls["merged"] = res_path.name
+        calls["env"] = env_extra
+        return {}, 0.5, None, 999_982
+
+    monkeypatch.setattr(ecm, "_stage1_shards", fake_shards)
+    monkeypatch.setattr(ecm, "_stage2", fake_stage2)
+    out = ecm.run_ecm_curves(n, 50_000, 200, ctx, tmp_path, "t")
+    assert calls["counts"] == [100, 100]        # equal cold-start split
+    assert out.curves_done == 200
+    assert out.b2 == 999_982
+    assert calls["merged"].startswith("ecm-t.1.merged")
+    assert calls["env"] == {"CUDA_VISIBLE_DEVICES": "0"}
+    assert ctx.ecm_device_rates["0"] > 0 and ctx.ecm_device_rates["1"] > 0
+
+
+def test_run_ecm_curves_fanout_stop_on_factor(monkeypatch, tmp_path):
+    import yagfu.backends.ecm as ecm
+
+    ctx = RunContext(devices=("0", "1"))
+    prov = EcmProvenance(b1=50_000, stage=1, sigma=7)
+
+    def fake_shards(n_, b1, counts, devices, ctx_, wd, tag):
+        shards = _mk_shards(wd, devices, counts)
+        shards[1].factors[P2] = prov
+        return shards
+
+    def no_stage2(*a, **k):
+        raise AssertionError("stage 2 must not run after a stage-1 factor")
+
+    monkeypatch.setattr(ecm, "_stage1_shards", fake_shards)
+    monkeypatch.setattr(ecm, "_stage2", no_stage2)
+    out = ecm.run_ecm_curves(P2 * P3, 50_000, 10_000, ctx, tmp_path, "t")
+    assert P2 in out.factors and out.factors[P2] is prov
+    assert out.curves_done == 10_000        # both shards counted
+    assert out.error is None
