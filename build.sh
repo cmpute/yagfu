@@ -72,9 +72,15 @@ for t in git nvcc cmake make gcc g++; do
   command -v "$t" >/dev/null 2>&1 || die "required tool not found: $t"
 done
 
-# make sure every submodule is populated (a fresh clone may not be)
-log "initialising submodules"
-git -C "$ROOT" submodule update --init --recursive
+# Make sure every submodule is populated (a fresh clone may not be).  Only
+# initialises submodules whose working tree is missing; it must NOT reset an
+# already-checked-out submodule, or a `git submodule update --remote <name>` or
+# a manual checkout would be silently reverted before the build.
+for sm in cgbn gmp-ecm gpuecm2 cuda-mpqs cuda-sieve msieve-cuda; do
+  [ -e "$ROOT/$sm/.git" ] && continue
+  log "initialising submodule $sm"
+  git -C "$ROOT" submodule update --init --recursive -- "$sm"
+done
 
 # CUDA install prefix, derived from the nvcc on PATH (e.g. /usr/local/cuda)
 NVCC_BIN="$(command -v nvcc)"
