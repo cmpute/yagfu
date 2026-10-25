@@ -113,12 +113,25 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--db-dry-run` | off | with `-db`: print RPC payloads instead of sending |
 | `--poly-budget S` | heuristic | NFS polyselect deadline (0 = msieve's own) |
 | `--topup-frac F` | 0.5 | NFS relation top-up growth on filter failure |
-| `-v / -q` | — | progress log to stderr / mute the detail line |
+| `-v / -q` | — | more detail in the stderr log / silence stderr logs |
 
-Results go to stdout, one primary line per input, logs to stderr:
+Results go to stdout, one primary line per input; YAFU-style progress logs go
+to stderr by default (banner, trial-division summary, every factor found with
+its `P##`/`PRP##` tag and the stage that found it, ECM batch progress with
+t-levels, sieve start/finish). `-v` adds detail (memory caps, per-band sieve
+updates), `-q` silences stderr entirely:
 
 ```
 $ yagfu 3946068388498480527218916724621611671856950960754487550101128852810403
+[20:33:52] fac: factoring 3946068388498480527218916724621611671856950960754487550101128852810403 (c70)
+[20:33:53] ecm: c70, plan=normal, target=t21.5
+[20:33:53] ecm: B1=2,000, 128 curves -> t15.37 (target t21.54)
+[20:33:54] ecm: B1=11,000, 128 curves -> t20.27 (target t21.54)
+[20:33:55] ecm: B1=50,000, 128 curves -> t22.72 (target t21.54)
+[20:33:55] siqs: cuda-mpqs on c70 (lp1=None)
+[20:33:56] siqs: rc=0 in 1.6s (ok)
+[20:33:56] fac: PRP35 = 47360480608224695728619362875791753 (siqs)
+[20:33:56] fac: PRP35 = 83319855242626065532276429111727051 (siqs)
 3946068388498480527218916724621611671856950960754487550101128852810403 = 47360480608224695728619362875791753 * 83319855242626065532276429111727051
   [PRP35 PRP35]  4.3s
 ```

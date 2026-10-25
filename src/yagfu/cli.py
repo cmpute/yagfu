@@ -282,7 +282,8 @@ def main(argv=None) -> int:
         sieve_procs=args.sieve_procs,
         plan=args.plan,
         xover=args.xover,
-        verbose=0 if args.quiet else args.verbose,
+        verbose=args.verbose,
+        quiet=args.quiet,
         keep_workdir=args.keep or bool(args.workdir),
         timeout_s=args.timeout,
         force_method=args.force,
@@ -302,7 +303,7 @@ def main(argv=None) -> int:
         token = read_token(args.db_token)
         fdb_client = FactorDbClient(
             token=token, dry_run=args.db_dry_run,
-            log=(lambda msg: ctx.log(msg)) if ctx.verbose else None)
+            log=(lambda msg: ctx.log(msg)) if not args.quiet else None)
 
     if args.workdir:
         base = Path(args.workdir).expanduser()

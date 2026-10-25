@@ -25,7 +25,8 @@ class RunContext:
     sieve_procs: int = 1                 # cuda-sieve processes per band
     plan: str = "normal"                 # light | normal | deep
     xover: int = 105                     # SIQS -> NFS crossover (digits)
-    verbose: int = 0
+    verbose: int = 0                     # -v count: extra detail level
+    quiet: bool = False                  # -q: silence all progress logs
     keep_workdir: bool = False
     timeout_s: float | None = None       # per-number wall budget
     force_method: str | None = None      # debug: "siqs" | "nfs"
@@ -40,6 +41,12 @@ class RunContext:
     deadline: float | None = None
 
     def log(self, msg: str) -> None:
+        """Key progress info — shown by default (YAFU-style), silenced by -q."""
+        if not self.quiet:
+            print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+    def logv(self, msg: str) -> None:
+        """Extra detail — only with -v."""
         if self.verbose > 0:
             print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 

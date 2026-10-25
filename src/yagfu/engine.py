@@ -83,6 +83,7 @@ class Engine:
         self.ctx.workdir = wd
         self.ctx.deadline = (time.monotonic() + self.ctx.timeout_s
                              if self.ctx.timeout_s else None)
+        self.ctx.log(f"fac: factoring {n} (c{_digits(n)})")
         try:
             res.factors = self._factor_rec(n, wd, res, depth=0)
             res.complete = self._verify(n, res.factors)
@@ -99,8 +100,20 @@ class Engine:
         """Classify f; recurse if composite. Returns its prime factors."""
         if is_probable_prime(f):
             proven = source in ("td", "power") or f < SPRP_2761_LIMIT
-            return [FoundFactor(f, source, proven, ecm)]
+            ff = FoundFactor(f, source, proven, ecm)
+            self._note_factor(ff)
+            return [ff]
+        self.ctx.log(f"fac: c{_digits(f)} composite factor from {source}, "
+                     f"recursing")
         return self._factor_rec(f, wd, res, depth + 1)
+
+    def _note_factor(self, ff: FoundFactor, note: str = "") -> None:
+        """YAFU-style factor announcement (skips trivial TD/small primes)."""
+        if ff.source in ("td", "power", "trivial") or ff.value < 2**16:
+            return
+        extra = {"ecm": " (ecm)", "rho": " (rho)", "siqs": " (siqs)",
+                 "nfs": " (nfs)"}.get(ff.source, "")
+        self.ctx.log(f"fac: {ff.tag} = {ff.value}{extra}{note}")
 
     @staticmethod
     def _verify(n: int, factors: list[FoundFactor]) -> bool:
@@ -130,11 +143,19 @@ class Engine:
         for p in small:
             out.append(FoundFactor(p, "td", True))
             res.bump("td_primes")
+        if small:
+            parts = []
+            for p in sorted(set(small)):
+                e = small.count(p)
+                parts.append(f"{p}^{e}" if e > 1 else f"{p}")
+            ctx.log("fac: td: " + " * ".join(parts))
         res.spend("td", time.monotonic() - t)
         if m == 1:
             return out
         if is_probable_prime(m):
-            out.append(FoundFactor(m, "td", m < SPRP_2761_LIMIT))
+            ff = FoundFactor(m, "td", m < SPRP_2761_LIMIT)
+            self._note_factor(ff, " (td cofactor)")
+            out.append(ff)
             return out
         ctx.check_deadline()
 
@@ -162,7 +183,9 @@ class Engine:
         if m == 1:
             return out
         if is_probable_prime(m):
-            out.append(FoundFactor(m, "rho", m < SPRP_2761_LIMIT))
+            ff = FoundFactor(m, "rho", m < SPRP_2761_LIMIT)
+            self._note_factor(ff, " (rho cofactor)")
+            out.append(ff)
             return out
         ctx.check_deadline()
 
@@ -175,7 +198,9 @@ class Engine:
         if m == 1:
             return out
         if is_probable_prime(m):
-            out.append(FoundFactor(m, "ecm", m < SPRP_2761_LIMIT))
+            ff = FoundFactor(m, "ecm", m < SPRP_2761_LIMIT)
+            self._note_factor(ff, " (ecm cofactor)")
+            out.append(ff)
             return out
         ctx.check_deadline()
 

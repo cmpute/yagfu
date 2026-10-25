@@ -185,8 +185,8 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
 
     maxmem = resolve_maxmem(ctx.ecm_stage2_maxmem_mb, ctx.device)
     if maxmem:
-        ctx.log(f"ecm: gpuecm2 -maxmem {maxmem} MB"
-                + ("" if ctx.ecm_stage2_maxmem_mb else " (90% of VRAM)"))
+        ctx.logv(f"ecm: gpuecm2 -maxmem {maxmem} MB"
+                 + ("" if ctx.ecm_stage2_maxmem_mb else " (90% of VRAM)"))
     out = EcmRunResult()
     done = 0
     inv = 0
