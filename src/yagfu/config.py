@@ -35,7 +35,7 @@ class RunContext:
     ecm_stage2_maxmem_mb: int | None = None     # gpuecm2 -maxmem; None = 90% of VRAM,
                                          # 0 = no cap (gpuecm2's own free-mem check)
     poly_budget_s: float | None = None   # NFS polyselect override
-    topup_frac: float = 0.5
+    topup_frac: float = 1.0          # geometric growth per filter round; GPU sieve is cheap, -nc1 passes are not
 
     # per-number state (reset by engine)
     workdir: Path = field(default_factory=lambda: Path("."))

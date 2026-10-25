@@ -18,6 +18,7 @@ import math
 import re
 import subprocess
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..config import RunContext
@@ -184,37 +185,60 @@ def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
 # the pipeline
 # ---------------------------------------------------------------------------
 
-def run_nfs(n: int, ctx: RunContext, wd: Path) -> list[int]:
-    """Factor n with GNFS inside wd; returns factors (empty on failure)."""
+@dataclass
+class NfsResult:
+    factors: list[int] = field(default_factory=list)
+    ok: bool = False
+    stages: dict[str, float] = field(default_factory=dict)
+    poly_e: float | None = None
+    poly_method: str | None = None
+    params: tuple = ()               # (rlim, alim, lpb, logI, initial_raw)
+    raw_relations: int = 0
+    bands: int = 0
+    error: str | None = None
+
+
+def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
+    """Factor n with GNFS inside wd."""
+    res = NfsResult(params=nfs_params(len(str(n))))
     msieve = find_bin("msieve", ctx.bin_dir)
     cuda_sieve = find_bin("cuda-sieve", ctx.bin_dir)
     wd.mkdir(parents=True, exist_ok=True)
     digits = len(str(n))
     nproc = str(ctx.threads)
-    rlim, alim, lpb, logI, initial_raw = nfs_params(digits)
+    rlim, alim, lpb, logI, initial_raw = res.params
     ctx.log(f"nfs: c{digits}, rlim={rlim:,}, alim={alim:,}, lpb={lpb}, "
             f"logI={logI}, target_raw~{initial_raw:,}")
 
     # ---- stage 1: polynomial selection ---------------------------------
+    t = time.monotonic()
     if digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
         budget = poly_budget(digits, ctx.poly_budget_s)
         cmd = [msieve, "-np", "-t", nproc, "-v", str(n)]
         if budget > 0:
-            rc, _ = run_cmd_wall_cap(cmd, wd, wd / "np.log", cap_s=budget,
-                                     timeout=NP_TIMEOUT_S)
+            run_cmd_wall_cap(cmd, wd, wd / "np.log", cap_s=budget,
+                             timeout=NP_TIMEOUT_S)
             if not (wd / "msieve.fb").exists():
                 # SIGINT before any candidate is saved: retry uncapped
                 run_cmd(cmd, wd, wd / "np.log", timeout=NP_TIMEOUT_S)
         else:
             run_cmd(cmd, wd, wd / "np.log", timeout=NP_TIMEOUT_S)
         if not (wd / "msieve.fb").exists():
-            ctx.log("nfs: polyselect failed (np.log)")
-            return []
+            res.error = "polyselect failed (np.log)"
+            ctx.log(f"nfs: {res.error}")
+            res.stages["polyselect_s"] = time.monotonic() - t
+            return res
         fb = _parse_msieve_fb(read_log(wd / "msieve.fb"))
         np_log = read_log(wd / "np.log")
         m = re.search(r"combined = ([\d.e+-]+)", np_log)
-        ctx.log(f"nfs: poly E={m.group(1)} (msieve -np, budget {budget:.0f}s)"
-                if m else f"nfs: msieve -np poly (budget {budget:.0f}s)")
+        if m:
+            res.poly_e = float(m.group(1))
+            res.poly_method = "msieve -np"
+            ctx.log(f"nfs: poly E={m.group(1)} (msieve -np, "
+                    f"budget {budget:.0f}s)")
+        else:
+            res.poly_method = "msieve -np"
+            ctx.log(f"nfs: msieve -np poly (budget {budget:.0f}s)")
     else:
         degree = 3 if digits < 80 else 4
         coeffs, mm = base_m_poly(n, degree)
@@ -223,7 +247,9 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> list[int]:
               "R0": str(-mm), "R1": "1"}
         for i, c in enumerate(coeffs):
             fb[f"A{i}"] = str(c)
+        res.poly_method = f"base-m deg-{degree}"
         ctx.log(f"nfs: base-m degree-{degree} poly (m={mm})")
+    res.stages["polyselect_s"] = time.monotonic() - t
 
     # ---- stage 2: job file + msieve.fb/worktodo.ini ---------------------
     job_text = _fb_to_job(fb, rlim, alim, lpb)
@@ -263,14 +289,17 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> list[int]:
                 "--poly", job_path.name, "--logI", logI, "--region",
                 min(logI, 14), "--device", ctx.device, (q_next, qhi)]
         try:
-            rc, _, relnames = _run_band_parallel(base, wd, ctx.sieve_procs,
-                                                 round_idx, SIEVE_TIMEOUT_S)
+            rc, wall, relnames = _run_band_parallel(base, wd, ctx.sieve_procs,
+                                                    round_idx, SIEVE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            ctx.log("nfs: sieve band timed out")
-            return []
+            res.error = "sieve band timed out"
+            ctx.log(f"nfs: {res.error}")
+            return res
+        res.stages["sieve_s"] = res.stages.get("sieve_s", 0.0) + wall
         if rc != 0:
-            ctx.log(f"nfs: sieve band {round_idx} failed (rc={rc})")
-            return []
+            res.error = f"sieve band {round_idx} failed (rc={rc})"
+            ctx.log(f"nfs: {res.error}")
+            return res
         cnt = sum(count_lines(wd / f) for f in relnames)
         bands.append((q_next, qhi, relnames, cnt, 0.0))
         have_raw += cnt
@@ -280,10 +309,13 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> list[int]:
             for _, _, files, _, _ in bands:
                 for f in files:
                     out.write((wd / f).read_bytes())
+        t = time.monotonic()
         rc, _ = run_cmd([msieve, "-s", "msieve.dat", "-l",
                          f"nc1-r{round_idx}.log", "-nc1", "-t", nproc, "-v"],
                         wd, wd / f"nc1-r{round_idx}.stdout",
                         timeout=NC_TIMEOUT_S)
+        res.stages["filter_s"] = res.stages.get("filter_s", 0.0) \
+            + time.monotonic() - t
         out_text = read_log(wd / f"nc1-r{round_idx}.stdout")
         m = re.search(r"found (\d+) cycles, need (\d+)", out_text)
         if m and int(m.group(1)) >= int(m.group(2)) \
@@ -297,36 +329,49 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> list[int]:
             target_raw = have_raw + max(int(deficit * 1.2),
                                         int(have_raw * ctx.topup_frac))
             continue
-        ctx.log("nfs: filtering did not converge")
-        return []
+        res.error = "filtering did not converge"
+        ctx.log(f"nfs: {res.error}")
+        return res
 
     # ---- stage 4: matrix build + Lanczos + sqrt ---------------------------
+    t = time.monotonic()
     run_cmd([msieve, "-s", "msieve.dat", "-l", "nc2-mat.log",
              "-nc2", "only_matbuild=1", "-t", nproc, "-v"],
             wd, wd / "nc2-mat.stdout", timeout=NC_TIMEOUT_S)
+    res.stages["matbuild_s"] = time.monotonic() - t
+    t = time.monotonic()
     try:
         rc, _ = run_cmd([msieve, "-s", "msieve.dat", "-l", "nc2-la.log",
                          "-nc2", "-t", nproc, "-v"], wd, wd / "nc2-la.stdout",
                         timeout=LA_TIMEOUT_S,
-                        env_extra={"CUDA_VISIBLE_DEVICES": ctx.device})
+                         env_extra={"CUDA_VISIBLE_DEVICES": ctx.device})
     except subprocess.TimeoutExpired:
-        ctx.log("nfs: linear algebra timed out")
-        return []
+        res.error = "linear algebra timed out"
+        ctx.log(f"nfs: {res.error}")
+        return res
+    res.stages["linalg_s"] = time.monotonic() - t
     if rc != 0:
-        ctx.log(f"nfs: linear algebra failed (rc={rc})")
-        return []
+        res.error = f"linear algebra failed (rc={rc})"
+        ctx.log(f"nfs: {res.error}")
+        return res
+    t = time.monotonic()
     try:
         rc, _ = run_cmd([msieve, "-s", "msieve.dat", "-l", "nc3.log",
                          "-nc3", "-t", nproc, "-v"], wd, wd / "nc3.stdout",
                         timeout=SQRT_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        ctx.log("nfs: sqrt timed out")
-        return []
+        res.error = "sqrt timed out"
+        ctx.log(f"nfs: {res.error}")
+        return res
+    res.stages["sqrt_s"] = time.monotonic() - t
     log3 = read_log(wd / "nc3.stdout")
     factors = [int(x) for x in re.findall(r"p\d+ factor: (\d+)", log3)]
     if not factors:
         factors = [int(x) for x in re.findall(r"Found [a-z]+ factor of \d+ digits: (\d+)", log3)]
-    factors = [f for f in factors if n % f == 0]
-    ctx.log(f"nfs: complete, {len(factors)} factor(s), "
+    res.factors = [f for f in factors if n % f == 0]
+    res.ok = bool(res.factors)
+    res.raw_relations = have_raw
+    res.bands = len(bands)
+    ctx.log(f"nfs: complete, {len(res.factors)} factor(s), "
             f"{len(bands)} sieve band(s), {have_raw:,} relations")
-    return factors
+    return res

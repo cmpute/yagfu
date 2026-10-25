@@ -113,7 +113,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--db-no-report` | off | with `-db`: query only, never report |
 | `--db-dry-run` | off | with `-db`: print RPC payloads instead of sending |
 | `--poly-budget S` | heuristic | NFS polyselect deadline (0 = msieve's own) |
-| `--topup-frac F` | 0.5 | NFS relation top-up growth on filter failure |
+| `--topup-frac F` | 1.0 | NFS relation target growth per filter round (GPU sieving is cheap, `-nc1` passes are not — grow fast, save filter rounds) |
 | `-v / -q` | — | more detail in the stderr log / silence stderr logs |
 
 Results go to stdout, one primary line per input; YAFU-style progress logs go
@@ -189,8 +189,16 @@ The ECM pretest itself is cheap: reaching the normal-plan target on a c100
 (t30.8) costs ~17 s across four B1 levels. A 15–30 digit factor anywhere in the
 pipeline is typically found in the first or second batch.
 
-Reproduce with `python3 bench_factor.py run --method all --digits 70,80,90,100`
-(per-method benchmark harness) or by feeding the same numbers to `yagfu`.
+Reproduce and re-derive the crossover with the benchmark harness, which
+drives the package backends directly and fits the YAFU-tune exponential
+model `T(d) = A·e^(kd)` per method:
+
+```sh
+python3 scripts/bench_factor.py gen  --digits 70,80,90,100   # fixed-seed semiprimes
+python3 scripts/bench_factor.py run  --method all            # ~10 min on a 4090
+python3 scripts/bench_factor.py report
+python3 scripts/bench_factor.py crossover   # fits both curves, prints --xover
+```
 
 ## Repository layout
 
@@ -209,9 +217,10 @@ src/yagfu/            the Python package
     nfs.py                polyselect → sieve bands → filter/LA/sqrt pipeline
     runner.py             subprocess plumbing
 scripts/build_wheel.sh  stages bin/ into the package and builds the wheel
-tests/                  82 unit tests (no GPU required; gmpy2 is only used
+scripts/bench_factor.py SIQS vs NFS benchmark harness and crossover fitter
+                        (drives the package backends; stdlib only)
+tests/                  95 unit tests (no GPU required; gmpy2 is only used
                         as a reference oracle for the primality tests)
-bench_factor.py         standalone method benchmark (SIQS vs GNFS)
 bin/                    build output (gitignored)
 ```
 

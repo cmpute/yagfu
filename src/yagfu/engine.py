@@ -335,13 +335,13 @@ class Engine:
                         return
                 else:
                     t = time.monotonic()
-                    factors = self._nfs(m, wd)
+                    r = self._nfs(m, wd)
                     res.spend("nfs", time.monotonic() - t)
                     res.bump("nfs_runs")
-                    if factors:
-                        self._absorb(factors, m, "nfs", wd, res, depth)
+                    if r.ok and r.factors:
+                        self._absorb(r.factors, m, "nfs", wd, res, depth)
                         return
-                    ctx.log("nfs: no factors")
+                    ctx.log(f"nfs: no factors ({r.error})")
             except TimeoutError:
                 raise
             except (FactorError, EcmUnsupported):
@@ -364,7 +364,7 @@ class Engine:
         if cof > 1:
             self._factor_rec(cof, wd, res, depth + 1)
 
-    def _nfs(self, n: int, wd: Path) -> list[int]:
+    def _nfs(self, n: int, wd: Path):
         if self._run_nfs is None:
             from .backends.nfs import run_nfs
             self._run_nfs = run_nfs

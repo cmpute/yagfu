@@ -45,9 +45,10 @@ NFS_PARAMS_ANCHORS: tuple[tuple[int, tuple[int, int, int, int, int]], ...] = (
     (150, (100_000_000, 100_000_000, 31, 14, 2_000_000_000)),
 )
 
-#: msieve -np's deg-4 GPU stage-1 table starts at log10(n) = 80; below ~85
-#: digits nothing comes out, so the base-m Python poly is used there.
-NFS_MSIEVE_POLY_MIN_DIGITS = 85
+#: msieve -np's GPU stage-1 search emits nothing below ~90 digits (verified:
+#: candidates at 90/100, none at 70/80/85 even uncapped), so the base-m
+#: Python poly is used below this.
+NFS_MSIEVE_POLY_MIN_DIGITS = 90
 
 
 def nfs_params(digits: int) -> tuple[int, int, int, int, int]:

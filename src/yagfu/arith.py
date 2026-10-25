@@ -48,6 +48,18 @@ def iroot(n: int, k: int) -> int:
     return x
 
 
+def next_prime(n: int) -> int:
+    """Smallest prime > n (upward search; BPSW-classified)."""
+    from .primes import is_probable_prime
+
+    if n < 2:
+        return 2
+    c = n + 1 if n % 2 == 0 else n + 2
+    while not is_probable_prime(c):
+        c += 2
+    return c
+
+
 def perfect_power(n: int) -> tuple[int, int] | None:
     """If n == b^e with e > 1, return (b, e); else None.
 

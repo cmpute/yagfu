@@ -74,8 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "free-memory budgeting)")
     ap.add_argument("--poly-budget", type=float, default=None,
                     help="NFS polyselect deadline in seconds (0 = msieve default)")
-    ap.add_argument("--topup-frac", type=float, default=0.5,
-                    help="NFS filter-failure relation top-up fraction")
+    ap.add_argument("--topup-frac", type=float, default=1.0,
+                    help="NFS relation target growth per filter round: "
+                         "new = have + max(1.2x deficit, frac x have). GPU "
+                         "sieving is cheap here while -nc1 passes are not, "
+                         "so growing fast saves filter rounds (default 1.0)")
     ap.add_argument("--db-token", default=None,
                     help="factordb token file (default ~/.factordb_token)")
     ap.add_argument("--db-no-report", action="store_true",
