@@ -61,8 +61,10 @@ def _patch(monkeypatch, job, found_on=(), fail_calls=()):
     def fake_start(self, m, wd):
         return job
 
-    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
+    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None,
+                 devices=None):
         calls["b1"].append(b1)
+        calls.setdefault("devices", set()).add(devices)
         if len(calls["b1"]) in fail_calls:
             raise KeyboardInterrupt
         out = EcmRunResult(curves_done=total, wall_s=0.001 * total)
@@ -96,7 +98,7 @@ def _patch(monkeypatch, job, found_on=(), fail_calls=()):
 # is lowered so the engine treats it as NFS-bound and starts the poly job.
 N95 = P2 * P3                          # 19 + 39 digits = 58 -> too small
 N = P1 * P2 * P3                       # 66 digits
-CTX = dict(xover=60)                   # >= max(60, poly-min 90)? poly gate is
+CTX = dict(xover=60, device="0", devices=("0", "1", "2"))                   # >= max(60, poly-min 90)? poly gate is
 # digits >= NFS_MSIEVE_POLY_MIN_DIGITS (90) — but _maybe_start_poly is
 # faked here, so the gate does not apply in these tests.
 
@@ -112,6 +114,9 @@ def test_overlap_runs_bonus_then_joins(monkeypatch, tmp_path):
     assert len(calls["b1"]) >= 3
     # NFS consumed the background poly
     assert calls["nfs_poly"] == [job]
+    # bonus ran on the cards the polyselect was not using (the main
+    # ladder, unencumbered, uses them all -> devices=None)
+    assert calls["devices"] == {None, ("1", "2")}
     assert job.waited == 0 or job.waited >= 0     # consume path may wait
 
 
@@ -120,7 +125,8 @@ def test_overlap_split_during_bonus_replans(monkeypatch, tmp_path):
     calls = _patch(monkeypatch, job)
     # find P1 on call 3 (inside the bonus window) -> cofactor P2*P3 is
     # composite -> re-plan via recursion, NFS never sees the stale poly
-    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
+    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None,
+                 devices=None):
         calls["b1"].append((b1, n))
         out = EcmRunResult(curves_done=total, wall_s=0.001 * total)
         if len(calls["b1"]) == 3:
@@ -160,7 +166,8 @@ def test_replan_carries_ledger_and_logs_discard(monkeypatch, tmp_path,
         return job if len(started) == 1 else None   # cofactor: no poly job
 
     monkeypatch.setattr(Engine, "_maybe_start_poly", fake_start)
-    eng = Engine(RunContext(xover=60))
+    eng = Engine(RunContext(xover=60, device="0",
+                              devices=("0", "1", "2")))
     res = eng.factor(N, tmp_path)
     assert res.complete, res.error
     assert len(calls["b1"]) == 3        # original ladder + one bonus call;
@@ -177,7 +184,8 @@ def test_bonus_aborts_when_poly_done(monkeypatch, tmp_path, capsys):
     job = FakeJob(polls=5)
     calls = _patch(monkeypatch, job)
 
-    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
+    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None,
+                 devices=None):
         calls["b1"].append((b1, stop_check is not None))
         out = EcmRunResult(curves_done=total, wall_s=0.001 * total)
         if len(calls["b1"]) == 4:      # first bonus batch: poly just ended
@@ -186,7 +194,8 @@ def test_bonus_aborts_when_poly_done(monkeypatch, tmp_path, capsys):
         return out
 
     monkeypatch.setattr(engine_mod, "run_ecm_curves", fake_ecm)
-    eng = Engine(RunContext(xover=60))
+    eng = Engine(RunContext(xover=60, device="0",
+                              devices=("0", "1", "2")))
     res = eng.factor(N, tmp_path)
     assert res.complete, res.error
     assert calls["b1"][3][1] is True    # bonus batches carry the stop hook
@@ -201,7 +210,8 @@ def test_bonus_ends_when_poly_dies_polyless(monkeypatch, tmp_path):
     job = DeadNoPolyJob(polls=2)
     calls = _patch(monkeypatch, job)
 
-    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
+    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None,
+                 devices=None):
         calls["b1"].append(b1)
         return EcmRunResult(curves_done=total, wall_s=0.001 * total)
 

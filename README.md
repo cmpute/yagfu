@@ -62,18 +62,23 @@ sieving loop is closed by msieve's filter verdict ("found N cycles, need M") wit
 geometric relation top-ups.
 
 **Overlapped polyselect.** As soon as a number is known to be NFS-bound (≥ 90
-digits and at/above the crossover, or `--force nfs`), `msieve -np` starts in the
-background on the CPUs while the GPU keeps running the ECM ladder — and past the
-plan target, filling higher-level budgets for free. The polyselect is trusted
+digits and at/above the crossover, or `--force nfs`), `msieve -np` starts in
+the background while the GPU keeps running the ECM ladder — and past the plan
+target, filling higher-level budgets for free on the cards the polyselect is
+not using (its GPU stage-1 scan is itself a full-GPU workload and owns the
+first card; sharing the card starves it, so with a single GPU there is no
+bonus overlap at all). The polyselect is trusted
 to finish its own search (msieve's internal deadline ends stage 1 but its
 stage-2 optimization keeps going, so only a total wall cap — 2h, or
 `--poly-budget` — interrupts it, cooperatively, saving the best-so-far
-polynomial); success is polled from `msieve.fb` appearing, and only that yields
-the GPUs back — a budget expiring mid-batch is never a reason to drop a
-running stage-1 batch. The polyselect wall time is
-unchanged, the GPU never idles during it, and the pretest gets extra depth
-at zero cost; if ECM finds a factor in the window the polyselect is cancelled
-and the cofactor re-planned from scratch.
+polynomial); success is polled from `msieve.fb` appearing, and only that ends
+the overlap. At ~110–119 digits this build's GPU poly stage-1 currently emits
+no candidates at all (verified: enlarging the coefficient space 20x and
+relaxing stage1_norm/min_evalue change nothing), so NFS polyselect can fail
+there — the practical crossover may need raising until that is understood.
+If ECM finds a factor in the window the polyselect is cancelled
+and the cofactor re-planned from scratch (a completed `msieve.fb` survives an
+interrupt for resume).
 `--no-poly-overlap` restores fully serial staging. With several devices
 (`--device 0,1,…`) stage 1 fans out one process per card with counts split by
 learned per-card throughput; the shards' residues are merged into a single

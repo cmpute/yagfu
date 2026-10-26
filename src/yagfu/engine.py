@@ -310,20 +310,28 @@ class Engine:
 
     def _poly_overlap_ecm(self, m: int, wd: Path, res: FactorResult,
                           depth: int, ledger: EcmLedger, job) -> int:
-        """Bonus ECM while background polyselect holds the CPUs: keep
-        filling level budgets above the plan target.
+        """Bonus ECM on the cards the polyselect is not using, filling
+        level budgets above the plan target while it runs.
 
-        The polyselect is trusted to finish its own search (only a total
-        wall cap interrupts it, cooperatively, so it saves its best-so-far
-        polynomial); success is polled from msieve.fb.  Only a polyselect
-        that ended WITH a polynomial yields the GPUs back; killing the
-        bonus batch for anything less would just waste free curves (a
-        4-GPU stage-1 batch at B1=11M is a minute of work).  A factor
-        found here (even in a killed batch's log) ends the overlap — the
+        The GPU polyselect owns devices[0] outright: its stage-1 scan is
+        itself a full-GPU workload, and sharing the card with an ECM
+        shard starves it (~1000x slower when measured sharing vs alone),
+        which used to deadlock the run — bonus never ends until the
+        polyselect finishes, and the polyselect never finishes while the
+        bonus holds the card.  So the bonus ladder runs on devices[1:]
+        only; with a single card there is no overlap at all.
+
+        Success is polled from msieve.fb, and only a polyselect that
+        ended WITH a polynomial yields the GPUs back.  A factor found
+        here (even in a killed batch's log) ends the overlap — the
         caller re-plans the cofactor."""
         ctx = self.ctx
-        ctx.log("ecm: polyselect running in background, climbing bonus "
-                "levels")
+        bonus_devs = ctx.devices[1:]
+        if not bonus_devs:
+            ctx.log("ecm: polyselect holds the only GPU; no bonus overlap")
+            return m
+        ctx.log(f"ecm: polyselect running in background, climbing bonus "
+                f"levels on {len(bonus_devs)} idle card(s)")
 
         j = 0
         inv = 0
@@ -340,7 +348,8 @@ class Engine:
             want = min(ledger.level_budget_left(j), ctx.ecm_maxcurves)
             inv += 1
             r = run_ecm_curves(m, B1_LADDER[j], want, ctx, wd,
-                               tag=f"o{j}-{inv}", stop_check=job.poly_ready)
+                               tag=f"o{j}-{inv}", stop_check=job.poly_ready,
+                               devices=bonus_devs)
             res.bump("ecm_invocations")
             if r.error:
                 raise FactorError(f"ecm: {r.error}")

@@ -320,26 +320,29 @@ def _stage2(n: int, b1: int, res_path: Path, ctx: RunContext, wd: Path,
 
 
 def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
-                   wd: Path, tag: str, stop_check=None) -> EcmRunResult:
+                   wd: Path, tag: str, stop_check=None,
+                   devices: tuple | None = None) -> EcmRunResult:
     """Run up to total_curves curves at B1 in GPU batches; stop at first
     round that finds a factor (subsequent curves are pointless then).
 
     With one device this is the classic single-process path.  With several
-    devices each round fans stage 1 out one process per card (counts
-    split by learned per-card throughput), the residues are merged, and a
-    single gpuecm2 stage 2 runs on the first device.
+    devices each round fans stage 1 out one process per card (counts split
+    by learned per-card throughput), the residues are merged, and a
+    single gpuecm2 stage 2 runs on the first device.  `devices` overrides
+    ctx.devices (the polyselect overlap passes the cards the polyselect is
+    not using).
 
     stop_check () -> bool is polled while stage 1 runs; when it fires the
     running stage-1 batch is killed and discarded (aborted=True, its
     curves count as 0) — used by the polyselect overlap so bonus ECM
-    yields immediately when the background polyselect finishes.  A stage 2
+    yields instantly when the background polyselect finishes.  A stage 2
     that already has residues always runs to completion so its round's
     work is kept.
     """
     if n.bit_length() > GPUECM2_MAX_BITS:
         raise EcmUnsupported(f"{n.bit_length()} bits > gpuecm2 limit of {GPUECM2_MAX_BITS}")
 
-    devices = ctx.devices
+    devices = ctx.devices if devices is None else devices
     single = len(devices) == 1
     s2_dev = devices[0]
     maxmem = resolve_maxmem(ctx.ecm_stage2_maxmem_mb, s2_dev)
