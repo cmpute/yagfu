@@ -136,6 +136,9 @@ def _stage1(n: int, b1: int, curves: int, ctx: RunContext, wd: Path,
             ) -> tuple[int, dict[int, EcmProvenance], int, float, str | None]:
     """One GPU stage-1 invocation; returns (rc, factors, curves, wall, error).
 
+    `device` is a physical id: the process is pinned to it via
+    CUDA_VISIBLE_DEVICES and addresses it as ordinal 0.
+
     With stop_check, the process is polled and killed when it fires; a
     killed batch never wrote its residues, so it reports ran=0 (any factor
     lines already printed are still kept — a free factor is a free factor).
@@ -143,18 +146,20 @@ def _stage1(n: int, b1: int, curves: int, ctx: RunContext, wd: Path,
     ecm = find_bin("ecm", ctx.bin_dir)
     res_path = wd / f"ecm-{tag}.residues"
     log_path = wd / f"ecm-{tag}.stage1.log"
-    cmd = [ecm, "-gpu", "-gpudevice", device, "-save", res_path.name,
+    cmd = [ecm, "-gpu", "-gpudevice", 0, "-save", res_path.name,
            "-gpucurves", curves, str(b1), "1"]
+    pin = ctx.pin_env(device)
     t0 = time.monotonic()
     try:
         if stop_check is None:
-            rc, _ = run_cmd(cmd, wd, log_path, input_bytes=f"{n}\n".encode(),
+            rc, _ = run_cmd(cmd, wd, log_path, env_extra=pin,
+                            input_bytes=f"{n}\n".encode(),
                             timeout=max(600, 4 * 86400))
         else:
             rc, _ = run_cmd_progress(
                 cmd, wd, log_path, timeout=max(600, 4 * 86400),
                 every_s=1.0, input_bytes=f"{n}\n".encode(),
-                stop=stop_check)
+                env_extra=pin, stop=stop_check)
     except Exception as e:  # noqa: BLE001
         return -1, {}, 0, time.monotonic() - t0, f"ecm failed to run: {e!r}"
     wall = time.monotonic() - t0
@@ -212,18 +217,19 @@ def _stage1_shards(n: int, b1: int, counts: list[int], devices: tuple,
     shards are killed when it fires and report ran=0 (their factors, if
     any, are kept)."""
     ecm = find_bin("ecm", ctx.bin_dir)
-    jobs, metas = [], []
+    jobs, envs, metas = [], [], []
     for i, (dev, cnt) in enumerate(zip(devices, counts)):
         if cnt <= 0:
             continue
         stag = f"{tag}.s{i}"          # index, not device: --device 0,0 is legal
         res_path = wd / f"ecm-{stag}.residues"
-        cmd = [ecm, "-gpu", "-gpudevice", str(dev), "-save", res_path.name,
+        cmd = [ecm, "-gpu", "-gpudevice", 0, "-save", res_path.name,
                "-gpucurves", cnt, str(b1), "1"]
         jobs.append((cmd, wd / f"ecm-{stag}.stage1.log", f"{n}\n".encode()))
+        envs.append({"CUDA_VISIBLE_DEVICES": str(dev)})   # dev is physical
         metas.append((i, str(dev), cnt, res_path))
     results = run_procs_parallel(jobs, wd, max(600, 4 * 86400),
-                                 poll_s=1.0, stop=stop_check)
+                                 poll_s=1.0, stop=stop_check, envs=envs)
     shards = []
     for (rc, wall), (i, dev, cnt, res_path) in zip(results, metas):
         try:
@@ -396,7 +402,9 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
                 out.aborted = True       # killed batch: discard its curves
                 out.curves_done -= round_ran
             return out  # no residues: nothing to resume
-        env2 = ({"CUDA_VISIBLE_DEVICES": str(s2_dev)} if not single else None)
+        # gpuecm2's CLI has no device flag; pinning is the only way it
+        # lands anywhere but the ambient default card
+        env2 = ctx.pin_env(s2_dev)
         facts2, wall2, err2, b2 = _stage2(n, b1, merged, ctx, wd,
                                           f"{tag}.{inv}", maxmem,
                                           env_extra=env2)

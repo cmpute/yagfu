@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import signal
 import subprocess
@@ -148,8 +149,14 @@ def _job_to_msieve_fb(job_text: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
-                       timeout: float, beat=None, beat_s: float = 120.0):
-    """Split one q band into n_procs chunks running concurrently on the GPU.
+                       timeout: float, devices: tuple[str, ...] = ("0",),
+                       beat=None, beat_s: float = 120.0):
+    """Split one q band into chunks running concurrently, one GPU each.
+
+    n_procs is per device: chunk i round-robins onto devices[i % len]
+    (adjacent q ranges land on different cards), each pinned to its card
+    via CUDA_VISIBLE_DEVICES and addressing it as ordinal 0.  devices
+    entries are physical ids.
 
     cmd_base ends with a (q_lo, q_hi) placeholder tuple for --qrange.
     `beat(elapsed_s)` fires every beat_s while the band runs (long bands
@@ -159,9 +166,10 @@ def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
     q_lo, q_hi = cmd_base[-1]
     base = cmd_base[:-1]
     width = q_hi - q_lo
-    n_procs = max(1, min(n_procs, width // 1500 or 1))
+    k = max(1, len(devices))
+    n_procs = max(1, min(n_procs * k, width // 1500 or 1))
     chunk = width // n_procs
-    jobs, names = [], []
+    jobs, envs, names = [], [], []
     for i in range(n_procs):
         a = q_lo + i * chunk
         b = q_hi if i == n_procs - 1 else a + chunk
@@ -171,8 +179,9 @@ def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
                                         "--relations", rels,
                                         "--log", f"band{round_idx}.{i}.log"]
         jobs.append((cmd, cwd / f"band{round_idx}.{i}.stdout", None))
+        envs.append({"CUDA_VISIBLE_DEVICES": devices[i % k]})
     results = run_procs_parallel(jobs, cwd, timeout, beat=beat,
-                                 beat_s=beat_s)
+                                 beat_s=beat_s, envs=envs)
     rc = max(rc for rc, _ in results)
     wall = max(w for _, w in results)
     return rc, wall, names
@@ -242,9 +251,13 @@ class PolyselectJob:
         cmd = [msieve, "-np", "-t", str(self.ctx.threads), "-v", str(self.n)]
         f = open(self.wd / "np.log", "wb")
         try:
+            # msieve -np has no device flag; the GPU stage-1 polyselect
+            # (>= ~90 digits) runs on the pinned card's ordinal 0
             self._p = subprocess.Popen([str(c) for c in cmd],
                                        cwd=str(self.wd),
-                                       stdout=f, stderr=subprocess.STDOUT)
+                                       stdout=f, stderr=subprocess.STDOUT,
+                                       env={**os.environ,
+                                            **self.ctx.pin_env()})
         finally:
             f.close()
 
@@ -550,17 +563,20 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
         ctx.log(f"nfs: round {round_idx}{' (probe)' if not bands_count else ''}: "
                 f"q {q_next}:{qhi}"
                 + (f" (have {have_raw:,}, target {target_raw:,})"
-                   if bands_count else ""))
+                   if bands_count else "")
+                + (f" [{ctx.sieve_procs} proc x {len(ctx.devices)} gpu]"
+                   if len(ctx.devices) > 1 else ""))
         base = [cuda_sieve, "--pipeline", "--cofactor",
                 "--poly", job_path.name, "--logI", logI, "--region",
-                min(logI, 14), "--device", ctx.device, (q_next, qhi)]
+                min(logI, 14), "--device", 0, (q_next, qhi)]
         for stale in wd.glob(f"band{round_idx}.*"):
             # a killed run may have left this round's partial outputs; the
             # same round index repeats on resume, so never append to them
             stale.unlink(missing_ok=True)
         try:
             rc, wall, relnames = _run_band_parallel(
-                base, wd, ctx.sieve_procs, round_idx, SIEVE_TIMEOUT_S)
+                base, wd, ctx.sieve_procs, round_idx, SIEVE_TIMEOUT_S,
+                ctx.devices)
         except subprocess.TimeoutExpired:
             res.error = "sieve band timed out"
             ctx.log(f"nfs: {res.error}")
@@ -643,7 +659,7 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
         [msieve, "-s", "msieve.dat", "-l", "nc2-la.log",
          "-nc2", "-t", nproc, "-v"], wd, wd / "nc2-la.stdout",
         timeout=LA_TIMEOUT_S, every_s=30,
-        env_extra={"CUDA_VISIBLE_DEVICES": ctx.device},
+        env_extra=ctx.pin_env(),
         on_lines=_la_lines)
     res.stages["linalg_s"] = time.monotonic() - t
     if rc == -9:

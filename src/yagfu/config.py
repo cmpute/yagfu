@@ -17,11 +17,47 @@ def _nproc() -> int:
         return max(1, os.cpu_count() or 1)
 
 
+def resolve_devices(specs) -> tuple[str, ...]:
+    """Translate --device ordinals into physical device ids.
+
+    The ordinals the user passes mean what they mean to every CUDA program
+    in this shell: indices into CUDA_VISIBLE_DEVICES when it is set, plain
+    physical ids otherwise.  Every backend subprocess is instead pinned with
+    CUDA_VISIBLE_DEVICES=<physical id>, which needs the physical id; UUID
+    entries pass through untouched (both CUDA and nvidia-smi -i accept
+    them).  Raises ValueError on anything that cannot be resolved.
+    """
+    ambient = os.environ.get("CUDA_VISIBLE_DEVICES")
+    entries = ([e.strip() for e in ambient.split(",") if e.strip()]
+               if ambient is not None else [])
+    if ambient is not None and not entries:
+        raise ValueError("CUDA_VISIBLE_DEVICES is set but hides every GPU")
+    out = []
+    for spec in specs:
+        s = str(spec).strip()
+        if not s.isdigit():
+            raise ValueError(f"device {spec!r} is not a device ordinal")
+        if not entries:
+            out.append(s)
+            continue
+        idx = int(s)
+        if idx >= len(entries):
+            raise ValueError(
+                f"device {idx} out of range for CUDA_VISIBLE_DEVICES="
+                f"{ambient!r} ({len(entries)} device(s) visible)")
+        out.append(entries[idx])
+    if not out:
+        raise ValueError("no devices given")
+    return tuple(out)
+
+
 @dataclass
 class RunContext:
     bin_dir: Path | None = None          # explicit --bin-dir
-    device: str = "0"                    # primary CUDA device (sieves, ECM stage 2)
-    devices: tuple[str, ...] = ("0",)    # ECM stage-1 fan-out set
+    device: str = "0"                    # primary CUDA device, physical id
+                                         # (polyselect, Lanczos, ECM stage 2)
+    devices: tuple[str, ...] = ("0",)    # fan-out set, physical ids: ECM
+                                         # stage 1 shards + sieve chunks
     ecm_device_rates: dict = field(default_factory=dict)
                                          # learned curves/s per device (scratch)
     threads: int = field(default_factory=lambda: max(1, _nproc() - 2))
@@ -47,6 +83,17 @@ class RunContext:
     # per-number state (reset by engine)
     workdir: Path = field(default_factory=lambda: Path("."))
     deadline: float | None = None
+
+    def pin_env(self, device: str | None = None) -> dict[str, str]:
+        """CUDA_VISIBLE_DEVICES override pinning one subprocess to a device.
+
+        ctx.devices holds physical ids; a pinned process sees exactly its
+        card as ordinal 0, so every backend's own device flag says 0.  The
+        return value is an env_extra-style override dict, merged over the
+        inherited environment by the run_cmd family.
+        """
+        return {"CUDA_VISIBLE_DEVICES": device if device is not None
+                else self.device}
 
     def _tee(self, line: str) -> None:
         """Append the line to the run log (cwd/yagfu.log)."""

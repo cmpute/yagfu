@@ -40,13 +40,17 @@ def run_cmd(cmd, cwd, log_path, env_extra=None, timeout=None, input_bytes=None):
 
 
 def run_cmd_wall_cap(cmd, cwd, log_path, cap_s, grace_s=90, timeout=3600,
-                     input_bytes=None):
+                     input_bytes=None, env_extra=None):
     """Run a subprocess under a cooperative wall-clock cap (SIGINT first)."""
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
     t0 = time.monotonic()
     with open(log_path, "wb") as f:
         p = subprocess.Popen([str(c) for c in cmd], cwd=str(cwd),
                              stdout=f, stderr=subprocess.STDOUT,
-                             stdin=subprocess.PIPE if input_bytes is not None else None)
+                             stdin=subprocess.PIPE if input_bytes is not None else None,
+                             env=env)
         if input_bytes is not None:
             assert p.stdin is not None
             p.stdin.write(input_bytes)
@@ -143,10 +147,13 @@ def run_cmd_progress(cmd, cwd, log_path, timeout=3600, env_extra=None,
 
 
 def run_procs_parallel(jobs, cwd, timeout, beat=None, beat_s=120.0,
-                       poll_s=2.0, stop=None):
+                       poll_s=2.0, stop=None, envs=None):
     """Run subprocesses concurrently, polled from the calling thread.
 
     jobs: list of (cmd, stdout_log_path, input_bytes_or_None) tuples.
+    envs: optional list of per-job env overrides (dict or None), merged
+    over os.environ the same way run_cmd merges env_extra — how device
+    pinning reaches each shard of a fan-out.
     Returns one (rc, wall_s) per job, in order (wall measured from the
     common start to that process's exit).  `beat(elapsed_s)` fires every
     beat_s while anything still runs.  `stop` () -> bool kills the set
@@ -157,12 +164,16 @@ def run_procs_parallel(jobs, cwd, timeout, beat=None, beat_s=120.0,
     """
     t0 = time.monotonic()
     procs = []
-    for cmd, log_path, input_bytes in jobs:
+    for j, (cmd, log_path, input_bytes) in enumerate(jobs):
+        env = None
+        if envs is not None and envs[j] is not None:
+            env = dict(os.environ)
+            env.update(envs[j])
         f = open(log_path, "wb")
         p = subprocess.Popen([str(c) for c in cmd], cwd=str(cwd),
                              stdout=f, stderr=subprocess.STDOUT,
                              stdin=subprocess.PIPE if input_bytes is not None
-                             else None)
+                             else None, env=env)
         if input_bytes is not None:
             try:
                 p.stdin.write(input_bytes)

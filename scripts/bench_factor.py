@@ -77,8 +77,12 @@ def save_result(res: dict) -> None:
 
 
 def make_ctx(args) -> RunContext:
+    from yagfu.config import resolve_devices
+    devices = resolve_devices(
+        tuple(d.strip() for d in args.device.split(",") if d.strip()))
     return RunContext(
-        device=args.device,
+        device=devices[0],
+        devices=devices,
         sieve_procs=args.sieve_procs,
         poly_budget_s=args.poly_budget,
         topup_frac=args.topup_frac,
@@ -211,12 +215,13 @@ def probe_siqs(n: int, ctx: RunContext, wd: Path) -> dict:
 
     wd.mkdir(parents=True, exist_ok=True)
     binary = find_bin("cuda-mpqs", ctx.bin_dir)
-    cmd = [binary, "--N", n, "--device", ctx.device, "--dir", "work",
+    cmd = [binary, "--N", n, "--device", 0, "--dir", "work",
            "--estimate_only"]
     lp1 = mpqs_lp1_bound(len(str(n)))
     if lp1:
         cmd += ["--lp1_bound", lp1]
-    rc, wall = run_cmd(cmd, wd, wd / "probe.log")
+    rc, wall = run_cmd(cmd, wd, wd / "probe.log",
+                       env_extra=ctx.pin_env())
     log = read_log(wd / "probe.log")
     out: dict = {}
     for key, rex in _RE_EST.items():
@@ -266,10 +271,11 @@ def probe_nfs(n: int, ctx: RunContext, wd: Path, band_width: int,
                          "NFS probing unsupported at this size"}
     budget = min(poly_cap_s, max(10.0, poly_budget(digits)))
     run_cmd_wall_cap([msieve, "-np", "-t", ctx.threads, "-v", str(n)],
-                     wd, wd / "np.log", cap_s=budget)
+                     wd, wd / "np.log", cap_s=budget,
+                     env_extra=ctx.pin_env())
     if not (wd / "msieve.fb").exists():
         run_cmd([msieve, "-np", "-t", ctx.threads, "-v", str(n)],
-                wd, wd / "np.log")
+                wd, wd / "np.log", env_extra=ctx.pin_env())
     if not (wd / "msieve.fb").exists():
         return {"error": f"polyselect failed (see {wd}/np.log)"}
     fb = _parse_msieve_fb(read_log(wd / "msieve.fb"))
@@ -281,11 +287,12 @@ def probe_nfs(n: int, ctx: RunContext, wd: Path, band_width: int,
     q0 = alim // 2
     rels_name = "probe.rels"
     cmd = [sieve_bin, "--pipeline", "--cofactor", "--poly", "probe.job",
-           "--logI", logI, "--region", min(logI, 14), "--device",
-           ctx.device, "--qrange", f"{q0}:{q0 + band_width}",
+           "--logI", logI, "--region", min(logI, 14), "--device", 0,
+           "--qrange", f"{q0}:{q0 + band_width}",
            "--relations", rels_name, "--log", "probe.sieve.log"]
     try:
-        rc, band_s = run_cmd(cmd, wd, wd / "probe.stdout")
+        rc, band_s = run_cmd(cmd, wd, wd / "probe.stdout",
+                             env_extra=ctx.pin_env())
     except Exception as e:  # noqa: BLE001
         return {"error": f"band failed: {e!r}"}
     got = count_lines(wd / rels_name)

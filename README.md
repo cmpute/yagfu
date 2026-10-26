@@ -73,6 +73,30 @@ window the polyselect is cancelled and the cofactor re-planned from scratch.
 learned per-card throughput; the shards' residues are merged into a single
 stage-2 run on the first card.
 
+**Multi-GPU.** `--device` takes a comma-separated list (`--device 0,1` — the
+ordinals mean what they mean to CUDA in your shell, i.e. indices into
+`CUDA_VISIBLE_DEVICES` when it is set). Every backend subprocess is pinned to
+one physical card via `CUDA_VISIBLE_DEVICES` and addresses it as ordinal 0,
+which is also what makes single-card `--device 3` land every stage —
+including gpuecm2 stage 2 (its CLI has no device flag) and the GPU polyselect
+(msieve `-np` has none either) — on that exact card. Per stage:
+
+* **ECM stage 1** fans out one `ecm -gpu` process per card, counts split by
+  an EWMA of each card's measured curves/s; residues are merged into one
+  gpuecm2 stage-2 run pinned to the first card.
+* **NFS sieving** splits each q-band into `--sieve-procs` × cards cuda-sieve
+  chunks, chunk *i* round-robbed onto card *i % k* (adjacent q ranges land on
+  different cards). `--sieve-procs` is per card.
+* **SIQS** switches to cuda-mpqs's built-in cluster mode from c80 up: a
+  coordinator on the first card plus one localhost TCP worker per remaining
+  card, work split by SM×clock weight; below c80 (or with one card) it stays
+  a single process, and a failed cluster falls back to the solo run.
+  All inter-card traffic is relations over TCP through host memory — no
+  NVLink/peer-to-peer GPU path is used anywhere.
+* **Polyselect, GPU Lanczos, NFS sqrt** are single-card (first device):
+  this msieve build has no multi-GPU Lanczos without an MPI build.
+
+
 Primality: Baillie–PSW (base-2 strong MR + strong Lucas, Selfridge method A);
 below 2³² a deterministic SPRP(2, 7, 61) is used and such factors are reported as
 proven primes (`P##`) rather than probable primes (`PRP##`).
@@ -118,9 +142,9 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--no-ecm` | off | skip the ECM stage entirely: TD → rho → SIQS/NFS (rerun convenience when the pretest is known useless) |
 | `--no-poly-overlap` | off | run NFS polyselect serially instead of in the background during ECM |
 | `--xover N` | 105 | SIQS → NFS crossover in digits |
-| `--device N[,N…]` | 0 | CUDA device; a comma-separated list fans GPU ECM stage 1 out one process per card (counts split by learned per-card throughput, residues merged into a single stage-2 run on the first card). Sieves use the first device |
+| `--device N[,N…]` | 0 | CUDA device(s); a list fans GPU ECM stage 1 and NFS sieving out across the cards (counts/chunks split per card), SIQS runs cuda-mpqs cluster mode from c80; polyselect, ECM stage 2 and Lanczos use the first device |
 | `--threads N` | nproc−2 | CPU threads for msieve stages |
-| `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band |
+| `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band, per GPU |
 | `--ecm-stage2-maxmem MB` | 90% of VRAM | gpuecm2 stage-2 memory cap — limits dF via GMP-ECM's memory model (smaller blocks, same B2 coverage); `0` = no cap |
 | `--timeout S` | none | per-number wall budget |
 | `--workdir DIR` | temp dir | scratch base directory; a number's workdir is removed only when it factors completely, kept on failure/Ctrl+C (`--keep` keeps always). An NFS workdir is a resume checkpoint: rerun the same number with the same `--workdir` to continue a killed job |
@@ -276,10 +300,16 @@ All binaries are staged into `bin/`: `ecm`, `gpuecm2`, `cuda-mpqs`,
 ## Development
 
 ```sh
-PYTHONPATH=src python3 -m pytest tests/      # 132 unit tests, no GPU needed
+PYTHONPATH=src python3 -m pytest tests/      # 110 unit tests, no GPU needed
 PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli -v <N>   # live run
 scripts/build_wheel.sh --no-stage            # rebuild wheel without re-staging
 ```
+
+**Multi-GPU, deliberately not (yet).** NFS polyselect is single-card (sharding
+msieve `-np` by leading-coefficient ranges is possible but not built); multi-GPU
+Lanczos needs an MPI build of msieve (`build.sh` does not set `MPI=1`); and
+`-f` batch mode processes numbers serially — an opt-in `--shard-gpus` (one
+pipeline per card over a dynamic number queue) is the planned next step.
 
 Per-number workdirs (ECM residue files, sieve bands, msieve logs) are removed
 only when a number factors completely. A failed, crashed, or interrupted run

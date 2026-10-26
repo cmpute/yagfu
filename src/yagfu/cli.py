@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 from . import __version__
-from .config import RunContext, cleanup_workdir
+from .config import RunContext, cleanup_workdir, resolve_devices
 from .engine import Engine, FactorResult, FoundFactor
 from .fdb import (
     ECM_REPORT_MAX_DIGITS,
@@ -51,13 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--xover", type=int, default=105,
                     help="SIQS -> NFS crossover in digits (default 105)")
     ap.add_argument("--device", default="0",
-                    help="CUDA device, or a comma-separated list to fan "
-                         "GPU ECM stage 1 out across cards (e.g. 0,1); "
-                         "sieving and ECM stage 2 use the first device")
+                    help="CUDA device, or a comma-separated list to use "
+                         "several cards: ECM stage 1 and NFS sieving fan "
+                         "out across them; polyselect, ECM stage 2, "
+                         "Lanczos and SIQS use the first device (SIQS "
+                         "goes cluster across all cards from c80)")
     ap.add_argument("--threads", type=int, default=None,
                     help="CPU threads for msieve stages (default nproc-2)")
     ap.add_argument("--sieve-procs", type=int, default=1,
-                    help="concurrent cuda-sieve processes per band (default 1)")
+                    help="concurrent cuda-sieve processes per band, per "
+                         "GPU (default 1)")
     ap.add_argument("--bin-dir", help="directory with the backend binaries")
     ap.add_argument("--workdir", help="base scratch directory "
                                       "(default: a temp dir). A number's "
@@ -297,6 +302,34 @@ def emit(n: int, res: FactorResult, merged: list[FoundFactor] | None,
     return bool(complete)
 
 
+def _verify_devices(devices: tuple[str, ...]) -> None:
+    """Fail fast on a typo'd --device when nvidia-smi can check it.
+
+    Best-effort: without a usable nvidia-smi (GPU-less machines, CI) the
+    check is skipped — the backends will surface their own errors then.
+    """
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                             text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if out.returncode != 0:
+        return
+    lines = [l for l in out.stdout.splitlines() if l.strip()]
+    if not lines:
+        return
+    known: set[str] = set()
+    for i, line in enumerate(lines):
+        known.add(str(i))
+        m = re.search(r"\(UUID:\s*GPU-([\w-]+)\)", line)
+        if m:
+            known.add(m.group(1))
+    for d in devices:
+        uuid = d[4:] if d.startswith("GPU-") else d
+        if d not in known and uuid not in known:
+            sys.exit(f"error: device {d!r} not found by nvidia-smi")
+
+
 # ---------------------------------------------------------------------------
 
 def main(argv=None) -> int:
@@ -304,9 +337,14 @@ def main(argv=None) -> int:
     if args.quiet and args.json:
         pass  # json lines still go to stdout; -q only mutes the detail line
     numbers = load_numbers(args)
-    devices = tuple(d.strip() for d in args.device.split(",") if d.strip())
-    if not devices:
+    raw_devices = tuple(d.strip() for d in args.device.split(",") if d.strip())
+    if not raw_devices:
         sys.exit("error: --device needs at least one ordinal")
+    try:
+        devices = resolve_devices(raw_devices)
+    except ValueError as e:
+        sys.exit(f"error: {e}")
+    _verify_devices(devices)
     kwargs = dict(
         bin_dir=Path(args.bin_dir) if args.bin_dir else None,
         device=devices[0],
