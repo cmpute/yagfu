@@ -59,30 +59,32 @@ c100: 117 s vs 167 s). NFS parameters come from a per-size anchor table
 (c70…c150, piecewise-linear), polyselect gets a wall-clock budget of
 `max(60 s, 8% of predicted sieve time)` enforced by cooperative SIGINT, and the
 sieving loop is closed by msieve's filter verdict ("found N cycles, need M") with
-geometric relation top-ups.
+geometric relation top-ups. The SIQS-vs-NFS choice is made once, after the ECM
+ladder, on the cofactor that actually reaches the sieves.
 
-**Overlapped polyselect.** As soon as a number is known to be NFS-bound (≥ 90
-digits and at/above the crossover, or `--force nfs`), `msieve -np` starts in
-the background while the GPU keeps running the ECM ladder — and past the plan
-target, filling higher-level budgets for free on the cards the polyselect is
-not using (its GPU stage-1 scan is itself a full-GPU workload and owns the
-first card; sharing the card starves it, so with a single GPU there is no
-bonus overlap at all). The polyselect is trusted
-to finish its own search (msieve's internal deadline ends stage 1 but its
-stage-2 optimization keeps going, so only a total wall cap — 2h, or
-`--poly-budget` — interrupts it, cooperatively, saving the best-so-far
-polynomial); success is polled from `msieve.fb` appearing, and only that ends
-the overlap. At ~110–119 digits this build's GPU poly stage-1 currently emits
-no candidates at all (verified: enlarging the coefficient space 20x and
-relaxing stage1_norm/min_evalue change nothing), so NFS polyselect can fail
-there — the practical crossover may need raising until that is understood.
-If ECM finds a factor in the window the polyselect is cancelled
-and the cofactor re-planned from scratch (a completed `msieve.fb` survives an
-interrupt for resume).
-`--no-poly-overlap` restores fully serial staging. With several devices
-(`--device 0,1,…`) stage 1 fans out one process per card with counts split by
-learned per-card throughput; the shards' residues are merged into a single
-stage-2 run on the first card.
+**Polyselect (multi-GPU, inside the NFS stage).** With several devices the
+polynomial search shards one `msieve -np` process per card over disjoint
+leading-coefficient ranges — msieve's default range (`1 .. N^(1/(d(d−1)))/3`,
+replicated in `nfs.py`) split k ways; only multiples of msieve's ad-sieve
+multiplier are ever searched and each process aligns its begin upward, so the
+slices partition the searched set exactly, with zero cross-card traffic. Each
+process gets its own `poly-*` subdir and `CUDA_VISIBLE_DEVICES` pin, `-t`
+divided across the cards (the GPU engine caps its producer pool at 4 anyway;
+`-t` also sizes the stage-2/3 CPU pool), and the same total wall cap as before
+(2h, or `--poly-budget`) — four cards buy four-fold range coverage under the
+cap, i.e. roughly a 4× speedup at equal quality. When every process ends, the
+shard with the best `combined` E wins and its `msieve.fb`/`np.log` are promoted
+to the NFS workdir root, which is exactly the single-process layout the
+downstream stages and resume paths expect. A shard that finds nothing is only
+retried on the CPU Gerbicz engine when *no* shard produced a polynomial (an
+unlucky empty slice is not worth CPU hours when the others hold a polynomial).
+An interrupted search is torn down cooperatively — SIGINT at the cap, SIGTERM on
+Ctrl+C — and msieve saves its best-so-far candidate on the way out, so a rerun
+with the same workdir reuses the salvaged polynomial instead of re-searching.
+At ~110–119 digits this build's GPU poly stage-1 currently emits no candidates
+at all, so NFS polyselect can fail there — the practical crossover may need
+raising until that is understood. With one device the search runs exactly the
+single-process command line of old, in the bare NFS workdir.
 
 **Multi-GPU.** `--device` takes a comma-separated list (`--device 0,1` — the
 ordinals mean what they mean to CUDA in your shell, i.e. indices into
@@ -104,8 +106,10 @@ including gpuecm2 stage 2 (its CLI has no device flag) and the GPU polyselect
   a single process, and a failed cluster falls back to the solo run.
   All inter-card traffic is relations over TCP through host memory — no
   NVLink/peer-to-peer GPU path is used anywhere.
-* **Polyselect, GPU Lanczos, NFS sqrt** are single-card (first device):
-  this msieve build has no multi-GPU Lanczos without an MPI build.
+* **Polyselect** shards one `msieve -np` per card over disjoint
+  leading-coefficient ranges (best polynomial wins); **GPU Lanczos and NFS
+  sqrt** are single-card (first device): this msieve build has no multi-GPU
+  Lanczos without an MPI build.
 
 
 Primality: Baillie–PSW (base-2 strong MR + strong Lucas, Selfridge method A);
@@ -151,9 +155,8 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--plan {light,normal,deep}` | `normal` | ECM target depth (2/9, 4/13, 1/3 of digits) |
 | `--ecm-only` | off | never run SIQS/NFS: climb every ECM level to its full budget, then sample t65 forever until the number factors or Ctrl+C |
 | `--no-ecm` | off | skip the ECM stage entirely: TD → rho → SIQS/NFS (rerun convenience when the pretest is known useless) |
-| `--no-poly-overlap` | off | run NFS polyselect serially instead of in the background during ECM |
 | `--xover N` | 105 | SIQS → NFS crossover in digits |
-| `--device N[,N…]` | 0 | CUDA device(s); a list fans GPU ECM stage 1 and NFS sieving out across the cards (counts/chunks split per card), SIQS runs cuda-mpqs cluster mode from c80; polyselect, ECM stage 2 and Lanczos use the first device |
+| `--device N[,N…]` | 0 | CUDA device(s); a list fans GPU ECM stage 1, polyselect and NFS sieving out across the cards (ECM counts/polyselect coefficient ranges/sieve chunks split per card), SIQS runs cuda-mpqs cluster mode from c80; ECM stage 2 and Lanczos use the first device |
 | `--threads N` | nproc−2 | CPU threads for msieve stages |
 | `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band, per GPU |
 | `--ecm-stage2-maxmem MB` | 90% of VRAM | gpuecm2 stage-2 memory cap — limits dF via GMP-ECM's memory model (smaller blocks, same B2 coverage); `0` = no cap |
@@ -164,7 +167,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--db-token FILE` | `~/.factordb_token` | factordb token file (one line) |
 | `--db-no-report` | off | with `-db`: query only, never report |
 | `--db-dry-run` | off | with `-db`: print RPC payloads instead of sending |
-| `--poly-budget S` | 2h | NFS polyselect total wall cap: the search runs to completion (cooperative SIGINT at the cap saves the best-so-far polynomial) |
+| `--poly-budget S` | 2h | NFS polyselect total wall cap, all sharded processes together: the search runs to completion (cooperative SIGINT at the cap saves the best-so-far polynomial) |
 | `--topup-frac F` | 1.0 | NFS relation target growth per filter round (GPU sieving is cheap, `-nc1` passes are not — grow fast, save filter rounds) |
 | `-v / -q` | — | more detail in the stderr log / silence stderr logs |
 
@@ -275,7 +278,7 @@ src/yagfu/            the Python package
 scripts/build_wheel.sh  stages bin/ into the package and builds the wheel
 scripts/bench_factor.py SIQS vs NFS benchmark harness and crossover fitter
                         (drives the package backends; stdlib only)
-tests/                  95 unit tests (no GPU required; gmpy2 is only used
+tests/                  112 unit tests (no GPU required; gmpy2 is only used
                         as a reference oracle for the primality tests)
 bin/                    build output (gitignored)
 ```
@@ -311,16 +314,15 @@ All binaries are staged into `bin/`: `ecm`, `gpuecm2`, `cuda-mpqs`,
 ## Development
 
 ```sh
-PYTHONPATH=src python3 -m pytest tests/      # 110 unit tests, no GPU needed
+PYTHONPATH=src python3 -m pytest tests/      # 112 unit tests, no GPU needed
 PYTHONPATH=src YAGFU_BIN=$PWD/bin python3 -m yagfu.cli -v <N>   # live run
 scripts/build_wheel.sh --no-stage            # rebuild wheel without re-staging
 ```
 
-**Multi-GPU, deliberately not (yet).** NFS polyselect is single-card (sharding
-msieve `-np` by leading-coefficient ranges is possible but not built); multi-GPU
-Lanczos needs an MPI build of msieve (`build.sh` does not set `MPI=1`); and
-`-f` batch mode processes numbers serially — an opt-in `--shard-gpus` (one
-pipeline per card over a dynamic number queue) is the planned next step.
+**Multi-GPU, deliberately not (yet).** Multi-GPU Lanczos needs an MPI build
+of msieve (`build.sh` does not set `MPI=1`); and `-f` batch mode processes
+numbers serially — an opt-in `--shard-gpus` (one pipeline per card over a
+dynamic number queue) is the planned next step.
 
 Per-number workdirs (ECM residue files, sieve bands, msieve logs) are removed
 only when a number factors completely. A failed, crashed, or interrupted run

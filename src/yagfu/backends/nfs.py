@@ -5,8 +5,9 @@ the per-size parameter tables generalized by interpolation (params.py).
 Pipeline shape:
 
 * polyselect: msieve -np with a wall-clock budget (SIGINT cooperative cap)
-  for >= 85 digits; classic base-m polynomial below that (this msieve
-  build emits no GPU stage-1 candidates under ~85 digits).
+  for >= 85 digits, sharded one process per GPU over disjoint
+  leading-coefficient ranges; classic base-m polynomial below that (this
+  msieve build emits no GPU stage-1 candidates under ~85 digits).
 * sieving: cuda-sieve bands with an adaptive width, special-q from alim/2,
   merged into msieve.dat; msieve -nc1 verdict drives the loop.
 * postprocessing: -nc2 matbuild, GPU Lanczos -nc2, sqrt -nc3.
@@ -18,6 +19,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -209,22 +211,54 @@ class NfsResult:
     error: str | None = None
 
 
-class PolyselectJob:
-    """msieve -np running in the background while GPU ECM continues.
+def _poly_coeff_max(n: int) -> int:
+    """msieve's default leading-coefficient search bound (poly_skew.c
+    find_poly_core): degree picked from the size, then
+    coeff_max = N^(1/(degree*(degree-1))) / 3 — same float arithmetic as
+    the C, so the values match what a plain -np prints."""
+    digits = math.log10(n)
+    degree = 4 if digits < 108 else (5 if digits < 220 else 6)
+    return int(float(n) ** (1.0 / (degree * (degree - 1))) / 3.0)
 
-    The engine starts one as soon as a number is known to be NFS-bound;
-    run_nfs later consumes the finished job instead of running its own
-    polyselect.  Success is polled from the artifacts, not the clock:
-    the polynomial exists iff msieve.fb is on disk, and msieve is left
-    alone to finish its own search (its internal deadline ends stage 1;
-    stage-2 optimization then runs as long as it keeps improving).  A
-    watcher thread only enforces a total wall cap — cooperative SIGINT
-    first, so msieve writes out its best candidate — and Ctrl+C,
-    timeouts and factor-found cancels never leave it alive.
+
+def _poly_ranges(n: int, k: int) -> list[tuple[int, int] | None]:
+    """Split the default leading-coefficient range into k contiguous
+    integer chunks; [None] means "one process, default range".  msieve
+    only ever searches multiples of an ad-sieve multiplier and rounds
+    each begin up to one, so arbitrary integer boundaries still partition
+    the searched set with no gaps and no overlap."""
+    if k <= 1:
+        return [None]
+    top = _poly_coeff_max(n)
+    width = top // k
+    if width == 0:
+        return [None]
+    out = []
+    for i in range(k):
+        lo = 1 if i == 0 else i * width + 1
+        hi = (i + 1) * width if i < k - 1 else top
+        if lo <= hi:
+            out.append((lo, hi))
+    return out
+
+
+class PolyselectJob:
+    """msieve -np polynomial search, sharded across the GPUs when there
+    are several: each card runs one process over a disjoint slice of the
+    leading-coefficient range, and the best-scoring shard wins.
+
+    The winner's msieve.fb/np.log are promoted to the workdir root, so
+    run_nfs's downstream stages and the resume paths see exactly the
+    single-process layout.  A watcher thread per process enforces the
+    total wall cap — cooperative SIGINT first, so msieve writes out its
+    best candidate — and the same wall cap buys k-fold coverage, not an
+    earlier exit.  Interrupts and timeouts never leave a process alive;
+    an interrupted search still leaves the salvaged best-so-far fb for a
+    rerun to reuse.
     """
 
     def __init__(self, n: int, ctx: RunContext, wd: Path,
-                 background: bool = True, engine: str = "gpu_cubsort"):
+                 engine: str = "gpu_cubsort"):
         msieve = find_bin("msieve", ctx.bin_dir)
         wd.mkdir(parents=True, exist_ok=True)
         # never inherit a stale poly from an earlier cancelled attempt
@@ -236,7 +270,7 @@ class PolyselectJob:
         self.n, self.ctx, self.wd = n, ctx, wd
         # trunk msieve has a stage-1 engine registry; the GPU cubsort
         # engine is the fast default, the CPU Gerbicz reference is the
-        # always-compiled-in fallback an ended search retries on
+        # always-compiled-in fallback a wholly poly-less search retries on
         self.engine = engine
         self._engine_retried = False
         self.budget = poly_budget(len(str(n)), ctx.poly_budget_s)
@@ -252,71 +286,113 @@ class PolyselectJob:
         self.wall_s = 0.0
         self._t0 = time.monotonic()
         self._deadline_at = self._t0 + cap
-        self._spawn(msieve)
-        if background:
-            ctx.log(f"nfs: polyselect started in background "
-                    f"(~{fmt_dur(self.budget)} expected, "
-                    f"cap {fmt_dur(cap)})")
+        self._cap_logged = False
+        # [(subdir, process)]: one private subdir per sharded card, or
+        # the bare workdir for a single-process search
+        self._procs: list[tuple[Path, subprocess.Popen]] = []
+        self._shard(msieve)
+        if self.sharded:
+            ctx.log(f"nfs: polyselect sharded across {len(self._procs)} "
+                    f"GPUs (leading coeffs 1..{self._coeff_top:,} split "
+                    f"{len(self._procs)} ways, -t {self._threads} each, "
+                    f"~{fmt_dur(self.budget)} expected, cap {fmt_dur(cap)})")
         else:
-            ctx.log(f"nfs: polyselect (msieve -np, "
-                    f"~{fmt_dur(self.budget)} expected, "
-                    f"cap {fmt_dur(cap)})")
+            ctx.log(f"nfs: polyselect (msieve -np, ~{fmt_dur(self.budget)} "
+                    f"expected, cap {fmt_dur(cap)})")
         self._watch()
 
-    def _spawn(self, msieve) -> None:
-        # the single-binary fork embeds all kernels; the engine name
-        # selects the ported trunk stage-1 engine (gpu_cubsort/cpu_gerbicz)
-        cmd = [msieve, "-np", f"stage1_engine={self.engine}",
-               "-t", str(self.ctx.threads), "-v", str(self.n)]
-        f = open(self.wd / "np.log", "wb")
-        try:
-            # msieve -np has no device flag; the GPU stage-1 polyselect
-            # (>= ~90 digits) runs on the pinned card's ordinal 0
-            self._p = subprocess.Popen([str(c) for c in cmd],
-                                       cwd=str(self.wd),
-                                       stdout=f, stderr=subprocess.STDOUT,
-                                       env={**os.environ,
-                                            **self.ctx.pin_env()})
-        finally:
-            f.close()
+    def _shard(self, msieve) -> None:
+        """Spawn one msieve -np per card: the default coefficient range
+        split k ways when sharding, whole and unpinned-from-args on a lone
+        card (exact single-process behavior).  A sharded process gets a
+        fresh private subdir — msieve reads msieve.fb *before* searching,
+        and a leftover file for the same N would skip the search."""
+        k = len(self.ctx.devices) if self.engine == "gpu_cubsort" else 1
+        rng = _poly_ranges(self.n, k)
+        self._procs = []
+        self._cards = list(zip(self.ctx.devices[:len(rng)], rng))
+        self.sharded = len(rng) > 1
+        self._coeff_top = _poly_coeff_max(self.n)
+        # GPU engines cap their producer pool at 4 anyway; -t also sizes
+        # the stage-2/3 CPU pool, so sharded processes divide the cores
+        self._threads = (str(self.ctx.threads) if len(rng) == 1 else
+                         str(max(2, self.ctx.threads // len(rng))))
+        for i, (dev, r) in enumerate(self._cards):
+            d = self.wd if r is None else self.wd / f"poly-{i}"
+            if r is not None:
+                shutil.rmtree(d, ignore_errors=True)
+                d.mkdir(parents=True)
+            # one nfs_args token, space-separated: a comma anywhere would
+            # trip msieve's legacy "X,Y" coefficient-range parse
+            args = f"stage1_engine={self.engine}"
+            if r is not None:
+                args += f" min_coeff={r[0]} max_coeff={r[1]}"
+            cmd = [msieve, "-np", args, "-t", self._threads, "-v",
+                   str(self.n)]
+            f = open(d / "np.log", "wb")
+            try:
+                # msieve -np has no device flag; each process sees exactly
+                # its card as ordinal 0 via CUDA_VISIBLE_DEVICES
+                p = subprocess.Popen([str(c) for c in cmd],
+                                     cwd=str(d),
+                                     stdout=f, stderr=subprocess.STDOUT,
+                                     env={**os.environ,
+                                          **self.ctx.pin_env(dev)})
+            finally:
+                f.close()
+            self._procs.append((d, p))
 
     def engine_retry(self) -> bool:
-        """A GPU stage-1 search that ended polynomial-less gets one retry
+        """A GPU search where NO card produced a polynomial gets one retry
         on the CPU Gerbicz engine — always compiled in, and msieve's own
-        default.  The wall cap keeps ticking; True when a process runs."""
+        default.  An unlucky empty range slice is not retried: with other
+        shards holding a polynomial, CPU hours on the empty slice buy
+        nothing.  The wall cap restarts; True when a process runs."""
         if self._engine_retried or self.engine == "cpu_gerbicz":
             return False
-        if self._p.poll() is None:            # still running
-            return False
-        if (self.wd / "msieve.fb").exists():  # ended with a polynomial
+        if any(p.poll() is None for _, p in self._procs):
+            return False                          # still running
+        if self.sharded:
+            empty = [d.name for d, _ in self._procs
+                     if not (d / "msieve.fb").exists()]
+            if len(empty) < len(self._procs):
+                if empty:
+                    self.ctx.log(f"nfs: polyselect shard(s) {', '.join(empty)}"
+                                 " found no polynomial; keeping the others'")
+                return False
+        elif (self.wd / "msieve.fb").exists():
             return False
         self._engine_retried = True
         self.engine = "cpu_gerbicz"
         self._t0 = time.monotonic()
         self._deadline_at = self._t0 + POLY_MAX_WAIT_S
+        self._cap_logged = False
         self.ctx.log("nfs: GPU polyselect found nothing; "
                      "retrying on the CPU Gerbicz engine")
-        self._spawn(find_bin("msieve", self.ctx.bin_dir))
+        self._shard(find_bin("msieve", self.ctx.bin_dir))
         self._watch()
         return True
 
     def _watch(self) -> None:
-        """Enforce the total wall cap on the -np process."""
-        threading.Thread(target=self._deadline_watch, daemon=True).start()
+        """Enforce the total wall cap on every -np process."""
+        for _, p in self._procs:
+            threading.Thread(target=self._deadline_watch, args=(p,),
+                             daemon=True).start()
 
-    def _deadline_watch(self) -> None:
+    def _deadline_watch(self, p) -> None:
         """At the cap, SIGINT msieve so it saves its best-so-far polynomial
         (msieve.fb) on the way out; escalate only if it hangs."""
-        p = self._p
         try:
             p.wait(timeout=max(self._deadline_at - time.monotonic(), 0.0))
             return
         except subprocess.TimeoutExpired:
             pass
         if p.poll() is None:
-            self.ctx.log(f"nfs: polyselect hit its wall cap "
-                         f"({fmt_dur(time.monotonic() - self._t0)}); "
-                         f"interrupting for the best-so-far polynomial")
+            if not self._cap_logged:
+                self._cap_logged = True
+                self.ctx.log(f"nfs: polyselect hit its wall cap "
+                             f"({fmt_dur(time.monotonic() - self._t0)}); "
+                             f"interrupting for the best-so-far polynomial")
             p.send_signal(signal.SIGINT)
             # the cooperative unwind can be slow: a single stage-2 root
             # optimization at c13x sizes runs for minutes, and killing
@@ -325,10 +401,9 @@ class PolyselectJob:
             try:
                 p.wait(timeout=600)
             except subprocess.TimeoutExpired:
-                self._term_kill()
+                self._term_kill(p)
 
-    def _term_kill(self) -> None:
-        p = self._p
+    def _term_kill(self, p) -> None:
         if p.poll() is None:
             p.terminate()
             try:
@@ -337,40 +412,51 @@ class PolyselectJob:
                 p.kill()
                 p.wait()
 
-    def running(self) -> bool:
-        return self._p.poll() is None
-
-    def poly_ready(self) -> bool:
-        """True once the polyselect has ended AND its polynomial is on disk.
-
-        The polynomial exists iff msieve.fb is on disk — polled, not
-        assumed: msieve is left to finish its own search, and a still
-        running -np with an fb already saved keeps optimizing (a better
-        polynomial may still land).
-        """
-        return not self.running() and (self.wd / "msieve.fb").exists()
-
-    def elapsed(self) -> float:
-        """Wall time since launch (even while still running)."""
-        return time.monotonic() - self._t0
-
     def wait(self, timeout: float | None = None) -> "PolyselectJob":
-        """Block until polyselect is done (the wall-cap watcher SIGINTs
-        it at the deadline so it saves its best-so-far polynomial; a
-        polynomial-less GPU search retries once on the CPU engine)."""
+        """Block until every process ends (the wall-cap watchers SIGINT
+        them at the deadline so each saves its best-so-far polynomial),
+        merge the shards, and only a search where no card produced a
+        polynomial retries once on the CPU engine.  Any exception (Ctrl+C
+        included) tears the processes down and salvages the best-so-far
+        polynomial before propagating."""
         try:
-            self._p.wait(timeout=timeout or NP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            self._term_kill()
+            self._join(timeout)
+            if self.sharded:
+                self._merge()
+            if self.engine_retry():
+                self._join(timeout)
             self._finish()
-            return self
-        if self.engine_retry():
-            try:
-                self._p.wait(timeout=NP_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
-                self._term_kill()
-        self._finish()
+        except BaseException:
+            self.cancel(drop_poly=False)
+            raise
         return self
+
+    def _join(self, timeout: float | None) -> None:
+        for _, p in self._procs:
+            try:
+                p.wait(timeout=timeout or NP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                self._term_kill(p)
+
+    def _merge(self) -> None:
+        """Promote the best-scoring shard result to the workdir root: the
+        polynomial (msieve.fb) plus its log (np.log carries the
+        combined-E line the finish/resume paths parse).  Also called from
+        cancel(): msieve writes its best on SIGTERM, so an interrupted
+        search still salvages the best-so-far polynomial."""
+        scored = []
+        for d, _ in self._procs:
+            if d == self.wd or not (d / "msieve.fb").exists():
+                continue
+            scored.append((_poly_e_from_log(d) or -1.0, d))
+        if not scored:
+            return
+        _, best = max(scored)
+        es = ", ".join(f"{e:g}" if e >= 0 else "?" for e, _ in scored)
+        self.ctx.log(f"nfs: polyselect shards E = [{es}]; best from "
+                     f"{best.name}")
+        shutil.copyfile(best / "msieve.fb", self.wd / "msieve.fb")
+        shutil.copyfile(best / "np.log", self.wd / "np.log")
 
     def _finish(self) -> None:
         self.wall_s = time.monotonic() - self._t0
@@ -380,29 +466,33 @@ class PolyselectJob:
             return
         self.fb = _parse_msieve_fb(read_log(fb_path))
         self.poly_method = "msieve -np"
-        m = re.search(r"combined = ([\d.e+-]+)", read_log(self.wd / "np.log"))
+        m = re.search(r"combined = ([\d.e+-]+)",
+                      read_log(self.wd / "np.log"))
         if m:
             self.poly_e = float(m.group(1))
 
     def cancel(self, drop_poly: bool = True) -> None:
-        """Stop the polyselect and drop partial artifacts; idempotent.
+        """Stop every process and drop partial artifacts; idempotent.
 
-        drop_poly=False keeps msieve.fb on disk: an interrupted run then
-        resumes with the polynomial instead of re-searching (msieve.fb
-        holds msieve's best confirmed candidate — a mid-run interrupt
-        leaves a usable, if not yet optimal, polynomial behind).  The
-        number-was-split path must drop it: that polynomial is for the
-        wrong number."""
-        p = getattr(self, "_p", None)
-        if p is not None and p.poll() is None:
-            self._term_kill()
-        if p is not None and p.poll() is not None and drop_poly \
-                and self.fb is None:
+        drop_poly=False keeps the merged best-so-far msieve.fb on disk:
+        an interrupted run then resumes with the polynomial instead of
+        re-searching (msieve.fb holds msieve's best confirmed candidate —
+        a mid-run interrupt leaves a usable, if not yet optimal,
+        polynomial behind)."""
+        for _, p in self._procs:
+            if p.poll() is None:
+                self._term_kill(p)
+        if self.sharded:
+            self._merge()
+        if all(p.poll() is not None for _, p in self._procs) \
+                and drop_poly and self.fb is None:
             for name in ("msieve.fb", "np.log"):
                 try:
                     (self.wd / name).unlink()
                 except OSError:
                     pass
+            for d in self.wd.glob("poly-*"):
+                shutil.rmtree(d, ignore_errors=True)
 
 
 def _append_band_rels(wd: Path, relnames: list[str]) -> None:
@@ -491,7 +581,7 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
                 ctx.log("nfs: reusing msieve.fb from workdir"
                         + (f" (E={res.poly_e:g})" if res.poly_e else ""))
         if fb is None:
-            poly = PolyselectJob(n, ctx, wd, background=False)
+            poly = PolyselectJob(n, ctx, wd)
             poly.wait()
             if poly.fb is None:
                 res.error = poly.error
