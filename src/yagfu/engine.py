@@ -311,16 +311,14 @@ class Engine:
         """Bonus ECM while background polyselect holds the CPUs: keep
         filling level budgets above the plan target.
 
-        Only a polyselect that finished WITH a polynomial yields the GPUs
-        back.  A budgeted attempt that dies polynomial-less is retried
-        with a doubled budget right here — the CPUs stay busy and the
-        overlap runs on through the retry; killing the bonus batch for
-        it would just waste free curves (a 4-GPU stage-1 batch at
-        B1=11M is a minute of work).  Only a retry ladder that climbed
-        to its cap without a polynomial ends the bonus early, and NFS
-        then reports the polyselect failure.  A factor found here (even
-        in a killed batch's log) ends the overlap — the caller re-plans
-        the cofactor."""
+        The polyselect is trusted to finish its own search (only a total
+        wall cap interrupts it, cooperatively, so it saves its best-so-far
+        polynomial); success is polled from msieve.fb.  Only a polyselect
+        that ended WITH a polynomial yields the GPUs back; killing the
+        bonus batch for anything less would just waste free curves (a
+        4-GPU stage-1 batch at B1=11M is a minute of work).  A factor
+        found here (even in a killed batch's log) ends the overlap — the
+        caller re-plans the cofactor."""
         ctx = self.ctx
         ctx.log("ecm: polyselect running in background, climbing bonus "
                 "levels")
@@ -332,9 +330,7 @@ class Engine:
             if job.poly_ready():
                 break               # polynomial in hand: NFS can start
             if not job.running():
-                if not job.retry():
-                    break           # failed for good: let NFS report it
-                continue
+                break               # ended polynomial-less: NFS reports it
             while j < NUM_LEVELS and ledger.level_budget_left(j) <= 0:
                 j += 1
             if j >= NUM_LEVELS:

@@ -64,14 +64,14 @@ geometric relation top-ups.
 **Overlapped polyselect.** As soon as a number is known to be NFS-bound (≥ 90
 digits and at/above the crossover, or `--force nfs`), `msieve -np` starts in the
 background on the CPUs while the GPU keeps running the ECM ladder — and past the
-plan target, filling higher-level budgets for free. Only a polyselect that
-actually produced a polynomial yields the GPUs back: when the wall budget kills
-`-np` before its first candidate, the retry (budget doubled each time,
-own wall cap — msieve's internal deadline only covers stage 1) starts right
-there in the
-background and the bonus ECM runs on through it (a budget expiry mid-batch is
-not a reason to drop a running stage-1 batch). The polyselect wall time is
-unchanged, the GPU no longer idles during it, and the pretest gets extra depth
+plan target, filling higher-level budgets for free. The polyselect is trusted
+to finish its own search (msieve's internal deadline ends stage 1 but its
+stage-2 optimization keeps going, so only a total wall cap — 2h, or
+`--poly-budget` — interrupts it, cooperatively, saving the best-so-far
+polynomial); success is polled from `msieve.fb` appearing, and only that yields
+the GPUs back — a budget expiring mid-batch is never a reason to drop a
+running stage-1 batch. The polyselect wall time is
+unchanged, the GPU never idles during it, and the pretest gets extra depth
 at zero cost; if ECM finds a factor in the window the polyselect is cancelled
 and the cofactor re-planned from scratch.
 `--no-poly-overlap` restores fully serial staging. With several devices
@@ -159,7 +159,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--db-token FILE` | `~/.factordb_token` | factordb token file (one line) |
 | `--db-no-report` | off | with `-db`: query only, never report |
 | `--db-dry-run` | off | with `-db`: print RPC payloads instead of sending |
-| `--poly-budget S` | heuristic | NFS polyselect deadline (0 = msieve's own) |
+| `--poly-budget S` | 2h | NFS polyselect total wall cap: the search runs to completion (cooperative SIGINT at the cap saves the best-so-far polynomial) |
 | `--topup-frac F` | 1.0 | NFS relation target growth per filter round (GPU sieving is cheap, `-nc1` passes are not — grow fast, save filter rounds) |
 | `-v / -q` | — | more detail in the stderr log / silence stderr logs |
 

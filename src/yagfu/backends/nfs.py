@@ -42,10 +42,11 @@ from .runner import (
 )
 
 NP_TIMEOUT_S = 2 * 3600
-#: each polyselect retry doubles the budget, but never past this wall
-#: cap — an attempt this long with no candidate at all means the search
-#: is not converging for this number/build
-POLY_RETRY_CAP_S = 2 * 3600
+#: total wall cap for a polyselect: msieve's internal deadline only ends
+#: stage 1 (its stage-2 optimization keeps going, and the CPU-seconds
+#: estimate does not account for GPU stage-1 speed), so the search is
+#: trusted to finish on its own but never past this
+POLY_MAX_WAIT_S = 2 * 3600
 SIEVE_TIMEOUT_S = 6 * 3600
 NC_TIMEOUT_S = 2 * 3600
 LA_TIMEOUT_S = 12 * 3600
@@ -213,9 +214,13 @@ class PolyselectJob:
 
     The engine starts one as soon as a number is known to be NFS-bound;
     run_nfs later consumes the finished job instead of running its own
-    polyselect.  A watcher thread enforces the wall-clock budget
-    (cooperative SIGINT, then terminate, then kill); Ctrl+C, timeouts and
-    factor-found cancels never leave the msieve process alive.
+    polyselect.  Success is polled from the artifacts, not the clock:
+    the polynomial exists iff msieve.fb is on disk, and msieve is left
+    alone to finish its own search (its internal deadline ends stage 1;
+    stage-2 optimization then runs as long as it keeps improving).  A
+    watcher thread only enforces a total wall cap — cooperative SIGINT
+    first, so msieve writes out its best candidate — and Ctrl+C,
+    timeouts and factor-found cancels never leave it alive.
     """
 
     def __init__(self, n: int, ctx: RunContext, wd: Path,
@@ -230,27 +235,28 @@ class PolyselectJob:
                 pass
         self.n, self.ctx, self.wd = n, ctx, wd
         self.budget = poly_budget(len(str(n)), ctx.poly_budget_s)
-        # an explicit --poly-budget (other than 0 = msieve's own) is
-        # never extended
-        self.user_budget = (ctx.poly_budget_s is not None
-                            and ctx.poly_budget_s > 0)
+        # an explicit --poly-budget is the total wall cap; otherwise the
+        # estimate above is informational and POLY_MAX_WAIT_S applies
+        cap = ctx.poly_budget_s if (
+            ctx.poly_budget_s is not None and ctx.poly_budget_s > 0
+        ) else POLY_MAX_WAIT_S
         self.fb: dict[str, str] | None = None
         self.poly_e: float | None = None
         self.poly_method: str | None = None
         self.error: str | None = None
         self.wall_s = 0.0
-        self._retried = False
-        self._at_cap = False
         self._t0 = time.monotonic()
+        self._deadline_at = self._t0 + cap
         self._spawn(msieve)
         if background:
             ctx.log(f"nfs: polyselect started in background "
-                    f"(budget {fmt_dur(self.budget)})")
+                    f"(~{fmt_dur(self.budget)} expected, "
+                    f"cap {fmt_dur(cap)})")
         else:
             ctx.log(f"nfs: polyselect (msieve -np, "
-                    f"budget {fmt_dur(self.budget)})")
-        if self.budget > 0:        # budget 0 = --poly-budget 0: msieve's own
-            self._watch(adopt=True)
+                    f"~{fmt_dur(self.budget)} expected, "
+                    f"cap {fmt_dur(cap)})")
+        self._watch()
 
     def _spawn(self, msieve) -> None:
         cmd = [msieve, "-np", "-t", str(self.ctx.threads), "-v", str(self.n)]
@@ -266,48 +272,23 @@ class PolyselectJob:
         finally:
             f.close()
 
-    def _maybe_extend_budget(self) -> None:
-        """Adopt msieve's own poly-select deadline when it exceeds our
-        heuristic cap.  msieve prints it (CPU-seconds) right after start;
-        capping earlier would SIGINT before the first confirmed candidate
-        and force the budget-doubling retry anyway.  An explicit --poly-budget is
-        never overridden."""
-        if self.user_budget:
-            return
-        try:
-            log = read_log(self.wd / "np.log")
-        except OSError:
-            return
-        m = _RE_MSIEVE_DEADLINE.search(log)
-        if not m:
-            return
-        wall = min(int(m.group(1)) / max(1, self.ctx.threads) + 120,
-                   2 * 3600)
-        if wall > self.budget:
-            self.budget = wall
-            self.ctx.log(f"nfs: polyselect budget extended to "
-                         f"{fmt_dur(wall)} (msieve's own deadline)")
+    def _watch(self) -> None:
+        """Enforce the total wall cap on the -np process."""
+        threading.Thread(target=self._deadline_watch, daemon=True).start()
 
-    def _watch(self, adopt: bool) -> None:
-        """Cap the current -np process at self.budget wall seconds."""
-        threading.Thread(target=self._budget_watch, args=(adopt,),
-                         daemon=True).start()
-
-    def _budget_watch(self, adopt: bool = True) -> None:
-        t0 = time.monotonic()
-        if adopt:
-            # msieve prints its deadline within the first seconds: adopt
-            # it before the cap can fire
-            while time.monotonic() - t0 < 30 and self._p.poll() is None:
-                self._maybe_extend_budget()
-                time.sleep(2)
+    def _deadline_watch(self) -> None:
+        """At the cap, SIGINT msieve so it saves its best-so-far polynomial
+        (msieve.fb) on the way out; escalate only if it hangs."""
         p = self._p
         try:
-            p.wait(timeout=max(self.budget - (time.monotonic() - t0), 5.0))
+            p.wait(timeout=max(self._deadline_at - time.monotonic(), 0.0))
             return
         except subprocess.TimeoutExpired:
             pass
         if p.poll() is None:
+            self.ctx.log(f"nfs: polyselect hit its wall cap "
+                         f"({fmt_dur(time.monotonic() - self._t0)}); "
+                         f"interrupting for the best-so-far polynomial")
             p.send_signal(signal.SIGINT)
             try:
                 p.wait(timeout=90)
@@ -330,63 +311,24 @@ class PolyselectJob:
     def poly_ready(self) -> bool:
         """True once the polyselect has ended AND its polynomial is on disk.
 
-        A dead process alone is not a verdict: the budget cap SIGINTs
-        -np before any candidate is confirmed, and msieve.fb existing is
-        exactly the "got at least one polynomial" criterion wait() uses
-        for its retry decision.
+        The polynomial exists iff msieve.fb is on disk — polled, not
+        assumed: msieve is left to finish its own search, and a still
+        running -np with an fb already saved keeps optimizing (a better
+        polynomial may still land).
         """
         return not self.running() and (self.wd / "msieve.fb").exists()
-
-    def retry(self) -> bool:
-        """If the previous -np exited without saving any polynomial,
-        respawn it with a doubled budget (capped); True when a process is
-        now running.
-
-        msieve's own deadline is a CPU-seconds stage-1 estimate — its
-        stage-2 optimization can run far past it — so no attempt is ever
-        trusted to stop itself: every respawn gets our wall-cap watcher.
-        The budget doubles per retry (the initial estimate first, then 2x,
-        4x, ...) up to POLY_RETRY_CAP_S; once an attempt at the cap
-        produced nothing, the search is over.  Called by the overlap
-        loop to keep the CPUs busy without ending the bonus ECM, and by
-        wait() for the serial path.
-        """
-        if self.budget <= 0 or self._at_cap:
-            return False
-        if self._p.poll() is None:            # still running
-            return False
-        if (self.wd / "msieve.fb").exists():  # ended with a polynomial
-            return False
-        prev = self.budget
-        self.budget = min(prev * 2, POLY_RETRY_CAP_S)
-        if self.budget >= POLY_RETRY_CAP_S:
-            self._at_cap = True               # this attempt is the last
-        self._retried = True
-        self.ctx.log(f"nfs: no polynomial within {fmt_dur(prev)}; "
-                     f"retrying with budget {fmt_dur(self.budget)}")
-        self._spawn(find_bin("msieve", self.ctx.bin_dir))
-        self._watch(adopt=False)
-        return True
 
     def elapsed(self) -> float:
         """Wall time since launch (even while still running)."""
         return time.monotonic() - self._t0
 
     def wait(self, timeout: float | None = None) -> "PolyselectJob":
-        """Block until polyselect is done, retrying with a doubled
-        budget for as long as attempts die polynomial-less."""
+        """Block until polyselect is done (the wall-cap watcher SIGINTs
+        it at the deadline so it saves its best-so-far polynomial)."""
         try:
             self._p.wait(timeout=timeout or NP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             self._term_kill()
-            self._finish()
-            return self
-        while self.retry():
-            try:
-                self._p.wait(timeout=NP_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
-                self._term_kill()
-                break
         self._finish()
         return self
 

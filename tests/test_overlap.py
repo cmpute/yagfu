@@ -22,7 +22,6 @@ class FakeJob:
         self.polls_left = polls
         self.cancelled = 0
         self.waited = 0
-        self.retries = 0
         self.budget = 60.0
         self.fb = {"N": "1"}          # truthy: cancel() keeps artifacts
 
@@ -38,9 +37,6 @@ class FakeJob:
     def poly_ready(self):
         return self.polls_left <= 0     # finished == success for the fake
 
-    def retry(self):
-        self.retries += 1
-        return False                    # subclasses opt into retrying
 
     def wait(self, timeout=None):
         self.waited += 1
@@ -50,46 +46,12 @@ class FakeJob:
         self.cancelled += 1
 
 
-class BudgetKillJob(FakeJob):
-    """The budgeted -np attempt dies with no polynomial; the doubled-
-    budget retry runs a while and then succeeds."""
-
-    def __init__(self, polls):
-        super().__init__(polls)
-        self.ready = False
-
-    def poly_ready(self):
-        return self.ready
-
-    def retry(self):
-        if self.retries >= 1:
-            return False
-        self.retries += 1
-        self.polls_left = 2            # the retry stays busy a while
-        return True
-
-    def running(self):
-        if self.polls_left > 0:
-            self.polls_left -= 1
-            return True
-        if self.retries >= 1:
-            self.ready = True          # retry finished with the poly
-        return False
-
-
-class FailTwiceJob(FakeJob):
-    """Every attempt — budgeted or retried — dies without a
-    polynomial: the overlap must end (bounded bonus), not climb forever."""
+class DeadNoPolyJob(FakeJob):
+    """-np ended with no polynomial on disk (cap hit, or it just failed):
+    the overlap must end (bounded bonus), not climb forever."""
 
     def poly_ready(self):
         return False
-
-    def retry(self):
-        if self.retries >= 1:
-            return False
-        self.retries += 1
-        self.polls_left = 1
-        return True
 
 
 def _patch(monkeypatch, job, found_on=(), fail_calls=()):
@@ -232,36 +194,11 @@ def test_bonus_aborts_when_poly_done(monkeypatch, tmp_path, capsys):
     assert "dropping the partial bonus batch" in capsys.readouterr().err
 
 
-def test_bonus_survives_budget_killed_polyselect(monkeypatch, tmp_path,
-                                                 capsys):
-    """The budgeted -np dying without a polynomial must NOT kill the
-    bonus batch: the doubled-budget retry starts in place, the overlap runs on
-    through it, and only its success (a polynomial) yields the GPUs."""
-    job = BudgetKillJob(polls=2)
-    calls = _patch(monkeypatch, job)
-
-    aborted = []
-
-    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
-        calls["b1"].append(b1)
-        aborted.append(bool(stop_check and stop_check()))
-        return EcmRunResult(curves_done=total, wall_s=0.001 * total)
-
-    monkeypatch.setattr(engine_mod, "run_ecm_curves", fake_ecm)
-    eng = Engine(RunContext(**CTX))
-    res = eng.factor(N, tmp_path)
-    assert res.complete, res.error
-    assert job.retries == 1                    # exactly one retry so far
-    assert not any(aborted)                    # no batch was ever stopped
-    assert len(calls["b1"]) >= 5               # bonus ran through the retry
-    assert "dropping the partial bonus batch" not in capsys.readouterr().err
-    assert calls["nfs_poly"] == [job]          # NFS joined with the poly
-
-
-def test_bonus_ends_after_failed_retry(monkeypatch, tmp_path):
-    """Retry also failing ends the overlap promptly instead of climbing
-    the ladder to t65 — NFS then reports the polyselect failure."""
-    job = FailTwiceJob(polls=2)
+def test_bonus_ends_when_poly_dies_polyless(monkeypatch, tmp_path):
+    """-np ending without a polynomial ends the overlap promptly instead
+    of climbing the ladder to t65 — NFS then reports the polyselect
+    failure."""
+    job = DeadNoPolyJob(polls=2)
     calls = _patch(monkeypatch, job)
 
     def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
@@ -272,94 +209,45 @@ def test_bonus_ends_after_failed_retry(monkeypatch, tmp_path):
     eng = Engine(RunContext(**CTX))
     res = eng.factor(N, tmp_path)
     assert res.complete, res.error             # fake NFS still succeeds
-    assert job.retries == 1
     assert 4 <= len(calls["b1"]) <= 8          # bounded bonus window
     assert calls["nfs_poly"] == [job]
 
 
-def test_polyselect_budget_adopts_msieve_deadline(tmp_path, capsys):
-    from yagfu.backends.nfs import PolyselectJob
-
-    job = object.__new__(PolyselectJob)     # no process, logic only
-    job.wd = tmp_path
-    job.ctx = RunContext(threads=13)
-    job.user_budget = False
-    job.budget = 60.0
-    (tmp_path / "np.log").write_text("poly select deadline: 15209\n")
-    job._maybe_extend_budget()
-    assert abs(job.budget - (15209 / 13 + 120)) < 1.0
-    assert "extended" in capsys.readouterr().err
-    job.user_budget = True              # explicit --poly-budget wins
-    job.budget = 60.0
-    job._maybe_extend_budget()
-    assert job.budget == 60.0
-
-
-def test_polyselect_retry_doubles_budget(tmp_path, monkeypatch, capsys):
-    """PolyselectJob.retry: a dead -np with no msieve.fb respawns with a
-    doubled, wall-capped budget each time; the ladder stops at the cap,
-    and a dead -np WITH msieve.fb never retries."""
+def test_polyselect_deadline_watch_sigints_at_cap(tmp_path, capsys):
+    """At the total wall cap the watcher SIGINTs msieve (so it saves its
+    best-so-far polynomial) instead of killing it outright."""
+    import signal
+    import subprocess
     import time
 
-    from yagfu.backends import nfs
-    from yagfu.backends.nfs import POLY_RETRY_CAP_S
-
-    class DeadP:
-        def poll(self):
-            return 1
-
-        def wait(self, timeout=None):
-            return 0
+    from yagfu.backends.nfs import PolyselectJob
 
     class AliveP:
+        def __init__(self):
+            self.signals = []
+
         def poll(self):
             return None
 
-    def mkjob(p=None):
-        job = object.__new__(nfs.PolyselectJob)
-        job.wd = tmp_path
-        job.ctx = RunContext(threads=2)
-        job._retried = False
-        job._at_cap = False
-        job.budget = 300.0
-        job.user_budget = False
-        job._t0 = time.monotonic()
-        job._p = p or DeadP()
-        return job
+        def send_signal(self, sig):
+            self.signals.append(sig)
+            self.dead = True
 
-    spawns, watches = [], []
+        def wait(self, timeout=None):
+            if getattr(self, "dead", False):
+                return 0
+            raise subprocess.TimeoutExpired("msieve", timeout)
 
-    def fake_spawn(ms):
-        spawns.append(ms)
-
-    def fake_watch(adopt):
-        watches.append(adopt)
-
-    monkeypatch.setattr(nfs, "find_bin", lambda name, bd: "/bin/msieve")
-
-    job = mkjob()
-    monkeypatch.setattr(job, "_spawn", fake_spawn, raising=False)
-    monkeypatch.setattr(job, "_watch", fake_watch, raising=False)
-    assert not job.poly_ready()            # dead, but no polynomial yet
-    assert job.retry() is True             # 300s -> 600s
-    assert job.budget == 600.0
-    assert job.retry() is True             # 600s -> 1200s: the ladder climbs
-    assert job.budget == 1200.0
-    assert spawns == ["/bin/msieve"] * 2
-    assert watches == [False, False]       # every respawn is wall-capped
-    err = capsys.readouterr().err
-    assert "retrying with budget" in err and "10.0m" in err
-
-    job.budget = POLY_RETRY_CAP_S // 2     # next doubling hits the cap
-    assert job.retry() is True
-    assert job.budget == POLY_RETRY_CAP_S
-    assert job.retry() is False            # the capped attempt was the last
-
-    assert mkjob(AliveP()).retry() is False        # still running: no retry
-    ok = mkjob()                                   # dead WITH a polynomial
-    (tmp_path / "msieve.fb").write_text("N 1\n")
-    assert ok.poly_ready()
-    assert ok.retry() is False
+    job = object.__new__(PolyselectJob)
+    job.wd = tmp_path
+    job.ctx = RunContext(log_file=tmp_path / "t.log")
+    job._t0 = time.monotonic() - 10.0
+    job._deadline_at = time.monotonic() - 1.0   # cap already passed
+    job._p = AliveP()
+    job._term_kill = lambda: None
+    job._deadline_watch()
+    assert job._p.signals == [signal.SIGINT]
+    assert "wall cap" in capsys.readouterr().err
 
 
 def test_overlap_keyboard_interrupt_cancels_job(monkeypatch, tmp_path):
