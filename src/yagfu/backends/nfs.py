@@ -363,8 +363,7 @@ class PolyselectJob:
             self._at_cap = True               # this attempt is the last
         self._retried = True
         self.ctx.log(f"nfs: no polynomial within {fmt_dur(prev)}; "
-                     f"retrying with budget {fmt_dur(self.budget)} "
-                     f"(wall-capped, not msieve's own deadline)")
+                     f"retrying with budget {fmt_dur(self.budget)}")
         self._spawn(find_bin("msieve", self.ctx.bin_dir))
         self._watch(adopt=False)
         return True
