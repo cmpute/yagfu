@@ -37,6 +37,8 @@ class FakeJob:
     def poly_ready(self):
         return self.polls_left <= 0     # finished == success for the fake
 
+    def engine_retry(self):
+        return False                    # subclasses opt into the fallback
 
     def wait(self, timeout=None):
         self.waited += 1
@@ -52,6 +54,48 @@ class DeadNoPolyJob(FakeJob):
 
     def poly_ready(self):
         return False
+
+
+def test_polyselect_engine_retry_to_cpu(tmp_path, monkeypatch, capsys):
+    """A polynomial-less GPU search respawns once on the CPU Gerbicz
+    engine; a polynomial on disk or a prior retry stops it."""
+    import time
+
+    from yagfu.backends import nfs
+
+    class DeadP:
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            return 0
+
+    job = object.__new__(nfs.PolyselectJob)
+    job.wd = tmp_path
+    job.ctx = RunContext(log_file=tmp_path / "t.log")
+    job.engine = "gpu_cubsort"
+    job._engine_retried = False
+    job._t0 = time.monotonic()
+    job._deadline_at = time.monotonic() + 3600
+    job._p = DeadP()
+    spawns, watches = [], []
+    monkeypatch.setattr(nfs, "find_bin", lambda name, bd: "/bin/msieve")
+    monkeypatch.setattr(job, "_spawn", lambda ms: spawns.append(ms),
+                        raising=False)
+    monkeypatch.setattr(job, "_watch", lambda: watches.append(1),
+                        raising=False)
+    assert job.engine_retry() is True          # gpu -> cpu_gerbicz, once
+    assert job.engine == "cpu_gerbicz"
+    assert spawns == ["/bin/msieve"] and watches == [1]
+    assert "CPU Gerbicz engine" in capsys.readouterr().err
+    assert job.engine_retry() is False
+    ok = object.__new__(nfs.PolyselectJob)     # a polynomial exists
+    ok.wd, ok.ctx = tmp_path, job.ctx
+    ok.engine, ok._engine_retried = "gpu_cubsort", False
+    ok._t0, ok._deadline_at = time.monotonic(), time.monotonic() + 60
+    ok._p = DeadP()
+    (tmp_path / "msieve.fb").write_text("N 1\n")
+    assert ok.engine_retry() is False
 
 
 def _patch(monkeypatch, job, found_on=(), fail_calls=()):
