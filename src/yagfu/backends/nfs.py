@@ -316,6 +316,47 @@ class PolyselectJob:
     def running(self) -> bool:
         return self._p.poll() is None
 
+    def poly_ready(self) -> bool:
+        """True once the polyselect has ended AND its polynomial is on disk.
+
+        A dead process alone is not a verdict: the budget cap SIGINTs
+        -np before any candidate is confirmed, and msieve.fb existing is
+        exactly the "got at least one polynomial" criterion wait() uses
+        for its retry decision.
+        """
+        return not self.running() and (self.wd / "msieve.fb").exists()
+
+    def retry_uncapped(self) -> bool:
+        """If the previous -np exited without saving any polynomial,
+        respawn it uncapped (once); True when a process is now running.
+
+        The budgeted attempt dying polynomial-less is not a failure —
+        msieve just hit our wall cap before its first confirmed
+        candidate, so it gets one uncapped retry (msieve's own deadline
+        still applies).  Called by the overlap loop to keep the CPUs
+        busy without ending the bonus ECM, and by wait() for the serial
+        path.
+        """
+        if self._retried or self.budget <= 0:
+            return False
+        if self._p.poll() is None:            # still running
+            return False
+        if (self.wd / "msieve.fb").exists():  # ended with a polynomial
+            return False
+        self._retried = True
+        est = ""
+        try:
+            m = _RE_MSIEVE_DEADLINE.search(read_log(self.wd / "np.log"))
+            if m:
+                est = (f", msieve's own deadline ~{fmt_dur(
+                    int(m.group(1)) / max(1, self.ctx.threads))}")
+        except OSError:
+            pass
+        self.ctx.log(f"nfs: no polynomial within {fmt_dur(self.budget)};"
+                     f" retrying uncapped{est}")
+        self._spawn(find_bin("msieve", self.ctx.bin_dir))
+        return True
+
     def elapsed(self) -> float:
         """Wall time since launch (even while still running)."""
         return time.monotonic() - self._t0
@@ -329,21 +370,7 @@ class PolyselectJob:
             self._term_kill()
             self._finish()
             return self
-        if (self.budget > 0 and not self._retried
-                and not (self.wd / "msieve.fb").exists()):
-            # the SIGINT arrived before any candidate was saved
-            self._retried = True
-            est = ""
-            try:
-                m = _RE_MSIEVE_DEADLINE.search(read_log(self.wd / "np.log"))
-                if m:
-                    est = (f", msieve's own deadline ~{fmt_dur(
-                        int(m.group(1)) / max(1, self.ctx.threads))}")
-            except OSError:
-                pass
-            self.ctx.log(f"nfs: no polynomial within {fmt_dur(self.budget)};"
-                         f" retrying uncapped{est}")
-            self._spawn(find_bin("msieve", self.ctx.bin_dir))
+        if self.retry_uncapped():
             try:
                 self._p.wait(timeout=NP_TIMEOUT_S)
             except subprocess.TimeoutExpired:

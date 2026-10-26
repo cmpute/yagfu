@@ -64,10 +64,14 @@ geometric relation top-ups.
 **Overlapped polyselect.** As soon as a number is known to be NFS-bound (≥ 90
 digits and at/above the crossover, or `--force nfs`), `msieve -np` starts in the
 background on the CPUs while the GPU keeps running the ECM ladder — and past the
-plan target, filling higher-level budgets for free until the polyselect budget
-expires. The polyselect wall time is unchanged, the GPU no longer idles during
-it, and the pretest gets extra depth at zero cost; if ECM finds a factor in the
-window the polyselect is cancelled and the cofactor re-planned from scratch.
+plan target, filling higher-level budgets for free. Only a polyselect that
+actually produced a polynomial yields the GPUs back: when the wall budget kills
+`-np` before its first candidate, the uncapped retry starts right there in the
+background and the bonus ECM runs on through it (a budget expiry mid-batch is
+not a reason to drop a running stage-1 batch). The polyselect wall time is
+unchanged, the GPU no longer idles during it, and the pretest gets extra depth
+at zero cost; if ECM finds a factor in the window the polyselect is cancelled
+and the cofactor re-planned from scratch.
 `--no-poly-overlap` restores fully serial staging. With several devices
 (`--device 0,1,…`) stage 1 fans out one process per card with counts split by
 learned per-card throughput; the shards' residues are merged into a single

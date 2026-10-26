@@ -22,6 +22,7 @@ class FakeJob:
         self.polls_left = polls
         self.cancelled = 0
         self.waited = 0
+        self.retries = 0
         self.budget = 60.0
         self.fb = {"N": "1"}          # truthy: cancel() keeps artifacts
 
@@ -34,12 +35,61 @@ class FakeJob:
             return True
         return False
 
+    def poly_ready(self):
+        return self.polls_left <= 0     # finished == success for the fake
+
+    def retry_uncapped(self):
+        self.retries += 1
+        return False                    # subclasses opt into retrying
+
     def wait(self, timeout=None):
         self.waited += 1
         return self
 
     def cancel(self):
         self.cancelled += 1
+
+
+class BudgetKillJob(FakeJob):
+    """The budgeted -np attempt dies with no polynomial; the uncapped
+    retry runs a while and then succeeds."""
+
+    def __init__(self, polls):
+        super().__init__(polls)
+        self.ready = False
+
+    def poly_ready(self):
+        return self.ready
+
+    def retry_uncapped(self):
+        if self.retries >= 1:
+            return False
+        self.retries += 1
+        self.polls_left = 2            # the retry stays busy a while
+        return True
+
+    def running(self):
+        if self.polls_left > 0:
+            self.polls_left -= 1
+            return True
+        if self.retries >= 1:
+            self.ready = True          # retry finished with the poly
+        return False
+
+
+class FailTwiceJob(FakeJob):
+    """Both the budgeted attempt and the uncapped retry die without a
+    polynomial — the overlap must end (bounded bonus), not climb forever."""
+
+    def poly_ready(self):
+        return False
+
+    def retry_uncapped(self):
+        if self.retries >= 1:
+            return False
+        self.retries += 1
+        self.polls_left = 1
+        return True
 
 
 def _patch(monkeypatch, job, found_on=(), fail_calls=()):
@@ -182,6 +232,51 @@ def test_bonus_aborts_when_poly_done(monkeypatch, tmp_path, capsys):
     assert "dropping the partial bonus batch" in capsys.readouterr().err
 
 
+def test_bonus_survives_budget_killed_polyselect(monkeypatch, tmp_path,
+                                                 capsys):
+    """The budgeted -np dying without a polynomial must NOT kill the
+    bonus batch: the uncapped retry starts in place, the overlap runs on
+    through it, and only its success (a polynomial) yields the GPUs."""
+    job = BudgetKillJob(polls=2)
+    calls = _patch(monkeypatch, job)
+
+    aborted = []
+
+    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
+        calls["b1"].append(b1)
+        aborted.append(bool(stop_check and stop_check()))
+        return EcmRunResult(curves_done=total, wall_s=0.001 * total)
+
+    monkeypatch.setattr(engine_mod, "run_ecm_curves", fake_ecm)
+    eng = Engine(RunContext(**CTX))
+    res = eng.factor(N, tmp_path)
+    assert res.complete, res.error
+    assert job.retries == 1                    # exactly one uncapped retry
+    assert not any(aborted)                    # no batch was ever stopped
+    assert len(calls["b1"]) >= 5               # bonus ran through the retry
+    assert "dropping the partial bonus batch" not in capsys.readouterr().err
+    assert calls["nfs_poly"] == [job]          # NFS joined with the poly
+
+
+def test_bonus_ends_after_failed_retry(monkeypatch, tmp_path):
+    """Retry also failing ends the overlap promptly instead of climbing
+    the ladder to t65 — NFS then reports the polyselect failure."""
+    job = FailTwiceJob(polls=2)
+    calls = _patch(monkeypatch, job)
+
+    def fake_ecm(n, b1, total, ctx, wd, tag, stop_check=None):
+        calls["b1"].append(b1)
+        return EcmRunResult(curves_done=total, wall_s=0.001 * total)
+
+    monkeypatch.setattr(engine_mod, "run_ecm_curves", fake_ecm)
+    eng = Engine(RunContext(**CTX))
+    res = eng.factor(N, tmp_path)
+    assert res.complete, res.error             # fake NFS still succeeds
+    assert job.retries == 1
+    assert 4 <= len(calls["b1"]) <= 8          # bounded bonus window
+    assert calls["nfs_poly"] == [job]
+
+
 def test_polyselect_budget_adopts_msieve_deadline(tmp_path, capsys):
     from yagfu.backends.nfs import PolyselectJob
 
@@ -198,6 +293,50 @@ def test_polyselect_budget_adopts_msieve_deadline(tmp_path, capsys):
     job.budget = 60.0
     job._maybe_extend_budget()
     assert job.budget == 60.0
+
+
+def test_retry_uncapped_spawns_once(tmp_path, monkeypatch, capsys):
+    """PolyselectJob.retry_uncapped: a dead -np with no msieve.fb gets
+    exactly one respawn; a dead -np WITH msieve.fb never retries."""
+    import time
+
+    from yagfu.backends import nfs
+
+    class DeadP:
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            return 0
+
+    def mkjob():
+        job = object.__new__(nfs.PolyselectJob)
+        job.wd = tmp_path
+        job.ctx = RunContext(threads=2)
+        job._retried = False
+        job.budget = 60.0
+        job.user_budget = False
+        job._t0 = time.monotonic()
+        job._p = DeadP()
+        return job
+
+    spawns = []
+    monkeypatch.setattr(nfs, "find_bin", lambda name, bd: "/bin/msieve")
+
+    job = mkjob()
+    monkeypatch.setattr(job, "_spawn", lambda ms: spawns.append(ms),
+                        raising=False)
+    (tmp_path / "np.log").write_text("poly select deadline: 600\n")
+    assert not job.poly_ready()            # dead, but no polynomial yet
+    assert job.retry_uncapped() is True
+    assert job.retry_uncapped() is False   # once only
+    assert spawns == ["/bin/msieve"]
+    assert "retrying uncapped" in capsys.readouterr().err
+
+    ok = mkjob()                           # dead WITH a polynomial
+    (tmp_path / "msieve.fb").write_text("N 1\n")
+    assert ok.poly_ready()
+    assert ok.retry_uncapped() is False
 
 
 def test_overlap_keyboard_interrupt_cancels_job(monkeypatch, tmp_path):

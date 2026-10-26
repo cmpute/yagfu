@@ -236,7 +236,9 @@ class Engine:
                     # for the original number — drop it, re-plan the cofactor
                     self._replan_after_split(job, m, wd, res, depth, ledger)
                     return
-                if job is not None and job.running():
+                # enter the bonus window even if the budgeted attempt just
+                # died: the overlap loop retries it uncapped in place
+                if job is not None:
                     t = time.monotonic()
                     m = self._poly_overlap_ecm(m, wd, res, depth, ledger, job)
                     res.spend("ecm", time.monotonic() - t)
@@ -307,22 +309,31 @@ class Engine:
     def _poly_overlap_ecm(self, m: int, wd: Path, res: FactorResult,
                           depth: int, ledger: EcmLedger, job) -> int:
         """Bonus ECM while background polyselect holds the CPUs: keep
-        filling level budgets above the plan target.  The moment the
-        polyselect finishes, the running stage-1 batch is killed and
-        discarded (bonus curves are free; waiting for them is not) and the
-        NFS stage proceeds.  A factor found here (even in a killed batch's
-        log) ends the overlap — the caller re-plans the cofactor."""
+        filling level budgets above the plan target.
+
+        Only a polyselect that finished WITH a polynomial yields the GPUs
+        back.  A budgeted attempt that dies polynomial-less is retried
+        uncapped right here — the CPUs stay busy and the overlap runs on
+        through the retry; killing the bonus batch for it would just
+        waste free curves (a 4-GPU stage-1 batch at B1=11M is a minute of
+        work).  Only a retry that also fails ends the bonus early, and
+        NFS then reports the polyselect failure.  A factor found here
+        (even in a killed batch's log) ends the overlap — the caller
+        re-plans the cofactor."""
         ctx = self.ctx
         ctx.log("ecm: polyselect running in background, climbing bonus "
                 "levels")
 
-        def _poly_done() -> bool:
-            return not job.running()
-
         j = 0
         inv = 0
-        while job.running():
+        while True:
             ctx.check_deadline()
+            if job.poly_ready():
+                break               # polynomial in hand: NFS can start
+            if not job.running():
+                if not job.retry_uncapped():
+                    break           # failed for good: let NFS report it
+                continue
             while j < NUM_LEVELS and ledger.level_budget_left(j) <= 0:
                 j += 1
             if j >= NUM_LEVELS:
@@ -330,7 +341,7 @@ class Engine:
             want = min(ledger.level_budget_left(j), ctx.ecm_maxcurves)
             inv += 1
             r = run_ecm_curves(m, B1_LADDER[j], want, ctx, wd,
-                               tag=f"o{j}-{inv}", stop_check=_poly_done)
+                               tag=f"o{j}-{inv}", stop_check=job.poly_ready)
             res.bump("ecm_invocations")
             if r.error:
                 raise FactorError(f"ecm: {r.error}")
@@ -351,6 +362,8 @@ class Engine:
                     m //= f
                 return m
             if r.aborted:
+                # stop only fires on success now, so this batch's kill
+                # really did buy the polynomial — drop it and join NFS
                 if r.curves_done == 0:
                     ctx.log("ecm: polyselect finished mid-batch; dropping "
                             "the partial bonus batch")
