@@ -340,7 +340,9 @@ class Engine:
             if job.poly_ready():
                 break               # polynomial in hand: NFS can start
             if not job.running():
-                break               # ended polynomial-less: NFS reports it
+                if not job.engine_retry():
+                    break           # failed for good: NFS reports it
+                continue
             while j < NUM_LEVELS and ledger.level_budget_left(j) <= 0:
                 j += 1
             if j >= NUM_LEVELS:

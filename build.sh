@@ -7,7 +7,10 @@
 #   gpuecm2     ECM stage 2 on the GPU (uses cmpute/cgbn)
 #   cuda-mpqs   SIQS/MPQS on the GPU
 #   cuda-sieve  NFS lattice sieving on the GPU
-#   msieve-cuda NFS post-processing (filtering / linear algebra / sqrt)
+#   msieve-trunk NFS post-processing + polyselect (jasonp trunk, as
+#               bundled in bbuhrow/yafu; the old NFS@Home lacuda fork's
+#               GPU poly stage-1 emits zero candidates in the c110-c119
+#               range — fixed upstream by the stage-1 engine rewrite)
 #
 # Usage: ./build.sh [options]
 #   -a, --arch NN       CUDA compute capability (default: detect from the GPU
@@ -177,25 +180,28 @@ build_cuda_sieve() {
 }
 
 build_msieve() {
-  log "building msieve-cuda (NFS post-processing, sm_${SM})"
+  log "building msieve-cuda (fork with the trunk polyselect port, sm_${SM})"
   cd "$ROOT/msieve-cuda"
 
-  # msieve's GPU code calls the CUDA *driver* API (cuCtxCreate etc.).
-  # When the toolkit is newer than the driver (e.g. CUDA 13 toolkit on a
-  # 550/CUDA 12.4 driver), the system libcuda.so lacks the _v4 symbols the
-  # toolkit headers emit and the link fails.  Prefer the datacenter
-  # forward-compat library (also what ld.so resolves at run time), else
-  # the toolkit's link-time stubs.
-  local drv="-L$CUDA_ROOT/lib64/stubs"
+  # the polyselect-from-trunk branch carries the port; check it out if the
+  # submodule still points at the pre-port commit
+  if ! git rev-parse --verify HEAD >/dev/null 2>&1 \
+     || ! git merge-base --is-ancestor "$(git rev-parse HEAD)" polyselect-from-trunk 2>/dev/null; then
+    log "  checking out branch polyselect-from-trunk"
+    git checkout polyselect-from-trunk
+  fi
+
+  # msieve's GPU code calls the CUDA *driver* API (cuCtxCreate etc.). With a
+  # newer toolkit than driver (CUDA 13 toolkit on a 550/12.4 driver) the
+  # emitted _v4 symbols are absent from the system libcuda.so; link the
+  # datacenter forward-compat library (also what ld.so picks at run time).
+  local drv=""
   if [ -e "$CUDA_ROOT/compat/lib/libcuda.so" ]; then
     drv="-L$CUDA_ROOT/compat/lib"
   fi
-  log "  linking driver API via $drv"
 
-  # VBITS=128: GPU block-Lanczos vector width. msieve's default 64 is
-  # tuned for small matrices; 128 is the recommended width for the
-  # c100+ jobs yagfu runs (faster linear algebra there, negligible cost
-  # on anything smaller).
+  # VBITS=128: GPU block-Lanczos vector width recommended for the c100+
+  # matrices yagfu runs. The single-binary build embeds every kernel.
   make -j"$JOBS" all CUDA="$SM" VBITS=128 LDFLAGS="$drv"
   install_bin "$ROOT/msieve-cuda/msieve" msieve
 }

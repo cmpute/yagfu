@@ -25,7 +25,11 @@ if [[ $STAGE == 1 ]]; then
     rm -rf "$PKG_BIN"
     mkdir -p "$PKG_BIN"
     for f in "$BIN"/*; do
-        install -m 755 "$f" "$PKG_BIN/"
+        if [ -d "$f" ]; then
+            cp -r "$f" "$PKG_BIN/"        # e.g. cub/sort_engine.so for msieve
+        else
+            install -m 755 "$f" "$PKG_BIN/"
+        fi
     done
     du -sh "$PKG_BIN"
 else

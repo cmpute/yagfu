@@ -224,7 +224,7 @@ class PolyselectJob:
     """
 
     def __init__(self, n: int, ctx: RunContext, wd: Path,
-                 background: bool = True):
+                 background: bool = True, engine: str = "gpu_cubsort"):
         msieve = find_bin("msieve", ctx.bin_dir)
         wd.mkdir(parents=True, exist_ok=True)
         # never inherit a stale poly from an earlier cancelled attempt
@@ -234,6 +234,11 @@ class PolyselectJob:
             except OSError:
                 pass
         self.n, self.ctx, self.wd = n, ctx, wd
+        # trunk msieve has a stage-1 engine registry; the GPU cubsort
+        # engine is the fast default, the CPU Gerbicz reference is the
+        # always-compiled-in fallback an ended search retries on
+        self.engine = engine
+        self._engine_retried = False
         self.budget = poly_budget(len(str(n)), ctx.poly_budget_s)
         # an explicit --poly-budget is the total wall cap; otherwise the
         # estimate above is informational and POLY_MAX_WAIT_S applies
@@ -259,7 +264,10 @@ class PolyselectJob:
         self._watch()
 
     def _spawn(self, msieve) -> None:
-        cmd = [msieve, "-np", "-t", str(self.ctx.threads), "-v", str(self.n)]
+        # the single-binary fork embeds all kernels; the engine name
+        # selects the ported trunk stage-1 engine (gpu_cubsort/cpu_gerbicz)
+        cmd = [msieve, "-np", f"stage1_engine={self.engine}",
+               "-t", str(self.ctx.threads), "-v", str(self.n)]
         f = open(self.wd / "np.log", "wb")
         try:
             # msieve -np has no device flag; the GPU stage-1 polyselect
@@ -271,6 +279,24 @@ class PolyselectJob:
                                             **self.ctx.pin_env()})
         finally:
             f.close()
+
+    def engine_retry(self) -> bool:
+        """A GPU stage-1 search that ended polynomial-less gets one retry
+        on the CPU Gerbicz engine — always compiled in, and msieve's own
+        default.  The wall cap keeps ticking; True when a process runs."""
+        if self._engine_retried or self.engine == "cpu_gerbicz":
+            return False
+        if self._p.poll() is None:            # still running
+            return False
+        if (self.wd / "msieve.fb").exists():  # ended with a polynomial
+            return False
+        self._engine_retried = True
+        self.engine = "cpu_gerbicz"
+        self.ctx.log("nfs: GPU polyselect found nothing; "
+                     "retrying on the CPU Gerbicz engine")
+        self._spawn(find_bin("msieve", self.ctx.bin_dir))
+        self._watch()
+        return True
 
     def _watch(self) -> None:
         """Enforce the total wall cap on the -np process."""
@@ -324,11 +350,19 @@ class PolyselectJob:
 
     def wait(self, timeout: float | None = None) -> "PolyselectJob":
         """Block until polyselect is done (the wall-cap watcher SIGINTs
-        it at the deadline so it saves its best-so-far polynomial)."""
+        it at the deadline so it saves its best-so-far polynomial; a
+        polynomial-less GPU search retries once on the CPU engine)."""
         try:
             self._p.wait(timeout=timeout or NP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             self._term_kill()
+            self._finish()
+            return self
+        if self.engine_retry():
+            try:
+                self._p.wait(timeout=NP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                self._term_kill()
         self._finish()
         return self
 
