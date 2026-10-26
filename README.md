@@ -66,7 +66,9 @@ digits and at/above the crossover, or `--force nfs`), `msieve -np` starts in the
 background on the CPUs while the GPU keeps running the ECM ladder — and past the
 plan target, filling higher-level budgets for free. Only a polyselect that
 actually produced a polynomial yields the GPUs back: when the wall budget kills
-`-np` before its first candidate, the uncapped retry starts right there in the
+`-np` before its first candidate, the retry (budget doubled each time,
+own wall cap — msieve's internal deadline only covers stage 1) starts right
+there in the
 background and the bonus ECM runs on through it (a budget expiry mid-batch is
 not a reason to drop a running stage-1 batch). The polyselect wall time is
 unchanged, the GPU no longer idles during it, and the pretest gets extra depth

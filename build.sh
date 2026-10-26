@@ -192,7 +192,11 @@ build_msieve() {
   fi
   log "  linking driver API via $drv"
 
-  make -j"$JOBS" all CUDA="$SM" LDFLAGS="$drv"
+  # VBITS=128: GPU block-Lanczos vector width. msieve's default 64 is
+  # tuned for small matrices; 128 is the recommended width for the
+  # c100+ jobs yagfu runs (faster linear algebra there, negligible cost
+  # on anything smaller).
+  make -j"$JOBS" all CUDA="$SM" VBITS=128 LDFLAGS="$drv"
   install_bin "$ROOT/msieve-cuda/msieve" msieve
 }
 

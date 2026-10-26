@@ -237,7 +237,7 @@ class Engine:
                     self._replan_after_split(job, m, wd, res, depth, ledger)
                     return
                 # enter the bonus window even if the budgeted attempt just
-                # died: the overlap loop retries it uncapped in place
+                # died: the overlap loop retries it (doubled budget) here
                 if job is not None:
                     t = time.monotonic()
                     m = self._poly_overlap_ecm(m, wd, res, depth, ledger, job)
@@ -313,13 +313,14 @@ class Engine:
 
         Only a polyselect that finished WITH a polynomial yields the GPUs
         back.  A budgeted attempt that dies polynomial-less is retried
-        uncapped right here — the CPUs stay busy and the overlap runs on
-        through the retry; killing the bonus batch for it would just
-        waste free curves (a 4-GPU stage-1 batch at B1=11M is a minute of
-        work).  Only a retry that also fails ends the bonus early, and
-        NFS then reports the polyselect failure.  A factor found here
-        (even in a killed batch's log) ends the overlap — the caller
-        re-plans the cofactor."""
+        with a doubled budget right here — the CPUs stay busy and the
+        overlap runs on through the retry; killing the bonus batch for
+        it would just waste free curves (a 4-GPU stage-1 batch at
+        B1=11M is a minute of work).  Only a retry ladder that climbed
+        to its cap without a polynomial ends the bonus early, and NFS
+        then reports the polyselect failure.  A factor found here (even
+        in a killed batch's log) ends the overlap — the caller re-plans
+        the cofactor."""
         ctx = self.ctx
         ctx.log("ecm: polyselect running in background, climbing bonus "
                 "levels")
@@ -331,7 +332,7 @@ class Engine:
             if job.poly_ready():
                 break               # polynomial in hand: NFS can start
             if not job.running():
-                if not job.retry_uncapped():
+                if not job.retry():
                     break           # failed for good: let NFS report it
                 continue
             while j < NUM_LEVELS and ledger.level_budget_left(j) <= 0:

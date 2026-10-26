@@ -42,6 +42,10 @@ from .runner import (
 )
 
 NP_TIMEOUT_S = 2 * 3600
+#: each polyselect retry doubles the budget, but never past this wall
+#: cap — an attempt this long with no candidate at all means the search
+#: is not converging for this number/build
+POLY_RETRY_CAP_S = 2 * 3600
 SIEVE_TIMEOUT_S = 6 * 3600
 NC_TIMEOUT_S = 2 * 3600
 LA_TIMEOUT_S = 12 * 3600
@@ -236,6 +240,7 @@ class PolyselectJob:
         self.error: str | None = None
         self.wall_s = 0.0
         self._retried = False
+        self._at_cap = False
         self._t0 = time.monotonic()
         self._spawn(msieve)
         if background:
@@ -244,8 +249,8 @@ class PolyselectJob:
         else:
             ctx.log(f"nfs: polyselect (msieve -np, "
                     f"budget {fmt_dur(self.budget)})")
-        if self.budget > 0:
-            threading.Thread(target=self._budget_watch, daemon=True).start()
+        if self.budget > 0:        # budget 0 = --poly-budget 0: msieve's own
+            self._watch(adopt=True)
 
     def _spawn(self, msieve) -> None:
         cmd = [msieve, "-np", "-t", str(self.ctx.threads), "-v", str(self.n)]
@@ -265,7 +270,7 @@ class PolyselectJob:
         """Adopt msieve's own poly-select deadline when it exceeds our
         heuristic cap.  msieve prints it (CPU-seconds) right after start;
         capping earlier would SIGINT before the first confirmed candidate
-        and force the uncapped retry anyway.  An explicit --poly-budget is
+        and force the budget-doubling retry anyway.  An explicit --poly-budget is
         never overridden."""
         if self.user_budget:
             return
@@ -283,13 +288,19 @@ class PolyselectJob:
             self.ctx.log(f"nfs: polyselect budget extended to "
                          f"{fmt_dur(wall)} (msieve's own deadline)")
 
-    def _budget_watch(self) -> None:
+    def _watch(self, adopt: bool) -> None:
+        """Cap the current -np process at self.budget wall seconds."""
+        threading.Thread(target=self._budget_watch, args=(adopt,),
+                         daemon=True).start()
+
+    def _budget_watch(self, adopt: bool = True) -> None:
         t0 = time.monotonic()
-        # msieve prints its deadline within the first seconds: adopt it
-        # before the cap can fire
-        while time.monotonic() - t0 < 30 and self._p.poll() is None:
-            self._maybe_extend_budget()
-            time.sleep(2)
+        if adopt:
+            # msieve prints its deadline within the first seconds: adopt
+            # it before the cap can fire
+            while time.monotonic() - t0 < 30 and self._p.poll() is None:
+                self._maybe_extend_budget()
+                time.sleep(2)
         p = self._p
         try:
             p.wait(timeout=max(self.budget - (time.monotonic() - t0), 5.0))
@@ -326,35 +337,36 @@ class PolyselectJob:
         """
         return not self.running() and (self.wd / "msieve.fb").exists()
 
-    def retry_uncapped(self) -> bool:
+    def retry(self) -> bool:
         """If the previous -np exited without saving any polynomial,
-        respawn it uncapped (once); True when a process is now running.
+        respawn it with a doubled budget (capped); True when a process is
+        now running.
 
-        The budgeted attempt dying polynomial-less is not a failure —
-        msieve just hit our wall cap before its first confirmed
-        candidate, so it gets one uncapped retry (msieve's own deadline
-        still applies).  Called by the overlap loop to keep the CPUs
-        busy without ending the bonus ECM, and by wait() for the serial
-        path.
+        msieve's own deadline is a CPU-seconds stage-1 estimate — its
+        stage-2 optimization can run far past it — so no attempt is ever
+        trusted to stop itself: every respawn gets our wall-cap watcher.
+        The budget doubles per retry (the initial estimate first, then 2x,
+        4x, ...) up to POLY_RETRY_CAP_S; once an attempt at the cap
+        produced nothing, the search is over.  Called by the overlap
+        loop to keep the CPUs busy without ending the bonus ECM, and by
+        wait() for the serial path.
         """
-        if self._retried or self.budget <= 0:
+        if self.budget <= 0 or self._at_cap:
             return False
         if self._p.poll() is None:            # still running
             return False
         if (self.wd / "msieve.fb").exists():  # ended with a polynomial
             return False
+        prev = self.budget
+        self.budget = min(prev * 2, POLY_RETRY_CAP_S)
+        if self.budget >= POLY_RETRY_CAP_S:
+            self._at_cap = True               # this attempt is the last
         self._retried = True
-        est = ""
-        try:
-            m = _RE_MSIEVE_DEADLINE.search(read_log(self.wd / "np.log"))
-            if m:
-                est = (f", msieve's own deadline ~{fmt_dur(
-                    int(m.group(1)) / max(1, self.ctx.threads))}")
-        except OSError:
-            pass
-        self.ctx.log(f"nfs: no polynomial within {fmt_dur(self.budget)};"
-                     f" retrying uncapped{est}")
+        self.ctx.log(f"nfs: no polynomial within {fmt_dur(prev)}; "
+                     f"retrying with budget {fmt_dur(self.budget)} "
+                     f"(wall-capped, not msieve's own deadline)")
         self._spawn(find_bin("msieve", self.ctx.bin_dir))
+        self._watch(adopt=False)
         return True
 
     def elapsed(self) -> float:
@@ -362,19 +374,20 @@ class PolyselectJob:
         return time.monotonic() - self._t0
 
     def wait(self, timeout: float | None = None) -> "PolyselectJob":
-        """Block until polyselect is done (including the uncapped retry
-        when the budget expired before any candidate was saved)."""
+        """Block until polyselect is done, retrying with a doubled
+        budget for as long as attempts die polynomial-less."""
         try:
             self._p.wait(timeout=timeout or NP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             self._term_kill()
             self._finish()
             return self
-        if self.retry_uncapped():
+        while self.retry():
             try:
                 self._p.wait(timeout=NP_TIMEOUT_S)
             except subprocess.TimeoutExpired:
                 self._term_kill()
+                break
         self._finish()
         return self
 
