@@ -179,7 +179,20 @@ build_cuda_sieve() {
 build_msieve() {
   log "building msieve-cuda (NFS post-processing, sm_${SM})"
   cd "$ROOT/msieve-cuda"
-  make -j"$JOBS" all CUDA="$SM"
+
+  # msieve's GPU code calls the CUDA *driver* API (cuCtxCreate etc.).
+  # When the toolkit is newer than the driver (e.g. CUDA 13 toolkit on a
+  # 550/CUDA 12.4 driver), the system libcuda.so lacks the _v4 symbols the
+  # toolkit headers emit and the link fails.  Prefer the datacenter
+  # forward-compat library (also what ld.so resolves at run time), else
+  # the toolkit's link-time stubs.
+  local drv="-L$CUDA_ROOT/lib64/stubs"
+  if [ -e "$CUDA_ROOT/compat/lib/libcuda.so" ]; then
+    drv="-L$CUDA_ROOT/compat/lib"
+  fi
+  log "  linking driver API via $drv"
+
+  make -j"$JOBS" all CUDA="$SM" LDFLAGS="$drv"
   install_bin "$ROOT/msieve-cuda/msieve" msieve
 }
 
