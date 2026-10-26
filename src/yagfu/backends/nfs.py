@@ -420,8 +420,6 @@ def _append_band_rels(wd: Path, relnames: list[str]) -> None:
 
 _NFS_STATE = "nfs-state.json"
 
-_RE_MSIEVE_DEADLINE = re.compile(r"poly select deadline: (\d+)")
-
 
 def _save_nfs_state(wd: Path, n: int, **kv) -> None:
     kv["n"] = str(n)
@@ -451,23 +449,9 @@ def _poly_e_from_log(wd: Path) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def nfs_resume_pending(wd: Path, n: int) -> bool:
-    """True when a previous run left a reusable polynomial for n in wd —
-    the engine then skips starting a background polyselect on top of it."""
-    job = wd / f"c{len(str(n))}.job"
-    try:
-        return f"n: {n}" in job.read_text()
-    except OSError:
-        return False
-
-
-def run_nfs(n: int, ctx: RunContext, wd: Path,
-            poly: PolyselectJob | None = None) -> NfsResult:
-    """Factor n with GNFS inside wd.
-
-    `poly` is a PolyselectJob the engine started while ECM was still
-    running; its (already computed) polynomial is used instead of running
-    polyselect again."""
+def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
+    """Factor n with GNFS inside wd (polyselect runs here when nothing
+    reusable is on disk)."""
     res = NfsResult(params=nfs_params(len(str(n))))
     msieve = find_bin("msieve", ctx.bin_dir)
     cuda_sieve = find_bin("cuda-sieve", ctx.bin_dir)
@@ -486,8 +470,6 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
         job_text = job_path.read_text()
         if f"n: {n}" in job_text:
             reused = True
-            if poly is not None:
-                poly.cancel()      # engine could not have known; stop it
             res.poly_method = "msieve -np (resumed)"
             e = _poly_e_from_log(wd)
             if e is not None:
@@ -509,8 +491,7 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
                 ctx.log("nfs: reusing msieve.fb from workdir"
                         + (f" (E={res.poly_e:g})" if res.poly_e else ""))
         if fb is None:
-            if poly is None:
-                poly = PolyselectJob(n, ctx, wd, background=False)
+            poly = PolyselectJob(n, ctx, wd, background=False)
             poly.wait()
             if poly.fb is None:
                 res.error = poly.error

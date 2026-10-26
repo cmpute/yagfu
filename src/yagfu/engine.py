@@ -41,7 +41,6 @@ from .ecmledger import (
     target_depth,
 )
 from .fmt import fmt_count, fmt_dur
-from .params import NFS_MSIEVE_POLY_MIN_DIGITS
 from .primes import SPRP_2761_LIMIT, is_probable_prime
 
 #: curve count per endless top-level batch in ecm-only mode
@@ -150,14 +149,12 @@ class Engine:
     # ------------------------------------------------------------- pipeline
 
     def _factor_rec(self, m: int, wd: Path, res: FactorResult, depth: int,
-                    ledger: EcmLedger | None = None, poly=None) -> None:
+                    ledger: EcmLedger | None = None) -> None:
         """Factor composite m (> 1); primes accumulate into res.factors.
 
         `ledger` pre-seeds the ECM work ledger — curves run on an ancestor
-        number count for its cofactors, so a re-plan after an overlap split
-        continues from the work already spent instead of re-climbing.
-        `poly` is a polyselect already running for m (started when an
-        ancestor number split mid-ladder); None means decide afresh."""
+        number count for its cofactors, so a recursion after a mid-ladder
+        split continues from the work already spent instead of re-climbing."""
         ctx = self.ctx
         if m == 1:
             return
@@ -219,105 +216,33 @@ class Engine:
             return
         ctx.check_deadline()
 
-        # -- GPU ECM ladder (+ background NFS polyselect when NFS-bound) --
+        # -- GPU ECM ladder ---------------------------------------------------
         if ledger is None:
             ledger = EcmLedger()
-        poly = poly if poly is not None else self._maybe_start_poly(m, wd)
-        cell = [poly]     # the live polyselect; a split may swap it out
+        if ctx.no_ecm:
+            ctx.log("ecm: skipped (--no-ecm)")
+        else:
+            orig = m
+            t = time.monotonic()
+            m = self._ecm_stage(m, wd, res, depth, ledger)
+            res.spend("ecm", time.monotonic() - t)
+            if self._ecm_done(m, res):
+                return
+            if m != orig:
+                # split during the pretest: the ladder already continued on
+                # the cofactor to the target; recurse keeps the ledger (the
+                # re-entry's cheaper prework re-runs, the ladder skips)
+                self._factor_rec(m, wd, res, depth + 1, ledger=ledger)
+                return
+        ctx.check_deadline()
 
-        def on_split(cofactor: int) -> None:
-            self._swap_polyselect(cell, cofactor, wd)
-
-        try:
-            if ctx.no_ecm:
-                ctx.log("ecm: skipped (--no-ecm)")
-            else:
-                orig = m
-                t = time.monotonic()
-                m = self._ecm_stage(m, wd, res, depth, ledger,
-                                    on_split=on_split)
-                res.spend("ecm", time.monotonic() - t)
-                if self._ecm_done(m, res):
-                    return
-                if m != orig:
-                    # split during the pretest: the swap hook has already
-                    # dropped the doomed polyselect (and started the
-                    # cofactor's own, when it stays NFS-bound)
-                    self._replan_after_split(None, m, wd, res, depth,
-                                             ledger, poly=cell[0])
-                    return
-                # enter the bonus window even if the budgeted attempt just
-                # died: the overlap loop retries it (doubled budget) here
-                if poly is not None:
-                    t = time.monotonic()
-                    m = self._poly_overlap_ecm(m, wd, res, depth, ledger,
-                                               poly)
-                    res.spend("ecm", time.monotonic() - t)
-                    if self._ecm_done(m, res):
-                        return
-                    if m != orig:
-                        self._replan_after_split(poly, m, wd, res, depth,
-                                                 ledger)
-                        return
-            ctx.check_deadline()
-
-            # -- sieves ----------------------------------------------------------
-            if ctx.ecm_only:
-                raise FactorError(
-                    f"ecm-only: c{_digits(m)} not fully factored by ECM")
-            self._sieve_stage(m, wd, res, depth, nfs_poly=poly)
-        finally:
-            if poly is not None:
-                # keep a (possibly completed) msieve.fb for resume: rerun
-                # with the same workdir reuses it instead of re-searching
-                poly.cancel(drop_poly=False)
+        # -- sieves (routed on the post-ECM cofactor size) --------------------
+        if ctx.ecm_only:
+            raise FactorError(
+                f"ecm-only: c{_digits(m)} not fully factored by ECM")
+        self._sieve_stage(m, wd, res, depth)
 
     # --------------------------------------------------------------- stages
-
-    def _poly_wanted(self, m: int) -> bool:
-        """Whether a background polyselect for m pays off: only when the
-        pipeline would reach NFS for this number anyway."""
-        ctx = self.ctx
-        if ctx.ecm_only or ctx.no_ecm or ctx.no_poly_overlap:
-            return False
-        digits = _digits(m)
-        if digits < NFS_MSIEVE_POLY_MIN_DIGITS:
-            return False
-        return (ctx.force_method == "nfs"
-                or (ctx.force_method != "siqs" and digits >= ctx.xover))
-
-    def _maybe_start_poly(self, m: int, wd: Path):
-        """Start background NFS polyselect if this number is NFS-bound:
-        CPU msieve -np and GPU ECM do not compete, so the polyselect budget
-        becomes free wall time (and free bonus ECM depth)."""
-        if not self._poly_wanted(m):
-            return None
-        from .backends.nfs import PolyselectJob, nfs_resume_pending
-        if nfs_resume_pending(wd / "nfs", m):
-            return None    # a previous run's polynomial is already there
-        return PolyselectJob(m, self.ctx, wd / "nfs")
-
-    def _swap_polyselect(self, cell: list, cofactor: int, wd: Path) -> None:
-        """ECM split the number mid-ladder: the running polyselect is for
-        the pre-split number, so drop it at once — and re-decide the route
-        by the cofactor's size.  A cofactor still NFS-bound gets a fresh
-        polyselect immediately (it overlaps the rest of the ladder instead
-        of starting after it); a sieve-bound one keeps the GPUs free."""
-        ctx = self.ctx
-        old = cell[0]
-        if old is not None:
-            ctx.log(f"nfs: discarding background polyselect (number was "
-                    f"split by ECM; budget {fmt_dur(old.budget)}, "
-                    f"ran {fmt_dur(old.elapsed())})")
-            old.cancel()
-        cell[0] = None
-        if cofactor > 1 and self._poly_wanted(cofactor):
-            from .backends.nfs import PolyselectJob, nfs_resume_pending
-            if nfs_resume_pending(wd / "nfs", cofactor):
-                return          # a stored polynomial already covers it
-            cell[0] = PolyselectJob(cofactor, ctx, wd / "nfs")
-            ctx.log(f"nfs: polyselect restarted for the "
-                    f"c{_digits(cofactor)} cofactor")
 
     def _ecm_done(self, m: int, res: FactorResult) -> bool:
         """Post-ECM exit check: fully split, or a prime cofactor."""
@@ -330,100 +255,8 @@ class Engine:
             return True
         return False
 
-    def _replan_after_split(self, job, cofactor: int, wd: Path,
-                            res: FactorResult, depth: int,
-                            ledger: EcmLedger, poly=None) -> None:
-        """ECM split the number while background polyselect was running.
-        A ladder split has already been through _swap_polyselect (job is
-        None; `poly` carries the cofactor's freshly started polyselect,
-        if it stayed NFS-bound).  A bonus-window split passes the doomed
-        job here.  Either way the recursion keeps the ECM ledger — curves
-        run on a number count for its cofactors — and the cofactor's own
-        (smaller, digit-based) polyselect budget applies."""
-        ctx = self.ctx
-        if job is not None:
-            ctx.log(f"nfs: discarding background polyselect (number was "
-                    f"split by ECM; budget {fmt_dur(job.budget)}, "
-                    f"ran {fmt_dur(job.elapsed())})")
-            job.cancel()
-        if cofactor > 1:
-            self._factor_rec(cofactor, wd, res, depth + 1, ledger,
-                             poly=poly)
-
-    def _poly_overlap_ecm(self, m: int, wd: Path, res: FactorResult,
-                          depth: int, ledger: EcmLedger, job) -> int:
-        """Bonus ECM on the cards the polyselect is not using, filling
-        level budgets above the plan target while it runs.
-
-        The GPU polyselect owns devices[0] outright: its stage-1 scan is
-        itself a full-GPU workload, and sharing the card with an ECM
-        shard starves it (~1000x slower when measured sharing vs alone),
-        which used to deadlock the run — bonus never ends until the
-        polyselect finishes, and the polyselect never finishes while the
-        bonus holds the card.  So the bonus ladder runs on devices[1:]
-        only; with a single card there is no overlap at all.
-
-        Success is polled from msieve.fb, and only a polyselect that
-        ended WITH a polynomial yields the GPUs back.  A factor found
-        here (even in a killed batch's log) ends the overlap — the
-        caller re-plans the cofactor."""
-        ctx = self.ctx
-        bonus_devs = ctx.devices[1:]
-        if not bonus_devs:
-            ctx.log("ecm: polyselect holds the only GPU; no bonus overlap")
-            return m
-        ctx.log(f"ecm: polyselect running in background, climbing bonus "
-                f"levels on {len(bonus_devs)} idle card(s)")
-
-        j = 0
-        inv = 0
-        while True:
-            ctx.check_deadline()
-            if job.poly_ready():
-                break               # polynomial in hand: NFS can start
-            if not job.running():
-                if not job.engine_retry():
-                    break           # failed for good: NFS reports it
-                continue
-            while j < NUM_LEVELS and ledger.level_budget_left(j) <= 0:
-                j += 1
-            if j >= NUM_LEVELS:
-                break               # whole ladder exhausted
-            want = min(ledger.level_budget_left(j), ctx.ecm_maxcurves)
-            inv += 1
-            r = run_ecm_curves(m, B1_LADDER[j], want, ctx, wd,
-                               tag=f"o{j}-{inv}", stop_check=job.poly_ready,
-                               devices=bonus_devs)
-            res.bump("ecm_invocations")
-            if r.error:
-                raise FactorError(f"ecm: {r.error}")
-            ledger.add(j, r.curves_done)
-            ctx.log(f"ecm: B1={B1_LADDER[j]:,}"
-                    + (f", B2={fmt_count(r.b2)}" if r.b2 else "")
-                    + f", {r.curves_done:,} curves (polyselect overlap) "
-                    f"-> t{ledger.depth():.2f}"
-                    + (f"; {len(r.factors)} factor(s)!" if r.factors else ""))
-            if r.curves_done == 0 and not r.factors and not r.aborted:
-                raise FactorError("ecm made no progress")
-            if r.factors:
-                for f in sorted(r.factors, key=lambda x: -len(str(x))):
-                    if m % f:
-                        continue
-                    res.bump("ecm_factors")
-                    self._collect(f, "ecm", wd, res, depth, ecm=r.factors[f])
-                    m //= f
-                return m
-            if r.aborted:
-                # stop only fires on success now, so this batch's kill
-                # really did buy the polynomial — drop it and join NFS
-                if r.curves_done == 0:
-                    ctx.log("ecm: polyselect finished mid-batch; dropping "
-                            "the partial bonus batch")
-                break
-        return m
-
     def _ecm_stage(self, m: int, wd: Path, res: FactorResult, depth: int,
-                   ledger: EcmLedger, on_split=None) -> int:
+                   ledger: EcmLedger) -> int:
         """GPU ECM ladder with the YAFU work ledger; returns the cofactor.
 
         The ledger and the ladder position survive cofactor splits: a curve
@@ -431,11 +264,10 @@ class Engine:
         dividing out a found factor the ladder simply continues on the
         cofactor instead of starting over (the plan target deliberately
         stays the original number's — a cofactor this deep into the ladder
-        is unlikely to still hold small factors).  `on_split(cofactor)` is
-        invoked at each split so the caller can re-plan around the new
-        number immediately.  In ecm-only mode there is no target: every
-        level runs to its full budget and the top level is then sampled
-        forever until the number factors or the user interrupts.
+        is unlikely to still hold small factors).  In ecm-only mode there
+        is no target: every level runs to its full budget and the top level
+        is then sampled forever until the number factors or the user
+        interrupts.
         """
         ctx = self.ctx
         top = NUM_LEVELS - 1
@@ -511,14 +343,12 @@ class Engine:
                 # ledger and the ladder position, just switch numbers
                 ctx.log(f"ecm: cofactor now c{_digits(m)}, "
                         f"continuing at t{T_LEVELS[j]}")
-                if on_split is not None:
-                    on_split(m)   # polyselect re-plans around the cofactor
                 continue
             j += 1
         return m
 
-    def _sieve_stage(self, m: int, wd: Path, res: FactorResult, depth: int,
-                     nfs_poly=None) -> None:
+    def _sieve_stage(self, m: int, wd: Path, res: FactorResult,
+                     depth: int) -> None:
         ctx = self.ctx
         digits = _digits(m)
         want_nfs = ctx.force_method == "nfs" or (
@@ -540,8 +370,7 @@ class Engine:
                         return
                 else:
                     t = time.monotonic()
-                    r = self._nfs(m, wd, poly=nfs_poly if method == order[0]
-                                  else None)
+                    r = self._nfs(m, wd)
                     res.spend("nfs", time.monotonic() - t)
                     res.bump("nfs_runs")
                     if r.ok and r.factors:
@@ -570,8 +399,8 @@ class Engine:
         if cof > 1:
             self._factor_rec(cof, wd, res, depth + 1)
 
-    def _nfs(self, n: int, wd: Path, poly=None):
+    def _nfs(self, n: int, wd: Path):
         if self._run_nfs is None:
             from .backends.nfs import run_nfs
             self._run_nfs = run_nfs
-        return self._run_nfs(n, self.ctx, wd / "nfs", poly=poly)
+        return self._run_nfs(n, self.ctx, wd / "nfs")

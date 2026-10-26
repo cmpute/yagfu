@@ -75,13 +75,3 @@ def test_nfs_state_corrupt(tmp_path):
     from yagfu.backends.nfs import _load_nfs_state
     (tmp_path / "nfs-state.json").write_text("{not json")
     assert _load_nfs_state(tmp_path, 1) is None
-
-
-def test_nfs_resume_pending(tmp_path):
-    from yagfu.backends.nfs import nfs_resume_pending
-    assert nfs_resume_pending(tmp_path, 12345) is False
-    job = tmp_path / "c5.job"
-    job.write_text("n: 67890\nrlim: 1\n")
-    assert nfs_resume_pending(tmp_path, 12345) is False   # different n
-    job.write_text("n: 12345\nrlim: 1\n")
-    assert nfs_resume_pending(tmp_path, 12345) is True

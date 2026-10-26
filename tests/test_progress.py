@@ -238,48 +238,6 @@ def test_run_procs_parallel_stop(tmp_path):
     assert [rc for rc, _ in results] == [KILLED_RC, KILLED_RC]
 
 
-def test_run_ecm_curves_stop_kills_round(monkeypatch, tmp_path):
-    """Polyselect finishing mid-stage-1: the batch is killed, its curves
-    count as zero, aborted is set."""
-    import yagfu.backends.ecm as ecm
-    from yagfu.backends.runner import KILLED_RC
-
-    ctx = RunContext()
-    stop = {"v": False}
-
-    def fake_stage1(n, b1, curves, ctx, wd, tag, device, stop_check=None):
-        stop["v"] = True               # poly finished during this batch
-        return KILLED_RC, {}, 0, 1.0, None
-
-    monkeypatch.setattr(ecm, "_stage1", fake_stage1)
-    out = ecm.run_ecm_curves(P2 * P3, 50_000, 200, ctx, tmp_path, "t",
-                             stop_check=lambda: stop["v"])
-    assert out.aborted and out.curves_done == 0 and not out.error
-
-
-def test_run_ecm_curves_stop_keeps_finished_round(monkeypatch, tmp_path):
-    """Stage 1 finished and stage 2 ran: the round's curves are kept even
-    though the stop fired — only the next round is skipped."""
-    import yagfu.backends.ecm as ecm
-
-    ctx = RunContext()
-    stop = {"v": False}
-
-    def fake_stage1(n, b1, curves, ctx, wd, tag, device, stop_check=None):
-        (wd / f"ecm-{tag}.residues").write_bytes(b"SIGMA=1\n" * 10)
-        return 0, {}, 128, 1.0, None
-
-    def fake_stage2(n, b1, res_path, ctx, wd, tag, maxmem, env_extra=None):
-        stop["v"] = True
-        return {}, 0.5, None, 1_873_422
-
-    monkeypatch.setattr(ecm, "_stage1", fake_stage1)
-    monkeypatch.setattr(ecm, "_stage2", fake_stage2)
-    out = ecm.run_ecm_curves(P2 * P3, 11_000, 200, ctx, tmp_path, "t",
-                             stop_check=lambda: stop["v"])
-    assert out.aborted and out.curves_done == 128 and out.b2 == 1_873_422
-
-
 # ------------------------------------------------- multi-GPU ECM fan-out
 
 def test_run_procs_parallel(tmp_path):
