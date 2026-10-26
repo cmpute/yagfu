@@ -256,7 +256,9 @@ class Engine:
             self._sieve_stage(m, wd, res, depth, nfs_poly=job)
         finally:
             if job is not None:
-                job.cancel()
+                # keep a (possibly completed) msieve.fb for resume: rerun
+                # with the same workdir reuses it instead of re-searching
+                job.cancel(drop_poly=False)
 
     # --------------------------------------------------------------- stages
 

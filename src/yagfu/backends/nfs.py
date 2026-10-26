@@ -344,13 +344,20 @@ class PolyselectJob:
         if m:
             self.poly_e = float(m.group(1))
 
-    def cancel(self) -> None:
-        """Stop the polyselect (unless it already produced a polynomial)
-        and drop partial artifacts; idempotent."""
+    def cancel(self, drop_poly: bool = True) -> None:
+        """Stop the polyselect and drop partial artifacts; idempotent.
+
+        drop_poly=False keeps msieve.fb on disk: an interrupted run then
+        resumes with the polynomial instead of re-searching (msieve.fb
+        holds msieve's best confirmed candidate — a mid-run interrupt
+        leaves a usable, if not yet optimal, polynomial behind).  The
+        number-was-split path must drop it: that polynomial is for the
+        wrong number."""
         p = getattr(self, "_p", None)
         if p is not None and p.poll() is None:
             self._term_kill()
-        if p is not None and p.poll() is not None and self.fb is None:
+        if p is not None and p.poll() is not None and drop_poly \
+                and self.fb is None:
             for name in ("msieve.fb", "np.log"):
                 try:
                     (self.wd / name).unlink()

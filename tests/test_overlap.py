@@ -42,7 +42,7 @@ class FakeJob:
         self.waited += 1
         return self
 
-    def cancel(self):
+    def cancel(self, drop_poly=True):
         self.cancelled += 1
 
 
