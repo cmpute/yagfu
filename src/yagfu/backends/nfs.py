@@ -292,6 +292,8 @@ class PolyselectJob:
             return False
         self._engine_retried = True
         self.engine = "cpu_gerbicz"
+        self._t0 = time.monotonic()
+        self._deadline_at = self._t0 + POLY_MAX_WAIT_S
         self.ctx.log("nfs: GPU polyselect found nothing; "
                      "retrying on the CPU Gerbicz engine")
         self._spawn(find_bin("msieve", self.ctx.bin_dir))
@@ -316,8 +318,12 @@ class PolyselectJob:
                          f"({fmt_dur(time.monotonic() - self._t0)}); "
                          f"interrupting for the best-so-far polynomial")
             p.send_signal(signal.SIGINT)
+            # the cooperative unwind can be slow: a single stage-2 root
+            # optimization at c13x sizes runs for minutes, and killing
+            # mid-unwind discards the whole search (measured: a 2h search
+            # lost to a 90s grace)
             try:
-                p.wait(timeout=90)
+                p.wait(timeout=600)
             except subprocess.TimeoutExpired:
                 self._term_kill()
 
