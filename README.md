@@ -81,10 +81,10 @@ unlucky empty slice is not worth CPU hours when the others hold a polynomial).
 An interrupted search is torn down cooperatively — SIGINT at the cap, SIGTERM on
 Ctrl+C — and msieve saves its best-so-far candidate on the way out, so a rerun
 with the same workdir reuses the salvaged polynomial instead of re-searching.
-At ~110–119 digits this build's GPU poly stage-1 currently emits no candidates
-at all, so NFS polyselect can fail there — the practical crossover may need
-raising until that is understood. With one device the search runs exactly the
-single-process command line of old, in the bare NFS workdir.
+(The pre-port GPU stage-1 emitted no candidates at c110–c119; the trunk-port
+engine does — verified at c110 and c137.)
+With one device the search runs exactly the single-process command line of
+old, in the bare NFS workdir.
 
 **Multi-GPU.** `--device` takes a comma-separated list (`--device 0,1` — the
 ordinals mean what they mean to CUDA in your shell, i.e. indices into
