@@ -1115,17 +1115,25 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
     res.stages["matbuild_s"] = time.monotonic() - t
     t = time.monotonic()
     # msieve prints its own "linear algebra completed ... (X%, ETA ...)"
-    # updates (carriage-return paced) while it runs; forward them live —
-    # throttled to one per minute — instead of sitting silent for hours
-    last_la = [0.0]
+    # updates (carriage-return paced) while it runs; forward the first one
+    # (it anchors the run: dimension count + initial ETA) and then one per
+    # completed 10% of the dimension count, instead of one per minute
+    last_la_decile = [-1]
 
     def _la_lines(lines):
         for l in lines:
             if "linear algebra" not in l:
                 continue
-            if l.startswith("commencing") or time.monotonic() - last_la[0] >= 60:
+            if l.startswith("commencing"):
                 ctx.log(f"nfs: {l.strip()}")
-                last_la[0] = time.monotonic()
+                continue
+            m = re.search(r"completed (\d+) of (\d+) dimensions", l)
+            if not m:
+                continue
+            decile = int(m.group(1)) * 10 // int(m.group(2))
+            if decile > last_la_decile[0]:
+                ctx.log(f"nfs: {l.strip()}")
+                last_la_decile[0] = decile
 
     rc, _ = run_cmd_progress(
         [msieve, "-s", "msieve.dat", "-l", "nc2-la.log",
