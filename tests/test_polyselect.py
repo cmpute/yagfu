@@ -1,8 +1,8 @@
 """PolyselectJob tests: multi-GPU range sharding, spawn pinning, result
-merge, interrupt salvage, retry policy — plus the quality-gated block
-ladder and the legacy wall-cap watcher.  No GPU, no real msieve."""
+merge, interrupt salvage, retry policy — plus the quality watcher that
+SIGINTs the search when the streamed best E meets msieve's expectation.
+No GPU, no real msieve."""
 
-import math
 import signal
 import subprocess
 import time
@@ -38,32 +38,6 @@ def test_poly_ranges_split_disjoint_covering():
         assert lo == hi + 1                # contiguous, no gap, no overlap
 
 
-def test_poly_deadline_table_matches_msieve():
-    """The replicated stage-1 deadline must agree with what msieve prints
-    (c152 on this box: "poly select deadline: 609820")."""
-    n152 = 37917182519133761458994004180287393522121573678735988165161922758472807134459667342498067501509551723560171548116096739466016888383316598100704114893997
-    assert nfs._poly_deadline_s(math.log10(n152)) == 609820
-    # exact rows and interpolation (220.0 selects degree 6 in msieve's
-    # rule, whose interpolated truncation prints 1079999 — so compare
-    # the degree-5 flat tail by equality of two of its points instead)
-    assert nfs._poly_deadline_s(110.0) == 45 * 60
-    assert nfs._poly_deadline_s(190.0) == nfs._poly_deadline_s(215.0)
-    assert 23 * 60 < nfs._poly_deadline_s(108.5) < 45 * 60
-    assert nfs._poly_deadline_s(80.0) == 12 * 60
-
-
-def _ladder_block_ranges(n, k, threads):
-    """Round-1 block ranges the ladder must spawn for these params."""
-    wall_full = nfs._poly_deadline_s(math.log10(n)) / threads
-    budget = nfs.poly_budget(len(str(n)), None)
-    width = max(nfs.POLY_MIN_BLOCK,
-                int(nfs._poly_coeff_max(n) * budget / wall_full))
-    return [(i * width + 1, min((i + 1) * width, nfs._poly_coeff_max(n)))
-            for i in range(k)]
-
-
-# ------------------------------------------------------------- spawning
-
 class FakeP:
     def __init__(self, cmd, **kw):
         self.cmd, self.kw = cmd, kw
@@ -82,8 +56,7 @@ def test_sharded_spawn_pins_and_splits(tmp_path, monkeypatch, capsys):
     """Four cards -> four processes, one per private poly-{i} subdir with
     its own CUDA_VISIBLE_DEVICES pin, a comma-free range arg, -t split
     across the cards, and no stale msieve.fb anywhere (msieve would read
-    one and skip the search).  The default mode opens with a round-1
-    block, not the whole range."""
+    one and skip the search)."""
     def record_spawn(cmd, **kw):
         p = FakeP(cmd, **kw)
         spawns.append(p)
@@ -115,14 +88,15 @@ def test_sharded_spawn_pins_and_splits(tmp_path, monkeypatch, capsys):
         got.append((lo, hi))
         assert p.cmd[p.cmd.index("-t") + 1] == "8"          # 32 // 4
         assert p.cmd[-1] == str(C110)
-    assert got == _ladder_block_ranges(C110, 4, 8)
-    assert "polyselect round 1 across 4 card(s)" in capsys.readouterr().err
+    assert got == nfs._poly_ranges(C110, 4)
+    err = capsys.readouterr().err
+    assert "sharded across 4 GPUs" in err
+    assert "stops as soon as the best E" in err
 
 
-def test_single_device_spawn_is_block_in_subdir(tmp_path, monkeypatch):
-    """One card, default mode: the round-1 block still runs in a private
-    subdir (the ladder promotes the winner to the root itself) with the
-    full -t and the card pin."""
+def test_single_device_spawn_is_unchanged(tmp_path, monkeypatch):
+    """One card: bare workdir, no range args, full -t — byte-identical
+    command line to the pre-sharding single-process search."""
     spawns = []
 
     def record_spawn(cmd, **kw):
@@ -137,10 +111,9 @@ def test_single_device_spawn_is_block_in_subdir(tmp_path, monkeypatch):
     nfs.PolyselectJob(C110, ctx, tmp_path)
     assert len(spawns) == 1
     p = spawns[0]
-    assert p.kw["cwd"] == str(tmp_path / "poly-0")
-    (lo, hi), = _ladder_block_ranges(C110, 1, 32)
-    assert f"min_coeff={lo} max_coeff={hi}" in p.cmd[2]
-    assert p.cmd[p.cmd.index("-t") + 1] == "32"
+    assert p.kw["cwd"] == str(tmp_path)
+    assert p.cmd[1:4] == ["-np", "stage1_engine=gpu_cubsort", "-t"]
+    assert p.cmd[4] == "32"
     assert p.kw["env"]["CUDA_VISIBLE_DEVICES"] == "2"
 
 
@@ -206,114 +179,131 @@ def test_merge_promotes_best_shard(tmp_path, capsys):
     assert job.poly_e == 1.5e-9 and job.fb["N"] == str(C110)
 
 
-def test_merge_never_displaces_better_incumbent(tmp_path, capsys):
-    """The ladder promotes round winners; a later, worse round must not
-    clobber the better polynomial already at the workdir root."""
-    job = object.__new__(nfs.PolyselectJob)
-    job.wd = tmp_path
-    job.ctx = RunContext(log_file=tmp_path / "t.log")
-    job.sharded = True
-    (tmp_path / "msieve.fb").write_text(f"N {C110}\nR1 incumbent\n")
-    (tmp_path / "np.log").write_text("skew 1.00, combined = 1.5e-09\n")
-    d = tmp_path / "poly-0"
-    d.mkdir()
-    (d / "msieve.fb").write_text(f"N {C110}\nR1 worse\n")
-    (d / "np.log").write_text("skew 1.00, combined = 1.2e-09\n")
-    job._procs = [(d, None)]
-    job._merge()
-    assert "R1 incumbent" in (tmp_path / "msieve.fb").read_text()
-    assert "keeps the incumbent E=1.5e-09" in capsys.readouterr().err
+# ---------------------------------------------------- quality watcher
 
+class SigP:
+    """Stays alive until SIGINT, then exits; records every signal."""
 
-# ------------------------------------------------- quality-gated ladder
-
-class LogP:
-    """Fake msieve -np: exits immediately and leaves the shard dir with
-    an np.log carrying msieve's E-expectation header plus one combined-E
-    line (values popped per spawn), like a completed search."""
-
-    values = []
-    spawns = []
-
-    def __init__(self, cmd, **kw):
-        self.cmd, self.kw = cmd, kw
-        e = LogP.values.pop(0)
-        d = Path(kw["cwd"])
-        (d / "np.log").write_text(
-            "expecting poly E from 1e-8 to > 2e-8\n"
-            f"skew 1.00, combined = {e}\n")
-        (d / "msieve.fb").write_text(f"N {C110}\nR1 {d.name}\n")
-        LogP.spawns.append((d, cmd))
+    def __init__(self, cmd=None, **kw):
+        self.kw = kw
+        self.signals = []
+        self.dead = False
 
     def poll(self):
-        return 0
+        return 0 if self.dead else None
 
     def wait(self, timeout=None):
+        deadline = time.monotonic() + (timeout or 0)
+        while not self.dead:
+            if timeout is not None and time.monotonic() > deadline:
+                raise subprocess.TimeoutExpired("msieve", timeout)
+            time.sleep(0.005)
         return 0
 
     def send_signal(self, sig):
-        pass
+        self.signals.append(sig)
+        self.dead = True
+
+    def terminate(self):
+        self.dead = True
+
+    def kill(self):
+        self.dead = True
 
 
-def _ladder_ctx(tmp_path, **kw):
-    return RunContext(device="0", devices=("0", "1"), threads=8,
-                      log_file=tmp_path / "t.log", **kw)
+def _watch_job(tmp_path, shards, hard_cap=False, budget=None, **ctxkw):
+    """A hand-built job whose shard dirs carry msieve-log fragments."""
+    job = object.__new__(nfs.PolyselectJob)
+    job.wd = tmp_path
+    job.ctx = RunContext(log_file=tmp_path / "t.log",
+                         poly_budget_s=budget, **ctxkw)
+    job._hard_cap = hard_cap
+    job._cap = job.budget = budget if hard_cap else nfs.POLY_MAX_WAIT_S
+    job.engine = "gpu_cubsort"
+    job._cap_logged = False
+    job._t0 = time.monotonic()
+    job._deadline_at = job._t0 + job._cap
+    job.poll_s = 0.02
+    job.bar = None
+    job.sharded = len(shards) > 1
+    job._procs = []
+    for i, log_text in enumerate(shards):
+        d = tmp_path / f"poly-{i}"
+        d.mkdir(exist_ok=True)
+        if log_text:
+            (d / "msieve.log").write_text(log_text)
+        job._procs.append((d, SigP()))
+    job._interrupt_all_orig = None
+    return job
 
 
-def test_ladder_runs_until_bar_met(tmp_path, monkeypatch, capsys):
-    """Round 1 lands below msieve's expectation: the ladder continues
-    over fresh, disjoint ground; round 2 meets the bar and stops early."""
-    LogP.values = [5e-9, 5e-9, 2e-8, 2e-8]
-    LogP.spawns = []
-    monkeypatch.setattr(nfs, "find_bin", lambda name, bd: "/bin/msieve")
-    monkeypatch.setattr(subprocess, "Popen",
-                        lambda cmd, **kw: LogP(cmd, **kw))
-    job = nfs.PolyselectJob(C110, _ladder_ctx(tmp_path), tmp_path)
-    job.wait()
-    assert len(LogP.spawns) == 4                 # 2 cards x 2 rounds
-    r1_hi = max(int(cmd[2].split("max_coeff=")[1].split()[0])
-                for d, cmd in LogP.spawns[:2])
-    r2_lo = min(int(cmd[2].split("min_coeff=")[1].split()[0])
-                for d, cmd in LogP.spawns[2:])
-    assert r2_lo == r1_hi + 1                    # fresh ground, no overlap
-    assert job.poly_e == 2e-8
-    assert job.fb["N"] == str(C110)
+BAR = "expecting poly E from 1e-8 to > 2e-8\n"
+
+
+def test_watch_sigints_when_bar_met(tmp_path, capsys):
+    """The streamed best E reaches msieve's expectation: the watcher
+    SIGINTs every shard (they save best-so-far on the way out)."""
+    job = _watch_job(tmp_path, [BAR + "polyselect best E = 2e-8\n",
+                                BAR + "polyselect best E = 1.5e-9\n"])
+    job._quality_watch()
+    assert all(p.signals == [signal.SIGINT] for _, p in job._procs)
+    assert "met msieve's expectation (E=2.000e-08 >= 1.000e-08)" \
+        in capsys.readouterr().err
+
+
+def test_watch_waits_while_below_bar(tmp_path, capsys):
+    """Below the bar the watcher must not fire; it returns once the
+    search ends on its own."""
+    job = _watch_job(tmp_path, [BAR + "polyselect best E = 5e-9\n",
+                                BAR + "polyselect best E = 4e-9\n"])
+    for _, p in job._procs:
+        p.dead = True                      # the search ends by itself
+    job._quality_watch()
+    assert all(p.signals == [] for _, p in job._procs)
     err = capsys.readouterr().err
-    assert "met msieve's expectation" in err
-    assert "keeps the incumbent" not in err
+    assert "met msieve's expectation" not in err
+    assert "wall cap" not in err
 
 
-def test_ladder_keeps_incumbent_and_exhausts_range(tmp_path, monkeypatch,
-                                                   capsys):
-    """No round ever meets the bar: the ladder keeps the best incumbent,
-    never regresses to a worse polynomial, and stops when the range is
-    exhausted."""
-    LogP.values = [5e-9, 4.9e-9, 4e-9, 4e-9, 1e-9, 1e-9]
-    LogP.spawns = []
-    monkeypatch.setattr(nfs, "find_bin", lambda name, bd: "/bin/msieve")
-    monkeypatch.setattr(subprocess, "Popen",
-                        lambda cmd, **kw: LogP(cmd, **kw))
-    job = nfs.PolyselectJob(C110, _ladder_ctx(tmp_path), tmp_path)
-    job.wait()
-    assert len(LogP.spawns) == 6                 # 3 rounds to exhaustion
+def test_watch_falls_back_to_cap_without_bar(tmp_path, capsys):
+    """No 'expecting poly E' line (older binary): after the grace period
+    the plain wall cap applies."""
+    job = _watch_job(tmp_path, ["some other log line\n",
+                                "some other log line\n"])
+    job._t0 = time.monotonic() - nfs.POLY_MAX_WAIT_S - 10
+    job._deadline_at = job._t0 + nfs.POLY_MAX_WAIT_S
+    job._quality_watch()
+    assert all(p.signals == [signal.SIGINT] for _, p in job._procs)
     err = capsys.readouterr().err
-    assert "keeps the incumbent E=5e-09" in err  # no regression
-    assert "searched the whole leading-coefficient range" in err
-    assert "R1 poly-0" in (tmp_path / "msieve.fb").read_text()
-    assert job.poly_e == 5e-9
-    # the union of all spawned ranges covers [1, top] with no overlap
-    seen = []
-    for d, cmd in LogP.spawns:
-        args = cmd[2]
-        seen.append((int(args.split("min_coeff=")[1].split()[0]),
-                     int(args.split("max_coeff=")[1].split()[0])))
-    seen.sort()
-    assert seen[0][0] == 1 and seen[-1][1] == MSIEVE_C110_TOP
-    for (_, hi), (lo, _) in zip(seen, seen[1:]):
-        assert lo == hi + 1
+    assert "no E bar in the logs" in err
+    assert "hit its wall cap" in err
 
 
-# ------------------------------------------------------ interrupt salvage
+def test_watch_cap_fires_in_hard_cap_mode(tmp_path, capsys):
+    """An explicit --poly-budget caps the search even when the bar is
+    known and not yet met."""
+    job = _watch_job(tmp_path, [BAR + "polyselect best E = 5e-9\n",
+                                BAR + "polyselect best E = 5e-9\n"],
+                     hard_cap=True, budget=0.0)
+    job._cap = job.budget = 0.3
+    job._deadline_at = job._t0 + 0.3
+    job._quality_watch()
+    assert all(p.signals == [signal.SIGINT] for _, p in job._procs)
+    err = capsys.readouterr().err
+    assert "hit its wall cap" in err
+    assert "met msieve's expectation" not in err
+
+
+def test_watch_respects_run_deadline(tmp_path, capsys):
+    """The per-number --timeout interrupts the search with the best-so-far
+    polynomial kept (the run then fails at the next checkpoint)."""
+    job = _watch_job(tmp_path, [BAR + "polyselect best E = 5e-9\n", ""],
+                     timeout_s=0.05)
+    job.ctx.deadline = time.monotonic() + 0.05
+    job._quality_watch()
+    assert all(p.signals == [signal.SIGINT] for _, p in job._procs)
+    assert "run timeout reached" in capsys.readouterr().err
+
 
 class AliveP:
     """Never exits on its own; dies on terminate()."""
@@ -445,33 +435,3 @@ def test_some_shards_have_poly_no_retry(tmp_path, monkeypatch, capsys):
     assert job.engine_retry() is False
     assert spawns == []
     assert "keeping the others" in capsys.readouterr().err
-
-
-# -------------------------------------------------------- wall-cap watch
-
-def test_deadline_watch_sigints_at_cap(tmp_path, capsys):
-    """At the total wall cap the watcher SIGINTs msieve (so it saves its
-    best-so-far polynomial) instead of killing it outright."""
-
-    class SleepingP(AliveP):
-        def wait(self, timeout=None):
-            if self.dead:
-                return 0
-            raise subprocess.TimeoutExpired("msieve", timeout)
-
-        def send_signal(self, sig):
-            self.signals.append(sig)
-            self.dead = True
-
-    job = object.__new__(nfs.PolyselectJob)
-    job.wd = tmp_path
-    job.ctx = RunContext(log_file=tmp_path / "t.log")
-    job._t0 = time.monotonic() - 10.0
-    job._deadline_at = time.monotonic() - 1.0   # cap already passed
-    job._cap_logged = False
-    p = SleepingP()
-    p.signals = []
-    job._term_kill = lambda p: None
-    job._deadline_watch(p)
-    assert p.signals == [signal.SIGINT]
-    assert "wall cap" in capsys.readouterr().err

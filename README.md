@@ -69,27 +69,25 @@ multiplier are ever searched and each process aligns its begin upward, so the
 slices partition the searched set exactly, with zero cross-card traffic. Each
 process gets its own `poly-*` subdir and `CUDA_VISIBLE_DEVICES` pin, `-t`
 divided across the cards (the GPU engine caps its producer pool at 4 anyway;
-`-t` also sizes the stage-2/3 CPU pool). The default search is
-**quality-gated**: the range is covered in naturally-completing blocks —
-round 1 lasts about `max(60 s, 8% of predicted sieve time)`, each later round
-grows ×4 — and after every round the best `combined` E is compared against
-the bar msieve itself prints ("expecting poly E from X to > Y"). At or above
-the bar the search stops early; below it, the next round continues over
-never-before-searched ground until the whole range is exhausted (msieve logs
-no E until a process ends, which is why the checkpoints are round
-boundaries). The winning `msieve.fb`/`np.log` are promoted
-to the NFS workdir root, which is exactly the single-process layout the
-downstream stages and resume paths expect; a better incumbent is never
-displaced by a later, worse round. A shard that finds nothing is only
-retried on the CPU Gerbicz engine when *no* round produced a polynomial (an
-unlucky empty block is not worth CPU hours).
-An interrupted search is torn down cooperatively — SIGTERM on
-Ctrl+C — and msieve saves its best-so-far candidate on the way out, so a rerun
-with the same workdir reuses the salvaged polynomial instead of re-searching.
+`-t` also sizes the stage-2/3 CPU pool). The search is **quality-gated**:
+the bundled msieve fork streams every new overall-best Murphy E to its log
+(`polyselect best E = … (ad = …)`) while the root optimizer keeps pace with
+the sweep, and yagfu watches those lines against the bar msieve itself
+prints ("expecting poly E from X to > Y") — the moment the best E reaches
+the bar, the whole search is SIGINTed and msieve writes out its best
+candidate. A search that never meets the bar ends with msieve's own range.
+The winner's `msieve.fb`/`np.log` are promoted to the NFS workdir root,
+which is exactly the single-process layout the downstream stages and resume
+paths expect. A shard that finds nothing is only retried on the CPU Gerbicz
+engine when *no* shard produced a polynomial (an unlucky empty slice is not
+worth CPU hours when the others hold a polynomial). An interrupted search is
+torn down cooperatively — SIGINT at the bar or cap, SIGTERM on Ctrl+C — and
+msieve saves its best-so-far candidate on the way out, so a rerun with the
+same workdir reuses the salvaged polynomial instead of re-searching.
 (The pre-port GPU stage-1 emitted no candidates at c110–c119; the trunk-port
 engine does — verified at c110 and c137.)
-`--poly-budget` reverts to the legacy shape: one full-range search under a
-hard wall cap, best-so-far polynomial at the cap.
+`--poly-budget` forces the legacy shape: one full-range search under a hard
+wall cap, best-so-far polynomial at the cap.
 
 **Multi-GPU.** `--device` takes a comma-separated list (`--device 0,1` — the
 ordinals mean what they mean to CUDA in your shell, i.e. indices into
