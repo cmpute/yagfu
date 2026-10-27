@@ -1,8 +1,10 @@
 """yagfu command-line interface.
 
     yagfu 123456789...            factor one number
-    yagfu -f numbers.txt          factor one number per line
+    yagfu -f numbers.txt          factor one number or id:<fid> per line
     yagfu -db 12345...            consult and report to factordb.com
+    yagfu -db -snfs id:110000...  factor a factordb record by id, using
+                                  its SNFS suggestion when it has one
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import time
 from pathlib import Path
 
 from . import __version__
+from .backends.nfs import parse_snfs_suggestion, snfs_job_from_file
 from .config import RunContext, cleanup_workdir, resolve_devices
 from .engine import Engine, FactorResult, FoundFactor
 from .fdb import (
@@ -43,11 +46,21 @@ def build_parser() -> argparse.ArgumentParser:
                "  yagfu -f composites.txt -db\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("number", nargs="?", help="decimal number to factor")
-    ap.add_argument("-f", "--file", help="text file with one number per line")
+    ap.add_argument("number", nargs="?",
+                    help="decimal number to factor, or id:<fid> for a "
+                         "factordb record lookup (with -db)")
+    ap.add_argument("-f", "--file", help="text file with one number or "
+                                         "id:<fid> per line")
     ap.add_argument("-db", "--factor-db", dest="factor_db", action="store_true",
                     help="fetch known factorizations from factordb.com, factor "
                          "what remains, and report new factors back")
+    ap.add_argument("-snfs", "--snfs", dest="snfs", action="store_true",
+                    help="with -db: when factordb suggests an SNFS "
+                         "polynomial for the number, factor it with SNFS "
+                         "after the ECM pretest (ECM target and sieve "
+                         "parameters follow the SNFS difficulty); numbers "
+                         "without a suggestion keep the usual SIQS/NFS "
+                         "routing")
     ap.add_argument("--plan", choices=("light", "normal", "deep"),
                     default="normal", help="ECM pretest depth (default normal)")
     ap.add_argument("--xover", type=int, default=105,
@@ -123,6 +136,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="with -db: only query, never report")
     ap.add_argument("--db-dry-run", action="store_true",
                     help="with -db: print requests instead of sending")
+    ap.add_argument("--snfs-job", help=argparse.SUPPRESS)  # debug: feed an
+                    # GGNFS-format SNFS job file directly, no factordb
     ap.add_argument("--json", action="store_true",
                     help="one JSON object per input line on stdout")
     ap.add_argument("-v", "--verbose", action="count", default=0,
@@ -137,7 +152,23 @@ def build_parser() -> argparse.ArgumentParser:
 # input handling
 # ---------------------------------------------------------------------------
 
-def load_numbers(args) -> list[int]:
+def load_numbers(args) -> list[int | tuple[str, str]]:
+    """Decimal ints, or ("id", fid) items naming factordb records.
+
+    The id:<fid> input form is a -db feature; without -db it is rejected."""
+    def parse(s: str, where: str) -> int | tuple[str, str]:
+        if s.startswith("id:"):
+            if not args.factor_db:
+                sys.exit(f"error: {where}: {s!r} needs -db (factordb lookup)")
+            fid = s[3:].strip()
+            if not fid.isdigit():
+                sys.exit(f"error: {where}: bad factordb id: {s!r}")
+            return ("id", fid)
+        try:
+            return int(s)
+        except ValueError:
+            sys.exit(f"error: {where}: not a decimal integer or id:N: {s!r}")
+
     if args.file:
         if args.number:
             sys.exit("error: pass either a number or -f FILE, not both")
@@ -146,19 +177,13 @@ def load_numbers(args) -> list[int]:
             s = line.strip()
             if not s or s.startswith("#"):
                 continue
-            try:
-                numbers.append(int(s))
-            except ValueError:
-                sys.exit(f"error: {args.file}:{lineno}: not a decimal integer: {s!r}")
+            numbers.append(parse(s, f"{args.file}:{lineno}"))
         if not numbers:
             sys.exit(f"error: {args.file} contains no numbers")
         return numbers
     if not args.number:
         sys.exit(build_parser().format_usage())
-    try:
-        return [int(args.number.strip())]
-    except ValueError:
-        sys.exit(f"error: not a decimal integer: {args.number!r}")
+    return [parse(args.number.strip(), "argument")]
 
 
 # ---------------------------------------------------------------------------
@@ -187,19 +212,30 @@ def _db_factor_list(client: FactorDbClient, n: int, fid: str | None):
 
 
 def factor_with_db(n: int, client: FactorDbClient, engine: Engine, wd: Path,
-                   report: bool = True) -> tuple[FactorResult, list[FoundFactor], dict]:
+                   report: bool = True, rec: dict | None = None,
+                   use_snfs: bool = False
+                   ) -> tuple[FactorResult, list[FoundFactor], dict]:
     """factordb-aware driver.
 
     Returns (engine result, known-db factors merged in, fdb summary dict).
     The engine result's factor list contains every prime factor of n
-    (db-known ones included, source 'fdb')."""
+    (db-known ones included, source 'fdb').  `rec` may carry a record
+    already fetched (get_number_by_id path), skipping the first query.
+
+    With use_snfs, a SNFS suggestion in the record is handed to the engine
+    when it applies to the number we factor ourselves (the suggestion maps
+    the whole record; a remainder that lost db-known factors would need
+    its own polynomial and keeps the usual routing)."""
     fdb_info: dict = {}
-    rec = client.get_number(n)
+    if rec is None:
+        rec = client.get_number(n, snfs=use_snfs)
     known: list[int] = []
     to_factor = n
     status = rec["status"] if rec else None
     fid = rec["fid"] if rec else None
     fdb_info["status"] = status
+    if fid is not None:
+        fdb_info["id"] = str(fid)
 
     if status in ("P", "PR"):
         known = [n]
@@ -217,8 +253,23 @@ def factor_with_db(n: int, client: FactorDbClient, engine: Engine, wd: Path,
             rem = 1
         to_factor = rem
 
+    snfs = None
+    if use_snfs and to_factor > 1 and to_factor == n:
+        snfs = parse_snfs_suggestion(rec.get("snfs") if rec else None, n,
+                                     fid=fid)
+        if snfs is None:
+            engine.ctx.logv("snfs: no usable factordb suggestion in the "
+                            "record")
+        else:
+            fdb_info["snfs"] = round(snfs.scaled, 2)
+            e = f", E {snfs.e:g}" if snfs.e else ""
+            engine.ctx.log(f"snfs: factordb suggests "
+                           f"{snfs.form or 'a polynomial'} "
+                           f"(difficulty {snfs.difficulty:g}, scaled "
+                           f"{snfs.scaled:g}{e})")
+
     if to_factor > 1:
-        res = engine.factor(to_factor, wd)
+        res = engine.factor(to_factor, wd, snfs=snfs)
     else:
         res = FactorResult(n=to_factor)
         res.complete = True
@@ -354,7 +405,27 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.quiet and args.json:
         pass  # json lines still go to stdout; -q only mutes the detail line
+    if args.snfs_job and args.factor_db:
+        sys.exit("error: pass either --snfs-job or -db, not both")
+    if args.snfs and not args.factor_db and not args.snfs_job:
+        sys.exit("error: -snfs needs -db (the SNFS suggestion comes from "
+                 "factordb) or --snfs-job")
     numbers = load_numbers(args)
+
+    snfs_direct = None
+    if args.snfs_job:
+        try:
+            snfs_direct = snfs_job_from_file(
+                Path(args.snfs_job).read_text())
+        except OSError as e:
+            sys.exit(f"error: cannot read {args.snfs_job}: {e}")
+        if snfs_direct is None:
+            sys.exit(f"error: {args.snfs_job}: no SNFS polynomial found "
+                     "(need an n:/polynomial job file)")
+        if len(numbers) != 1 or numbers[0] != snfs_direct.n:
+            sys.exit(f"error: {args.snfs_job} is a job for "
+                     f"{snfs_direct.n}; pass exactly that number")
+
     raw_devices = tuple(d.strip() for d in args.device.split(",") if d.strip())
     if not raw_devices:
         sys.exit("error: --device needs at least one ordinal")
@@ -410,7 +481,21 @@ def main(argv=None) -> int:
     interrupted = False
     kept_any = False            # any workdir survives (failure/interrupt)
     try:
-        for idx, n in enumerate(numbers):
+        for idx, item in enumerate(numbers):
+            # an id:<fid> input resolves to its record (and number) first;
+            # factor_with_db then reuses the record instead of re-querying
+            rec = None
+            if isinstance(item, tuple):
+                fid = item[1]
+                rec = fdb_client.get_number_by_id(fid, snfs=args.snfs)
+                if rec is None or not rec.get("decimal"):
+                    failures += 1
+                    print(f"id:{fid}: FAILED (factordb record unavailable)",
+                          flush=True)
+                    continue
+                n = int(rec["decimal"])
+            else:
+                n = item
             wd = base / f"{idx:03d}-{str(n)[:12]}"
             # an existing workdir is a resume candidate, never wiped
             wd.mkdir(parents=True, exist_ok=True)
@@ -422,13 +507,14 @@ def main(argv=None) -> int:
                 if fdb_client is not None:
                     res, merged, fdb_info = factor_with_db(
                         n, fdb_client, engine, wd,
-                        report=not args.db_no_report)
+                        report=not args.db_no_report, rec=rec,
+                        use_snfs=args.snfs)
                     ok = emit(n, res, merged, fdb_info, time.monotonic() - t0,
                               args.json,
                               str(wd) if not _merged_complete(n, merged) else None,
                               args.quiet)
                 else:
-                    res = engine.factor(n, wd)
+                    res = engine.factor(n, wd, snfs=snfs_direct)
                     ok = emit(n, res, None, None, time.monotonic() - t0,
                               args.json,
                               str(wd) if not res.complete else None,

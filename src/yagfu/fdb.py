@@ -116,12 +116,20 @@ class FactorDbClient:
 
     # ------------------------------------------------------------- queries
 
-    def get_number(self, n: int) -> dict | None:
-        """Record for decimal n: {fid, status, decimal, digits} or None."""
+    def _get_number(self, target: dict, *, snfs: bool = False,
+                    expect: int | None = None) -> dict | None:
+        """Shared get_number: {fid, status, decimal, digits, snfs} or None.
+
+        With snfs=True the query asks factordb to attach its SNFS
+        suggestion (`snfs: true, detail: 2` — served for open composites
+        of 80..400 digits; the `snfs` object carries `polys` ordered
+        best-first)."""
+        params: dict = {"target": target, "decimal": True}
+        if snfs:
+            params["snfs"] = True
+            params["detail"] = 2
         try:
-            res = self.rpc("get_number",
-                           {"target": {"expr": str(n)}, "decimal": True},
-                           timeout=120)
+            res = self.rpc("get_number", params, timeout=120)
         except FactorDbError as e:
             self._log(f"fdb: get_number failed: {e}")
             return None
@@ -129,12 +137,34 @@ class FactorDbClient:
             return None
         fid = (res.get("id") or {}).get("fid")
         dec = res.get("decimal")
-        if dec and str(dec) != str(n):
+        if dec is None:
+            if expect is None:
+                # by id: the decimal IS the number we are after
+                self._log("fdb: record carries no decimal, ignoring")
+                return None
+            dec = str(expect)
+        elif expect is not None and str(dec) != str(expect):
             self._log("fdb: decimal mismatch, ignoring record")
             return None
+        raw_snfs = res.get("snfs")
         return {"fid": fid, "status": res.get("status"),
-                "decimal": str(dec) if dec else str(n),
-                "digits": res.get("digits")}
+                "decimal": str(dec),
+                "digits": res.get("digits"),
+                "snfs": raw_snfs if isinstance(raw_snfs, dict) else None}
+
+    def get_number(self, n: int, *, snfs: bool = False) -> dict | None:
+        """Record for decimal n, or None."""
+        return self._get_number({"expr": str(n)}, snfs=snfs, expect=n)
+
+    def get_number_by_id(self, fid: str | int, *,
+                         snfs: bool = False) -> dict | None:
+        """Record by factordb id (same shape as get_number)."""
+        try:
+            num = int(fid)
+        except (TypeError, ValueError):
+            self._log(f"fdb: bad factordb id: {fid!r}")
+            return None
+        return self._get_number({"id": num}, snfs=snfs)
 
     def get_factor_decimals(self, fid: str) -> list[str]:
         """Decimal strings of the factors stored for record `fid`."""

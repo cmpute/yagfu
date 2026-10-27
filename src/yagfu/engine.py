@@ -12,6 +12,10 @@ budget, cumulative ECM work ledger, independent final algorithm selector):
        digits <= 45 and target < t15)
     -> final selector: cuda-mpqs (SIQS) below the crossover digit count,
        msieve+cuda-sieve (GNFS) at/above it; each is the other's fallback.
+       With a supplied SNFS polynomial (factordb's -snfs suggestion, or
+       --snfs-job) the polynomial's number is sieved with it instead — the
+       ECM pretest sized by the SNFS difficulty — and only a failed SNFS
+       run falls back to the usual selection.
        In ecm-only mode the sieves are never reached: the ladder climbs
        every level to its full budget and then keeps sampling the t65
        level forever, until the number is factored or the user interrupts.
@@ -27,6 +31,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .arith import perfect_power, pollard_rho, trial_divide
 from .backends.ecm import EcmProvenance, EcmUnsupported, run_ecm_curves
@@ -42,6 +47,9 @@ from .ecmledger import (
 )
 from .fmt import fmt_count, fmt_dur
 from .primes import SPRP_2761_LIMIT, is_probable_prime
+
+if TYPE_CHECKING:
+    from .backends.nfs import SnfsJob
 
 #: curve count per endless top-level batch in ecm-only mode
 ECM_ONLY_TOPUP_CURVES = 1024
@@ -91,7 +99,8 @@ class Engine:
 
     # ------------------------------------------------------------------ api
 
-    def factor(self, n: int, wd: Path) -> FactorResult:
+    def factor(self, n: int, wd: Path,
+               snfs: "SnfsJob | None" = None) -> FactorResult:
         res = FactorResult(n=n)
         if n < 2:
             res.error = "n must be >= 2"
@@ -101,7 +110,7 @@ class Engine:
                              if self.ctx.timeout_s else None)
         self.ctx.log(f"fac: factoring {n} (c{_digits(n)})")
         try:
-            self._factor_rec(n, wd, res, depth=0)
+            self._factor_rec(n, wd, res, depth=0, snfs=snfs)
         except KeyboardInterrupt:
             # the backend subprocess was killed by subprocess.run's
             # exception path; report whatever has been collected so far
@@ -149,12 +158,17 @@ class Engine:
     # ------------------------------------------------------------- pipeline
 
     def _factor_rec(self, m: int, wd: Path, res: FactorResult, depth: int,
-                    ledger: EcmLedger | None = None) -> None:
+                    ledger: EcmLedger | None = None,
+                    snfs: "SnfsJob | None" = None) -> None:
         """Factor composite m (> 1); primes accumulate into res.factors.
 
         `ledger` pre-seeds the ECM work ledger — curves run on an ancestor
         number count for its cofactors, so a recursion after a mid-ladder
-        split continues from the work already spent instead of re-climbing."""
+        split continues from the work already spent instead of re-climbing.
+        `snfs` is an SNFS polynomial suggestion for this same number: it
+        rides through the ECM stage (and a split's recursion) and is
+        consumed by the first sieve stage reached; recursions on sibling
+        factors (power/rho/sieve splits) never see it."""
         ctx = self.ctx
         if m == 1:
             return
@@ -224,7 +238,7 @@ class Engine:
         else:
             orig = m
             t = time.monotonic()
-            m = self._ecm_stage(m, wd, res, depth, ledger)
+            m = self._ecm_stage(m, wd, res, depth, ledger, snfs)
             res.spend("ecm", time.monotonic() - t)
             if self._ecm_done(m, res):
                 return
@@ -232,7 +246,9 @@ class Engine:
                 # split during the pretest: the ladder already continued on
                 # the cofactor to the target; recurse keeps the ledger (the
                 # re-entry's cheaper prework re-runs, the ladder skips)
-                self._factor_rec(m, wd, res, depth + 1, ledger=ledger)
+                # and the snfs suggestion (it maps the original number)
+                self._factor_rec(m, wd, res, depth + 1, ledger=ledger,
+                                 snfs=snfs)
                 return
         ctx.check_deadline()
 
@@ -240,7 +256,7 @@ class Engine:
         if ctx.ecm_only:
             raise FactorError(
                 f"ecm-only: c{_digits(m)} not fully factored by ECM")
-        self._sieve_stage(m, wd, res, depth)
+        self._sieve_stage(m, wd, res, depth, snfs=snfs)
 
     # --------------------------------------------------------------- stages
 
@@ -256,7 +272,8 @@ class Engine:
         return False
 
     def _ecm_stage(self, m: int, wd: Path, res: FactorResult, depth: int,
-                   ledger: EcmLedger) -> int:
+                   ledger: EcmLedger,
+                   snfs: "SnfsJob | None" = None) -> int:
         """GPU ECM ladder with the YAFU work ledger; returns the cofactor.
 
         The ledger and the ladder position survive cofactor splits: a curve
@@ -268,16 +285,24 @@ class Engine:
         is no target: every level runs to its full budget and the top level
         is then sampled forever until the number factors or the user
         interrupts.
+
+        With an SNFS suggestion the pretest is sized by the SNFS
+        difficulty, not the raw digit count: an SNFS-170 number of 270
+        digits needs a t170 pretest, not a t270 one.
         """
         ctx = self.ctx
+        # the effective size: scaled difficulty when sieving SNFS
+        sz = snfs.scaled if snfs is not None else _digits(m)
         top = NUM_LEVELS - 1
         if ctx.ecm_only:
             ctx.log(f"ecm: c{_digits(m)}, ecm-only: every level to full "
                     f"budget, then endless t65")
         else:
-            target = min(target_depth(_digits(m), ctx.plan), 65.0)
-            ctx.log(f"ecm: c{_digits(m)}, plan={ctx.plan}, "
-                    f"target=t{target:.1f}")
+            target = min(target_depth(sz, ctx.plan), 65.0)
+            ctx.log(f"ecm: c{_digits(m)}"
+                    + (f" (snfs difficulty {sz:g})" if snfs is not None
+                       else "")
+                    + f", plan={ctx.plan}, target=t{target:.1f}")
 
         j = 0
         inv = 0
@@ -288,7 +313,7 @@ class Engine:
                 j = top                        # park at t65 forever
             elif not ctx.ecm_only and j > 0 and (
                     ledger.depth() >= target
-                    or (_digits(m) <= 45 and target < 15.0)):
+                    or (sz <= 45 and target < 15.0)):
                 break  # target reached, or YAFU's trivial-pretest skip
             if ctx.ecm_only:
                 want = ledger.level_budget_left(j)
@@ -348,9 +373,31 @@ class Engine:
         return m
 
     def _sieve_stage(self, m: int, wd: Path, res: FactorResult,
-                     depth: int) -> None:
+                     depth: int, snfs: "SnfsJob | None" = None) -> None:
         ctx = self.ctx
         digits = _digits(m)
+        if snfs is not None:
+            # the suggestion maps its own number, which may be larger than
+            # the post-ECM cofactor: sieve the polynomial's number (the
+            # job cost is the same) and strip what the pretest already
+            # found when absorbing.  A failed suggestion is consumed —
+            # retrying it on the fallback path would fail the same way.
+            attach = snfs.n
+            ctx.log(f"snfs: sieving c{_digits(attach)} with the supplied "
+                    f"polynomial (difficulty {snfs.scaled:g})")
+            ctx.check_deadline()
+            t = time.monotonic()
+            r = self._nfs(attach, wd, snfs=snfs)
+            res.spend("nfs", time.monotonic() - t)
+            res.bump("nfs_runs")
+            if r.ok and r.factors:
+                res.bump("snfs_runs")
+                self._absorb_snfs(r.factors, attach, m, wd, res, depth)
+                return
+            ctx.log(f"snfs: failed ({r.error}); falling back to the "
+                    f"usual sieve selection")
+            snfs = None
+
         want_nfs = ctx.force_method == "nfs" or (
             ctx.force_method != "siqs" and digits >= ctx.xover)
         order = ("nfs", "siqs") if want_nfs else ("siqs", "nfs")
@@ -388,6 +435,34 @@ class Engine:
                 ctx.log(f"{method} failed on c{digits}, trying {other}")
         raise FactorError(f"both sieves failed on c{digits} (logs in {wd})")
 
+    def _absorb_snfs(self, raw_factors: list[int], attach_n: int, m: int,
+                     wd: Path, res: FactorResult, depth: int) -> None:
+        """Absorb factors of attach_n into the cofactor m.
+
+        The SNFS run sieved attach_n, of which m is a divisor (the ECM
+        pretest may have stripped primes along the way): every collected
+        prime divides attach_n too, so stripping it from each returned
+        factor leaves a divisor of m.  Composites recurse; whatever of m
+        survives recurses with the usual sieve selection."""
+        cof = m
+        for f in sorted(set(raw_factors), reverse=True):
+            v = f
+            for ff in res.factors:
+                while v % ff.value == 0:
+                    v //= ff.value
+            if v <= 1:
+                continue
+            if cof % v != 0:
+                self.ctx.log(f"snfs: factor {f} does not split the "
+                             "cofactor, ignoring")
+                continue
+            cof //= v
+            self._collect(v, "nfs", wd, res, depth)
+        if cof > 1:
+            self.ctx.log(f"snfs: c{_digits(cof)} of the attach number "
+                         f"still composite, recursing")
+            self._factor_rec(cof, wd, res, depth + 1)
+
     def _absorb(self, raw_factors: list[int], m: int, source: str, wd: Path,
                 res: FactorResult, depth: int) -> None:
         """Turn a sieve's factor dump into verified prime FoundFactors."""
@@ -399,8 +474,8 @@ class Engine:
         if cof > 1:
             self._factor_rec(cof, wd, res, depth + 1)
 
-    def _nfs(self, n: int, wd: Path):
+    def _nfs(self, n: int, wd: Path, snfs: "SnfsJob | None" = None):
         if self._run_nfs is None:
             from .backends.nfs import run_nfs
             self._run_nfs = run_nfs
-        return self._run_nfs(n, self.ctx, wd / "nfs")
+        return self._run_nfs(n, self.ctx, wd / "nfs", snfs=snfs)

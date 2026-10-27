@@ -169,13 +169,16 @@ Binary lookup order: `--bin-dir` > `$YAGFU_BIN` > the wheel-bundled `yagfu/bin/`
 yagfu <number>                 factor one decimal number
 yagfu -f numbers.txt           factor a file: one number per line (# comments OK)
 yagfu -db <number>             consult factordb.com first, report results back
+yagfu -db -snfs id:<fid>       factor a factordb record by id, using its
+                               SNFS suggestion when it has one
 yagfu -f batch.txt -db --json  batch mode, JSONL output
 ```
 
 | option | default | meaning |
 |---|---|---|
-| `-f, --file FILE` | — | input file, one number per line |
+| `-f, --file FILE` | — | input file, one number or `id:<fid>` per line |
 | `-db, --factor-db` | off | factordb fetch + report (see below) |
+| `-snfs, --snfs` | off | with `-db`: when factordb suggests an SNFS polynomial for the number, factor it with SNFS after the ECM pretest (see below) |
 | `--plan {light,normal,deep}` | `normal` | ECM target depth (2/9, 4/13, 1/3 of digits) |
 | `--ecm-only` | off | never run SIQS/NFS: climb every ECM level to its full budget, then sample t65 forever until the number factors or Ctrl+C |
 | `--no-ecm` | off | skip the ECM stage entirely: TD → rho → SIQS/NFS (rerun convenience when the pretest is known useless) |
@@ -252,6 +255,49 @@ affect the factorization result or the exit code.
 The token is read from `--db-token FILE` (default `~/.factordb_token`, one line)
 and sent in the `X-Fdb-User-Token` header; it is never printed. Without a token
 everything still works, anonymously and without credit.
+
+### factordb records by id (`id:<fid>`)
+
+With `-db`, the input (positional or a `-f` line) may name a record instead of a
+number:
+
+```
+yagfu -db id:1100000000631376229
+```
+
+The record is fetched with `get_number` by id (one query, no expression
+round-trip) and the flow continues exactly as if the decimal had been given: FF
+records are answered from the database, CF records lose their known factors,
+C records are factored locally. A failed lookup fails that one input and the
+run continues with the rest.
+
+### SNFS from factordb (`-snfs`)
+
+`-snfs` (requires `-db`) enables SNFS for numbers where factordb itself
+suggests it: for open composites of 80–400 digits the record query asks for the
+`sNfs` suggestion (`snfs: true, detail: 2`), an ordered list of special-form
+polynomials with difficulty scores. When the record being factored carries one
+(and nothing was divided out of it first), yagfu:
+
+* sieves the polynomial factordb ranks first — no local SNFS polynomial search,
+  no GNFS polyselect; the special-q side follows the suggestion (`--sq-side 0`
+  for rational-side polys);
+* sizes the ECM pretest and the sieve parameters (rlim/alim/lpbr/logI) by the
+  SNFS *scaled difficulty* instead of the raw digit count — a c270 number at
+  difficulty 170 gets a t170 pretest and c170-class sieve parameters
+  (`SNFS_PARAMS_ANCHORS` in `params.py`; initial anchors, the two
+  factordb-generated jobs pin the ends, not measured calibrations);
+* absorbs the factors of the original number, stripping whatever the ECM
+  pretest already found (sieving the polynomial's number costs the same as
+  sieving the cofactor, and covers both).
+
+A failed SNFS run falls back to the usual SIQS/NFS selection on the cofactor.
+Numbers without a suggestion are unaffected. Choosing between SNFS and
+GNFS/SIQS automatically (by difficulty vs digit count) is deliberately not
+attempted yet: `-snfs` follows factordb's recommendation when present.
+
+`--snfs-job FILE` (hidden debug flag) feeds a GGNFS-format SNFS job file
+directly — same pipeline, no factordb; the job's `n:` must equal the input.
 
 ## Performance
 

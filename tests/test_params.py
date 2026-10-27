@@ -8,6 +8,7 @@ from yagfu.params import (
     nfs_params,
     poly_budget,
     sieve_time_estimate,
+    snfs_params,
 )
 
 
@@ -92,3 +93,24 @@ def test_find_bin_order(tmp_path, monkeypatch):
     monkeypatch.setenv("YAGFU_BIN", str(tmp_path / "missing"))
     with pytest.raises(FileNotFoundError, match="no-such-bin"):
         find_bin("no-such-bin", None)
+
+
+def test_snfs_params_anchors_exact():
+    assert snfs_params(100) == (500_000, 500_000, 25, 12)
+    assert snfs_params(300) == (200_000_000, 200_000_000, 32, 14)
+
+
+def test_snfs_params_clamps():
+    assert snfs_params(50) == snfs_params(100)
+    assert snfs_params(400) == snfs_params(300)
+
+
+def test_snfs_params_track_factordb_jobs():
+    # the two factordb-generated snfs jobs pinned in the anchor comments:
+    # d~170 -> ~7M / lpb 27 / I13, d~270 -> ~85.6M / lpb 31 (I15 capped 14)
+    rlim, alim, lpb, logI = snfs_params(170.84)
+    assert rlim == alim and 6_000_000 <= rlim <= 9_000_000
+    assert lpb == 27 and logI == 13
+    rlim, alim, lpb, logI = snfs_params(269.75)
+    assert rlim == alim and 80_000_000 <= rlim <= 110_000_000
+    assert lpb == 31 and logI == 14

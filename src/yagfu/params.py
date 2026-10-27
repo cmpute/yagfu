@@ -52,22 +52,55 @@ NFS_PARAMS_ANCHORS: tuple[tuple[int, tuple[int, int, int, int]], ...] = (
 NFS_MSIEVE_POLY_MIN_DIGITS = 90
 
 
-def nfs_params(digits: int) -> tuple[int, int, int, int]:
-    """(rlim, alim, lpb, logI) for a digits-digit GNFS job."""
-    anchors = NFS_PARAMS_ANCHORS
-    if digits <= anchors[0][0]:
+def _interp(anchors, x: float) -> tuple[int, int, int, int]:
+    if x <= anchors[0][0]:
         return anchors[0][1]
-    if digits >= anchors[-1][0]:
+    if x >= anchors[-1][0]:
         return anchors[-1][1]
     for (d0, p0), (d1, p1) in zip(anchors, anchors[1:]):
-        if d0 <= digits <= d1:
-            t = (digits - d0) / (d1 - d0)
+        if d0 <= x <= d1:
+            t = (x - d0) / (d1 - d0)
             vals = []
             for a, b in zip(p0, p1):
                 v = a + t * (b - a)
                 vals.append(int(round(v)) if isinstance(a, int) else v)
             return tuple(vals)  # type: ignore[return-value]
     raise AssertionError("unreachable")
+
+
+def nfs_params(digits: int) -> tuple[int, int, int, int]:
+    """(rlim, alim, lpb, logI) for a digits-digit GNFS job."""
+    return _interp(NFS_PARAMS_ANCHORS, digits)
+
+
+# --------------------------------------------------------------------------
+# SNFS sieve parameters: (rlim, alim, lpb, logI), keyed on the SCALED
+# difficulty factordb reports (yafu's param-selection size, not the raw
+# digit count of the input).  Initial anchors, not measured calibrations:
+# rlim/alim/lpb track the usual yafu/NFS@Home SNFS tables — two
+# factordb-generated snfs jobs pin the ends (d~170: 7M / lpb 27 / lasieve
+# I13, d~270: 85.6M / lpb 31 / I15); logI is capped at 14 (cuda-sieve's
+# sweet spot) instead of following lasieve's wider picks.
+# --------------------------------------------------------------------------
+
+SNFS_PARAMS_ANCHORS: tuple[tuple[int, tuple[int, int, int, int]], ...] = (
+    (100, (500_000,     500_000,     25, 12)),
+    (120, (1_200_000,   1_200_000,   26, 13)),
+    (140, (3_000_000,   3_000_000,   26, 13)),
+    (160, (5_000_000,   5_000_000,   27, 13)),
+    (180, (9_000_000,   9_000_000,   27, 13)),
+    (200, (20_000_000,  20_000_000,  28, 14)),
+    (220, (40_000_000,  40_000_000,  29, 14)),
+    (240, (60_000_000,  60_000_000,  30, 14)),
+    (260, (80_000_000,  80_000_000,  31, 14)),
+    (280, (110_000_000, 110_000_000, 31, 14)),
+    (300, (200_000_000, 200_000_000, 32, 14)),
+)
+
+
+def snfs_params(difficulty: float) -> tuple[int, int, int, int]:
+    """(rlim, alim, lpb, logI) for an SNFS job of this scaled difficulty."""
+    return _interp(SNFS_PARAMS_ANCHORS, difficulty)
 
 
 # --------------------------------------------------------------------------

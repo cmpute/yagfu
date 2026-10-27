@@ -2,6 +2,9 @@
 
 Ported from bench_factor.py's run_nfs (validated on this hardware), with
 the per-size parameter tables generalized by interpolation (params.py).
+With a supplied SNFS polynomial (SnfsJob: factordb's get_number `snfs`
+suggestion or a --snfs-job file) polyselect is skipped entirely and the
+parameters come from the SNFS difficulty table instead.
 Pipeline shape:
 
 * polyselect: one msieve -np per GPU over disjoint leading-coefficient
@@ -48,6 +51,7 @@ from ..params import (
     NFS_MSIEVE_POLY_MIN_DIGITS,
     nfs_params,
     poly_budget,
+    snfs_params,
 )
 from . import find_bin
 from .runner import (
@@ -173,6 +177,128 @@ def _job_to_msieve_fb(job_text: str) -> tuple[str, str]:
     fb += [f"FRMAX {kv['rlim']}", f"FAMAX {kv['alim']}",
            f"SRLPMAX {1 << int(kv['lpbr'])}", f"SALPMAX {1 << int(kv['lpba'])}"]
     return "\n".join(fb) + "\n", kv["n"] + "\n"
+
+
+# ---------------------------------------------------------------------------
+# SNFS: polynomials supplied from outside (factordb's get_number `snfs`
+# suggestion, or a hand-written --snfs-job file).  yagfu never searches
+# for SNFS polynomials itself; the siever takes the job as-is and only
+# the special-q side (factordb's `side`) reaches the cuda-sieve command.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SnfsJob:
+    n: int
+    coeffs: list[int]          # c0..cd, ascending
+    y0: int
+    y1: int
+    skew: float
+    difficulty: float          # raw SNFS difficulty
+    scaled: float              # scaled difficulty: the param-selection size
+    side: str = "a"            # special-q side factordb wants: "a" | "r"
+    e: float | None = None     # polyselect score, when factordb reports one
+    form: str | None = None    # special form, e.g. "859465723^19-1"
+    fid: object = None         # factordb record the suggestion came from
+
+
+def parse_snfs_suggestion(raw: object, n: int,
+                          fid: object = None) -> SnfsJob | None:
+    """factordb get_number's `snfs` object -> best SnfsJob for n, or None.
+
+    The object is {"n": decimal, "polys": [...]} with the polys ordered
+    best-first (factordb puts the lowest scaled difficulty first); the
+    first one that parses wins."""
+    if not isinstance(raw, dict) or str(raw.get("n", "")) != str(n):
+        return None
+    for p in raw.get("polys") or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            coeffs = [int(c) for c in p["c"]]
+            if not coeffs or coeffs[-1] == 0:
+                continue
+            difficulty = float(p["difficulty"])
+            scaled = float(p.get("scaled", difficulty))
+            job = SnfsJob(n=n, coeffs=coeffs,
+                          y0=int(p["y0"]), y1=int(p["y1"]),
+                          skew=float(p["skew"]),
+                          difficulty=difficulty, scaled=scaled,
+                          side=p.get("side", "a"),
+                          e=p.get("e"), form=p.get("form"), fid=fid)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if job.side not in ("a", "r"):
+            job.side = "a"
+        return job
+    return None
+
+
+def snfs_job_from_file(text: str, fid: object = None) -> SnfsJob | None:
+    """Parse a GGNFS-format SNFS job file (the shape factordb's snfs.php
+    serves: n/type/size/skew/cN/Y0/Y1/params, comments carrying the
+    difficulty and the special-q side).  None without an n:/polynomial."""
+    kv: dict[str, str] = {}
+    deg = -1
+    difficulty = scaled = None
+    side = "a"
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            m = re.search(r"difficulty:\s*([\d.]+)", s)
+            if m and difficulty is None:
+                difficulty = float(m.group(1))
+            m = re.search(r"scaled difficulty:\s*([\d.]+)", s)
+            if m:
+                scaled = float(m.group(1))
+            if "rational side" in s:
+                side = "r"
+            continue
+        parts = s.split()
+        if len(parts) != 2:
+            continue
+        k, v = parts[0].rstrip(":"), parts[1]
+        kv[k] = v
+        m = re.fullmatch(r"c(\d+)", k)
+        if m:
+            deg = max(deg, int(m.group(1)))
+    if "n" not in kv or deg < 1 or "Y0" not in kv or "Y1" not in kv:
+        return None
+    try:
+        job = SnfsJob(n=int(kv["n"]),
+                      coeffs=[int(kv.get(f"c{i}", 0)) for i in range(deg + 1)],
+                      y0=int(kv["Y0"]), y1=int(kv["Y1"]),
+                      skew=float(kv.get("skew", "1.0")),
+                      difficulty=(difficulty if difficulty is not None
+                                  else float(kv["size"]) if "size" in kv
+                                  else 0.0),
+                      scaled=scaled if scaled is not None else 0.0,
+                      side=side, fid=fid)
+    except ValueError:
+        return None
+    if job.scaled <= 0:
+        job.scaled = job.difficulty
+    return job
+
+
+def _snfs_job_text(job: SnfsJob, rlim: int, alim: int, lpb: int) -> str:
+    """GGNFS job file for a supplied SNFS polynomial."""
+    deg = len(job.coeffs) - 1
+    lines = [f"n: {job.n}"]
+    if job.form:
+        lines.append(f"# {job.form}, difficulty: {job.difficulty:g}, "
+                     f"scaled difficulty: {job.scaled:g}")
+    if job.side == "r":
+        lines.append("# special-q on the rational side")
+    lines += ["type: snfs", f"size: {round(job.difficulty)}",
+              f"skew: {job.skew:.4f}"]
+    for i in range(deg, -1, -1):
+        lines.append(f"c{i}: {job.coeffs[i]}")
+    lines += [f"Y0: {job.y0}", f"Y1: {job.y1}",
+              f"rlim: {rlim}", f"alim: {alim}",
+              f"lpbr: {lpb}", f"lpba: {lpb}",
+              f"mfbr: {2 * lpb}", f"mfba: {2 * lpb}",
+              "rlambda: 2.5", "alambda: 2.5"]
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -753,24 +879,50 @@ def _poly_running_e_from_log(wd: Path) -> float | None:
     return best
 
 
-def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
+def run_nfs(n: int, ctx: RunContext, wd: Path,
+            snfs: SnfsJob | None = None) -> NfsResult:
     """Factor n with GNFS inside wd (polyselect runs here when nothing
-    reusable is on disk)."""
-    res = NfsResult(params=nfs_params(len(str(n))))
+    reusable is on disk).  With `snfs`, that supplied polynomial is used
+    as-is: no polyselect, parameters from the SNFS difficulty table."""
+    rlim, alim, lpb, logI = (snfs_params(snfs.scaled) if snfs is not None
+                             else nfs_params(len(str(n))))
+    res = NfsResult(params=(rlim, alim, lpb, logI))
     msieve = find_bin("msieve", ctx.bin_dir)
     cuda_sieve = find_bin("cuda-sieve", ctx.bin_dir)
     wd.mkdir(parents=True, exist_ok=True)
     digits = len(str(n))
     nproc = str(ctx.threads)
-    rlim, alim, lpb, logI = res.params
-    ctx.log(f"nfs: c{digits}, rlim={rlim:,}, alim={alim:,}, lpb={lpb}, "
-            f"logI={logI}")
+    ctx.log(f"nfs: c{digits}"
+            + (f" snfs (difficulty {snfs.scaled:g}"
+               + (f", {snfs.form}" if snfs.form else "")
+               + (", special-q on the rational side" if snfs.side == "r"
+                  else "")
+               + ")"
+               if snfs is not None else "")
+            + f", rlim={rlim:,}, alim={alim:,}, lpb={lpb}, logI={logI}")
 
     # ---- stage 1: polynomial selection (or reuse from a previous run) ----
     t = time.monotonic()
     job_path = wd / f"c{digits}.job"
     reused = False
-    if job_path.exists():
+    job_text = None
+    if snfs is not None:
+        if job_path.exists():
+            job_text = job_path.read_text()
+            if f"n: {n}" in job_text:
+                reused = True
+                res.poly_method = "snfs (resumed)"
+                ctx.log("nfs: reusing snfs job from workdir")
+        if not reused:
+            job_text = _snfs_job_text(snfs, rlim, alim, lpb)
+            job_path.write_text(job_text)
+            res.poly_method = "snfs (factordb)"
+            ctx.log(f"nfs: snfs degree-{len(snfs.coeffs) - 1} poly"
+                    + (f" ({snfs.form})" if snfs.form else "")
+                    + f", difficulty {snfs.difficulty:g}"
+                    + (f", E={snfs.e:g}" if snfs.e else ""))
+        res.stages["polyselect_s"] = 0.0
+    if not reused and snfs is None and job_path.exists():
         job_text = job_path.read_text()
         if f"n: {n}" in job_text:
             reused = True
@@ -780,7 +932,7 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
                 res.poly_e = e
             ctx.log("nfs: reusing polynomial from workdir"
                     + (f" (E={res.poly_e:g})" if res.poly_e else ""))
-    if not reused and digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
+    if not reused and snfs is None and digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
         fb = None
         if (wd / "msieve.fb").exists():
             # polyselect finished (or was budget-capped) but the job file
@@ -808,7 +960,7 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
                         f"(msieve -np, {fmt_dur(poly.wall_s)})")
             else:
                 ctx.log("nfs: msieve -np poly")
-    if not reused and digits < NFS_MSIEVE_POLY_MIN_DIGITS:
+    if not reused and snfs is None and digits < NFS_MSIEVE_POLY_MIN_DIGITS:
         degree = 3 if digits < 80 else 4
         coeffs, mm = base_m_poly(n, degree)
         fb = {"N": str(n),
@@ -818,10 +970,11 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
             fb[f"A{i}"] = str(c)
         res.poly_method = f"base-m deg-{degree}"
         ctx.log(f"nfs: base-m degree-{degree} poly (m={mm})")
-    res.stages["polyselect_s"] = 0.0 if reused else time.monotonic() - t
+    if snfs is None:
+        res.stages["polyselect_s"] = 0.0 if reused else time.monotonic() - t
 
     # ---- stage 2: job file + msieve.fb/worktodo.ini ---------------------
-    if not reused:
+    if not reused and snfs is None:
         job_text = _fb_to_job(fb, rlim, alim, lpb)
         job_path.write_text(job_text)
     fb_text, ini_text = _job_to_msieve_fb(job_text)
@@ -930,7 +1083,11 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
         tag = f"w{seq:04d}"
         base = [cuda_sieve, "--pipeline", "--cofactor",
                 "--poly", job_path.name, "--logI", logI, "--region",
-                min(logI, 14), "--device", 0, (S.q_next, qhi)]
+                min(logI, 14), "--device", 0]
+        if snfs is not None and snfs.side == "r":
+            base += ["--sq-side", 0]    # SNFS: factordb wants the
+                                        # special-q on the rational side
+        base += [(S.q_next, qhi)]
         ctx.log(f"nfs: wave {tag}: q {S.q_next}:{qhi} "
                 f"(have {fmt_count(have_total)})"
                 + (f" [{ctx.sieve_procs} proc x {len(ctx.devices)} gpu]"

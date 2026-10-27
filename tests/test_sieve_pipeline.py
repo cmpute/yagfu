@@ -12,7 +12,7 @@ import time
 import pytest
 
 import yagfu.backends.nfs as nfs
-from yagfu.backends.nfs import _filter_rung, run_nfs
+from yagfu.backends.nfs import SnfsJob, _filter_rung, run_nfs
 from yagfu.config import RunContext
 
 N71 = 10 ** 70 + 3            # 71 digits: base-m poly, below the msieve
@@ -62,7 +62,8 @@ def mark(what):
 
 lo, hi = args[args.index("--qrange") + 1].split(":")
 relname = args[args.index("--relations") + 1]
-mark(f"band start {lo}:{hi} pid={os.getpid()}")
+sq = " sq=0" if "--sq-side" in args else ""
+mark(f"band start {lo}:{hi}{sq} pid={os.getpid()}")
 time.sleep(float(os.environ.get("YAGFU_TEST_SIEVE_SLEEP", "0")))
 per_q = float(os.environ.get("YAGFU_TEST_RELS_PER_Q", "0.001"))
 n = max(1, int((int(hi) - int(lo)) * per_q))
@@ -370,3 +371,94 @@ def test_filter_rung_estimator():
     assert _filter_rung(blind, 1.0, 1.15) == (400, "ladder")
     # a tiny topup still leaves a minimum growth step (no filter spam)
     assert _filter_rung([(1, 100, 90, -10, 5)], 0.0, 1.15) == (102, "ladder")
+
+
+# ------------------------------------------------------------------- snfs
+
+def _snfs_job(n, side="a"):
+    return SnfsJob(n=n, coeffs=[1, 0, 0, 0, 0, 0, 3], y0=-100, y1=1,
+                   skew=1.0, difficulty=70.1, scaled=70.6, side=side,
+                   form="x^6+3", e=1e-4)
+
+
+def test_snfs_run_skips_polyselect_and_writes_job(harness, tmp_path):
+    """With a supplied polynomial the job file is written directly (no
+    msieve -np anywhere), the params come from the SNFS table, and the
+    algebraic-side default leaves --sq-side off the sieve command."""
+    ctx, calls, verdicts = harness
+    verdicts.write_text("found 6000 cycles, need 5\n")
+    wd = tmp_path / "wd"
+    res = run_nfs(N71, ctx, wd, snfs=_snfs_job(N71))
+    seq = _seq(calls)
+    msieve_calls = [s for s in seq if s.startswith("msieve ")]
+    assert msieve_calls and all("-np" not in s for s in msieve_calls)
+    txt = (wd / f"c{len(str(N71))}.job").read_text()
+    assert f"n: {N71}" in txt and "type: snfs" in txt
+    assert "c6: 3" in txt and "Y0: -100" in txt
+    assert res.poly_method == "snfs (factordb)"
+    assert res.stages["polyselect_s"] == 0.0
+    assert not any("sq=0" in s for s in seq)
+
+
+def test_snfs_rational_side_sieves_with_sq_side_0(harness, tmp_path):
+    ctx, calls, verdicts = harness
+    verdicts.write_text("found 6000 cycles, need 5\n")
+    wd = tmp_path / "wd"
+    run_nfs(N71, ctx, wd, snfs=_snfs_job(N71, side="r"))
+    seq = _seq(calls)
+    assert any(s.startswith("band start ") and " sq=0 " in f"{s} "
+               for s in seq)
+
+
+def test_snfs_job_reused_from_workdir(harness, tmp_path):
+    """The second run on the same workdir picks the written job back up
+    instead of rewriting it: poly_method says resumed."""
+    ctx, calls, verdicts = harness
+    verdicts.write_text("filtering wants 50 more relations\n")
+    wd = tmp_path / "wd"
+    res1 = run_nfs(N71, ctx, wd, snfs=_snfs_job(N71))
+    assert res1.poly_method == "snfs (factordb)"
+    res2 = run_nfs(N71, ctx, wd, snfs=_snfs_job(N71))
+    assert res2.poly_method == "snfs (resumed)"
+
+
+def test_snfs_job_file_roundtrip():
+    """_snfs_job_text -> snfs_job_from_file preserves the polynomial and
+    the difficulty/side comments; a factordb snfs.php-style file parses
+    with its params ignored (yagfu picks them from the difficulty)."""
+    from yagfu.backends.nfs import snfs_job_from_file
+    from yagfu.params import snfs_params
+
+    job = _snfs_job(N71, side="r")
+    rlim, alim, lpb, _ = snfs_params(job.scaled)
+    text = nfs._snfs_job_text(job, rlim, alim, lpb)
+    back = snfs_job_from_file(text)
+    assert back.n == job.n and back.coeffs == job.coeffs
+    assert back.y0 == job.y0 and back.y1 == job.y1
+    assert back.side == "r" and back.scaled == job.scaled
+
+    php = f"""n: {N71}
+# x^66+1, difficulty: 70.10, scaled difficulty: 70.60
+# special-q on the algebraic side, siever gnfs-lasieve4I13e, start at q = 1000 in ranges of 4000
+type: snfs
+size: 70
+skew: 1.0000
+c6: 3
+c0: 1
+Y1: 1
+Y0: -100
+rlim: 7000000
+alim: 7000000
+lpbr: 27
+lpba: 27
+mfbr: 54
+mfba: 54
+rlambda: 2.5
+alambda: 2.5
+"""
+    j2 = snfs_job_from_file(php)
+    assert j2 is not None
+    assert j2.n == N71 and j2.coeffs == [1, 0, 0, 0, 0, 0, 3]
+    assert j2.difficulty == 70.10 and j2.scaled == 70.60
+    assert j2.side == "a"
+    assert snfs_job_from_file("n: 123\n") is None     # no polynomial

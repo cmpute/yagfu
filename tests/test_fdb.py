@@ -36,7 +36,56 @@ def test_get_number_parses_record(client):
         "decimal": "123456789", "digits": 9}
     rec = client.get_number(123456789)
     assert rec == {"fid": "abc123", "status": "C",
-                   "decimal": "123456789", "digits": 9}
+                   "decimal": "123456789", "digits": 9, "snfs": None}
+
+
+def test_get_number_by_id(client):
+    client._transport.results["get_number"] = {
+        "id": {"fid": 1100000000631376229}, "status": "C",
+        "decimal": "1166367688", "digits": 135}
+    rec = client.get_number_by_id("1100000000631376229")
+    assert rec == {"fid": 1100000000631376229, "status": "C",
+                   "decimal": "1166367688", "digits": 135, "snfs": None}
+    (method, params), = client._transport.calls
+    assert method == "get_number"
+    assert params["target"] == {"id": 1100000000631376229}
+    assert params["decimal"] is True
+
+
+def test_get_number_by_id_rejects_garbage(client):
+    assert client.get_number_by_id("12x3") is None
+    assert client.get_number_by_id(None) is None
+    assert client._transport.calls == []
+
+
+def test_get_number_by_id_without_decimal_ignored(client):
+    # a record with an omitted decimal carries no number to factor
+    client._transport.results["get_number"] = {
+        "id": {"fid": 7}, "status": "C", "digits": 9,
+        "decimal_omitted": True}
+    assert client.get_number_by_id(7) is None
+
+
+def test_get_number_snfs_request_and_passthrough(client):
+    snfs = {"n": "6", "polys": [{"c": ["1", "1"]}], "status": "C"}
+    client._transport.results["get_number"] = {
+        "id": {"fid": "f"}, "status": "C", "decimal": "6", "digits": 1,
+        "snfs": snfs}
+    rec = client.get_number(6, snfs=True)
+    (_, params), = client._transport.calls
+    assert params["snfs"] is True
+    assert params["detail"] == 2
+    assert rec["snfs"] is snfs
+    # the plain query asks for neither key; a stray field still passes
+    # through (using it is the caller's policy)
+    client._transport.calls.clear()
+    client._transport.results["get_number"] = {
+        "id": {"fid": "f"}, "status": "C", "decimal": "6", "digits": 1,
+        "snfs": snfs}
+    rec = client.get_number(6)
+    (_, params), = client._transport.calls
+    assert "snfs" not in params and "detail" not in params
+    assert rec["snfs"] is snfs
 
 
 def test_get_number_mismatch_ignored(client):

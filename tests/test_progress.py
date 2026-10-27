@@ -125,7 +125,7 @@ def test_cli_keeps_workdir_on_failure(tmp_path, monkeypatch, capsys):
     from yagfu import cli
     from yagfu.engine import Engine, FactorResult
 
-    def fake_factor(self, n, wd):
+    def fake_factor(self, n, wd, snfs=None):
         (wd / "scratch.txt").write_text("x")
         return FactorResult(n=n, complete=False, error="boom")
 
@@ -139,7 +139,7 @@ def test_cli_removes_workdir_on_success(tmp_path, monkeypatch, capsys):
     from yagfu import cli
     from yagfu.engine import Engine, FactorResult, FoundFactor
 
-    def fake_factor(self, n, wd):
+    def fake_factor(self, n, wd, snfs=None):
         (wd / "scratch.txt").write_text("x")
         res = FactorResult(n=n, complete=True)
         res.factors.append(FoundFactor(n, "td", True))
