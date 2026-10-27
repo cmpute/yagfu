@@ -104,7 +104,12 @@ including gpuecm2 stage 2 (its CLI has no device flag) and the GPU polyselect
   gpuecm2 stage-2 run pinned to the first card.
 * **NFS sieving** splits each q-band into `--sieve-procs` × cards cuda-sieve
   chunks, chunk *i* round-robbed onto card *i % k* (adjacent q ranges land on
-  different cards). `--sieve-procs` is per card.
+  different cards). `--sieve-procs` is per card. The msieve `-nc1` filter
+  that closes each round runs in the background, overlapped with the next
+  band's sieving — it only reads `msieve.dat` and a band is appended only
+  after the verdict covering the data so far has been collected, so the
+  stop check stays exact while the filter cost (25–35% of wall time on
+  c150-class runs) hides under GPU time.
 * **SIQS** switches to cuda-mpqs's built-in cluster mode from c80 up: a
   coordinator on the first card plus one localhost TCP worker per remaining
   card, work split by SM×clock weight; below c80 (or with one card) it stays
