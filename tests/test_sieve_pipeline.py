@@ -1,9 +1,9 @@
 """The sieving loop's overlapped filter: fake cuda-sieve/msieve binaries
 drive run_nfs's round loop end-to-end (base-m polynomial path, no GPU),
-and the recorded call order proves the -nc1 of round k overlaps band
-k+1, that bands never collapse to stubs while a verdict is in flight,
-and that near the target the filter runs inline so the stop stays
-fresh.  No GPU, no real msieve."""
+and the recorded call order proves the probe round's -nc1 is collected
+inline (its hint sizes band 2), that round k>=2's -nc1 overlaps band
+k+1, and that bands never collapse to stubs while a verdict is in
+flight.  No GPU, no real msieve."""
 
 import os
 import time
@@ -30,7 +30,11 @@ if "-nc1" in args:
     round_ = [a.split("nc1-r")[1].split(".")[0]
               for a in args if a.startswith("nc1-r")][0]
     mark(f"nc1 start r{round_} pid={os.getpid()}")
-    time.sleep(float(os.environ.get("YAGFU_TEST_NC1_SLEEP", "0")))
+    sleep_s = float(os.environ.get("YAGFU_TEST_NC1_SLEEP", "0"))
+    if round_ == "1":
+        sleep_s = 0.0    # the probe filter is collected inline; the sleep
+                         # exists to keep a later round's filter in flight
+    time.sleep(sleep_s)
     if os.environ.get("YAGFU_TEST_NC1_FAIL"):
         mark(f"nc1 fail r{round_}")
         sys.exit(1)
@@ -96,9 +100,11 @@ def _index(seq, prefix):
 
 
 def test_filter_overlaps_next_band(harness, tmp_path):
-    """Round k's -nc1 is still running when band k+1 is sieved and is
-    only collected afterwards; when its verdict says enough, the band
-    sieved under it is discarded instead of appended."""
+    """The probe round's -nc1 is collected inline before band 2 is sized
+    (its hint replaces the generous initial target); round k>=2's -nc1
+    still runs while band k+1 is sieved and is only collected afterwards;
+    when its verdict says enough, the band sieved under it is discarded
+    instead of appended."""
     ctx, calls, verdicts = harness
     verdicts.write_text(
         "found 10 cycles, need 5000\nfiltering wants 60 more relations\n"
@@ -114,27 +120,28 @@ def test_filter_overlaps_next_band(harness, tmp_path):
     seq = _seq(calls)
     bands = [(s.split()[2], _index(seq, s))
              for s in seq if s.startswith("band start ")]
-    ends = {s.split()[2]: _index(seq, s)
-            for s in seq if s.startswith("band end ")}
     n1 = {s.split()[2]: _index(seq, s)
           for s in seq if s.startswith("nc1 start ")}
     n1e = {s.split()[2]: _index(seq, s)
            for s in seq if s.startswith("nc1 end ")}
-    # round 1's filter overlapped band 2, round 2's overlapped band 3:
-    # each filter was still running after its band had started (an
-    # inline filter would have ended before the next band began — the
-    # only ordering the scheduler lets us assert deterministically)
     (_, i_b2), (_, i_b3) = bands[1], bands[2]
-    assert i_b2 < n1e["r1"]
+    # the probe verdict was in hand before band 2 was sized, and band 2
+    # carries the hint's size, not the (much larger) initial target
+    assert n1e["r1"] < i_b2
+    lo, hi = (int(x) for x in bands[1][0].split(":"))
+    assert hi - lo < 100_000
+    # rounds past the probe overlap as before: round 2's filter was still
+    # running after band 3 had started (the only ordering the scheduler
+    # lets us assert deterministically)
     assert i_b3 < n1e["r2"]
     assert n1["r1"] < n1e["r1"] and n1["r2"] < n1e["r2"]
     # the stopping verdict covers the data through band 2 — band 3 (the
     # one sieved under that filter) is discarded, never appended
     assert res.bands == 2
-    assert res.raw_relations == 987
+    assert res.raw_relations == 107
     # the discarded band's relations were dropped, not appended:
     # msieve.dat stops exactly at the enough-point (band 2)
-    assert sum(1 for _ in open(wd / "msieve.dat")) == 987
+    assert sum(1 for _ in open(wd / "msieve.dat")) == 107
     assert not list(wd.glob("band3.*.rels"))
     assert res.error is None or "no factor" in (res.error or "")
 
@@ -156,12 +163,13 @@ def test_bands_track_measured_deficit(harness, tmp_path):
     bands = [(int(s.split()[2].split(":")[0]),
               int(s.split()[2].split(":")[1]))
              for s in seq if s.startswith("band start ")]
-    assert len(bands) >= 3
+    assert len(bands) >= 4
     for lo, hi in bands:
         assert hi - lo > 20000             # no stub bands anywhere
-    # the stopping verdict discards the band sieved under it
+    # the stopping verdict discards the band sieved under it (band 4);
+    # bands 1-3 are the appended ones
     assert res.bands == 3
-    assert res.raw_relations == 1064
+    assert res.raw_relations == 185
 
 
 def test_verdict_exhaustion_reports_non_convergence(harness, tmp_path):
@@ -199,16 +207,18 @@ def test_filter_failure_reports_error(harness, tmp_path, monkeypatch):
 
 def test_interrupt_kills_pending_filter(harness, tmp_path, monkeypatch):
     """Ctrl+C mid-band tears down the background -nc1 instead of
-    orphaning it over msieve.dat."""
+    orphaning it over msieve.dat.  The probe's filter is collected
+    inline, so the interrupt lands on round 3 with round 2's filter
+    (a 30s sleeper) still in flight."""
     ctx, calls, verdicts = harness
-    verdicts.write_text("found 10 cycles, need 5000\n")
+    verdicts.write_text("filtering wants 500 more relations\n")
     monkeypatch.setenv("YAGFU_TEST_NC1_SLEEP", "30")
 
     real_band = nfs._run_band_parallel
 
     def exploding_band(base, cwd, n_procs, round_idx, timeout,
                        devices=("0",), beat=None, beat_s=120.0):
-        if round_idx >= 2:
+        if round_idx >= 3:
             time.sleep(0.3)        # let the background -nc1 come up first
             raise KeyboardInterrupt("simulated Ctrl+C")
         return real_band(base, cwd, n_procs, round_idx, timeout,

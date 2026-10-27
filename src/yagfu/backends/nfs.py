@@ -783,14 +783,41 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
                             round_idx=round_idx, bands=bands_count,
                             last_cnt=last_cnt, last_width=last_width)
             return "bump"
+        res.error = "filtering did not converge"
         return "fail"
 
     pending = None        # (proc, round, stdout path, t0): the -nc1 over
                           # the data appended so far, overlapped with the
-                          # next band's sieving
+                          # next band's sieving (the probe round's filter
+                          # is the exception — see the launch site)
     hint_floor = 0        # last bump amount; while a verdict is in flight
                           # it is the best guess for sizing the band that
                           # the stale target cannot size
+
+    def _collect_pending() -> tuple[str, int] | None:
+        """Wait out the in-flight -nc1 and classify its verdict; None when
+        nothing is pending.  Leaves the error text in res on "fail" — the
+        call sites own the logging and the control flow."""
+        nonlocal pending
+        if pending is None:
+            return None
+        proc, filter_round, path, t0 = pending
+        pending = None
+        while True:
+            try:
+                proc.wait(timeout=30)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() - t0 > NC_TIMEOUT_S:
+                    proc.kill()
+                    proc.wait()
+                    break
+        res.stages["filter_s"] = res.stages.get("filter_s", 0.0) \
+            + time.monotonic() - t0
+        if proc.returncode != 0:
+            res.error = f"filtering failed (rc={proc.returncode})"
+            return "fail", filter_round
+        return _handle_verdict(read_log(path), filter_round), filter_round
     try:
         while True:
             ctx.check_deadline()
@@ -844,46 +871,22 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
             # every relation appended before the band, and it must be
             # done before the band itself is appended (msieve is reading
             # msieve.dat while we would be writing to it)
-            out_text = None
-            filter_round = 0
-            if pending is not None:
-                proc, filter_round, path, t0 = pending
-                pending = None
-                while True:
-                    try:
-                        proc.wait(timeout=30)
-                        break
-                    except subprocess.TimeoutExpired:
-                        if time.monotonic() - t0 > NC_TIMEOUT_S:
-                            proc.kill()
-                            proc.wait()
-                            break
-                wall = time.monotonic() - t0
-                res.stages["filter_s"] = \
-                    res.stages.get("filter_s", 0.0) + wall
-                if proc.returncode != 0:
-                    res.error = f"filtering failed (rc={proc.returncode})"
+            got = _collect_pending()
+            if got is not None:
+                act, _ = got
+                if act == "fail":
                     ctx.log(f"nfs: {res.error}")
                     return res
-                out_text = read_log(path)
-
-            # the verdict covers exactly the data appended so far (the
-            # band just sieved is not in it), so decide BEFORE appending:
-            # on "stop" the band sieved under this filter turned out to
-            # be unnecessary and is dropped instead of bloating the
-            # matrix past the enough-point
-            if out_text is not None:
-                act = _handle_verdict(out_text, filter_round)
+                # the verdict covers exactly the data appended so far (the
+                # band just sieved is not in it), so on "stop" that band
+                # turned out to be unnecessary and is dropped instead of
+                # bloating the matrix past the enough-point
                 if act == "stop":
                     ctx.log(f"nfs: enough at {have_raw:,} relations; "
                             f"discarding the overlapped band")
                     for f in relnames:
                         (wd / f).unlink(missing_ok=True)
                     break
-                if act == "fail":
-                    res.error = "filtering did not converge"
-                    ctx.log(f"nfs: {res.error}")
-                    return res
 
             cnt = sum(count_lines(wd / f) for f in relnames)
             _append_band_rels(wd, relnames)     # one copy on disk, then delete
@@ -926,6 +929,23 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
                        time.monotonic())
             ctx.log(f"nfs: filtering round {round_idx} in the background, "
                     f"overlapping the next band")
+            if round_idx == 1:
+                # the probe's filter is seconds and its hint is the only
+                # thing standing between round 2 and the deliberately
+                # generous initial target (c135: probe says +1M, the
+                # table says 550M) — collect it before sizing instead of
+                # overlapping it.  Later rounds overlap as usual: their
+                # filters run over 100M+ relations and genuinely pay to
+                # hide under the next band
+                got = _collect_pending()
+                if got is not None:
+                    act, _ = got
+                    if act == "fail":
+                        ctx.log(f"nfs: {res.error}")
+                        return res
+                    if act == "stop":
+                        ctx.log(f"nfs: enough at {have_raw:,} relations")
+                        break
     finally:
         # a return inside the loop (band failure, non-convergence) or an
         # exception must not leave a background -nc1 reading msieve.dat
