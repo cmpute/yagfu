@@ -58,6 +58,13 @@ NP_TIMEOUT_S = 2 * 3600
 POLY_MAX_WAIT_S = 2 * 3600
 #: how often the watcher re-reads the shard logs for the running best E
 POLY_POLL_S = 20.0
+#: stop when the best E has not improved for this long and already sits
+#: this close to the bar: the best E grows only logarithmically with
+#: search effort, so a stalled record means hours more search for
+#: percent-level gains (measured: GPU searches stall at 60-70% of the
+#: printed bar well before the coefficient range is exhausted)
+POLY_STALL_S = 30 * 60
+POLY_STALL_FLOOR = 0.5
 SIEVE_TIMEOUT_S = 6 * 3600
 NC_TIMEOUT_S = 2 * 3600
 LA_TIMEOUT_S = 12 * 3600
@@ -405,11 +412,16 @@ class PolyselectJob:
 
     def _quality_watch(self) -> None:
         """Poll the shard logs and stop the search: SIGINT as soon as the
-        streamed best E meets msieve's expectation (the processes save
-        their best-so-far polynomial on the way out; the cooperative
-        unwind can take minutes, _join's escalation handles a hang), or
-        at the wall cap for the modes that have one."""
+        streamed best E clears the quality target — a fraction of msieve's
+        printed expectation, which assumes a search several times longer
+        than any bounded one — or when the record has stalled above the
+        floor.  The processes save their best-so-far polynomial on the
+        way out (the cooperative unwind can take minutes, _join's
+        escalation handles a hang); the wall cap still applies for the
+        modes that have one."""
         bar_warned = False
+        best_val: float | None = None
+        best_at = 0.0
         while True:
             if all(p.poll() is not None for _, p in self._procs):
                 return
@@ -422,12 +434,26 @@ class PolyselectJob:
                 best = max((e for e in map(_poly_running_e_from_log,
                                            (d for d, _ in self._procs))
                             if e is not None), default=None)
-                if best is not None and best >= self.bar:
-                    self.ctx.log(f"nfs: polyselect met msieve's expectation "
-                                 f"(E={best:.3e} >= {self.bar:.3e}); stopping "
-                                 f"the search")
-                    self._interrupt_all()
-                    return
+                if best is not None:
+                    if best != best_val:
+                        best_val, best_at = best, time.monotonic()
+                    target = self.bar * self.ctx.poly_frac
+                    if best >= target:
+                        self.ctx.log(
+                            f"nfs: polyselect reached the quality target "
+                            f"(E={best:.3e} >= {self.ctx.poly_frac:.0%} of "
+                            f"msieve's {self.bar:.3e}); stopping the search")
+                        self._interrupt_all()
+                        return
+                    if best >= self.bar * POLY_STALL_FLOOR \
+                            and time.monotonic() - best_at >= POLY_STALL_S:
+                        self.ctx.log(
+                            f"nfs: polyselect best E stalled at "
+                            f"{best / self.bar:.0%} of msieve's bar for "
+                            f"{fmt_dur(time.monotonic() - best_at)}; "
+                            f"stopping the search")
+                        self._interrupt_all()
+                        return
             else:
                 if not bar_warned and time.monotonic() - self._t0 > 60:
                     bar_warned = True

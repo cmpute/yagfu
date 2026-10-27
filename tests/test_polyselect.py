@@ -247,8 +247,8 @@ def test_watch_sigints_when_bar_met(tmp_path, capsys):
                                 BAR + "polyselect best E = 1.5e-9\n"])
     job._quality_watch()
     assert all(p.signals == [signal.SIGINT] for _, p in job._procs)
-    assert "met msieve's expectation (E=2.000e-08 >= 1.000e-08)" \
-        in capsys.readouterr().err
+    assert "reached the quality target (E=2.000e-08 >= 65% of " \
+        "msieve's 1.000e-08)" in capsys.readouterr().err
 
 
 def test_watch_waits_while_below_bar(tmp_path, capsys):
@@ -303,6 +303,56 @@ def test_watch_respects_run_deadline(tmp_path, capsys):
     job._quality_watch()
     assert all(p.signals == [signal.SIGINT] for _, p in job._procs)
     assert "run timeout reached" in capsys.readouterr().err
+
+
+def test_watch_frac_gate_below_bar(tmp_path, capsys):
+    """The default gate is 65% of the bar, not the bar: a best E between
+    the two stops the search immediately (the full bar assumes a search
+    several times longer)."""
+    job = _watch_job(tmp_path, [BAR + "polyselect best E = 7e-9\n",
+                                BAR + "polyselect best E = 6e-9\n"])
+    job._quality_watch()
+    assert all(p.signals == [signal.SIGINT] for _, p in job._procs)
+    assert "reached the quality target (E=7.000e-09 >= 65% of " \
+        "msieve's 1.000e-08)" in capsys.readouterr().err
+
+
+def test_watch_frac_one_insists_on_bar(tmp_path, capsys):
+    """--poly-frac 1.0 restores the strict gate: 90% of the bar keeps
+    waiting (until the search ends on its own)."""
+    job = _watch_job(tmp_path, [BAR + "polyselect best E = 9e-9\n",
+                                BAR + "polyselect best E = 8e-9\n"],
+                     poly_frac=1.0)
+    for _, p in job._procs:
+        p.dead = True
+    job._quality_watch()
+    assert all(p.signals == [] for _, p in job._procs)
+    assert "reached the quality target" not in capsys.readouterr().err
+
+
+def test_watch_stall_stops_above_floor(tmp_path, capsys, monkeypatch):
+    """No new record for POLY_STALL_S with the best E above the stall
+    floor: waiting longer buys percent-level gains, so stop."""
+    monkeypatch.setattr(nfs, "POLY_STALL_S", 0.05)
+    job = _watch_job(tmp_path, [BAR + "polyselect best E = 6e-9\n",
+                                BAR + "polyselect best E = 6e-9\n"])
+    job._quality_watch()
+    assert all(p.signals == [signal.SIGINT] for _, p in job._procs)
+    assert "best E stalled at 60% of msieve's bar" \
+        in capsys.readouterr().err
+
+
+def test_watch_stall_waits_below_floor(tmp_path, capsys, monkeypatch):
+    """A stalled record below the stall floor means the search has not
+    warmed up yet: no stop, the search ends on its own."""
+    monkeypatch.setattr(nfs, "POLY_STALL_S", 0.05)
+    job = _watch_job(tmp_path, [BAR + "polyselect best E = 4e-9\n",
+                                BAR + "polyselect best E = 4e-9\n"])
+    for _, p in job._procs:
+        p.dead = True
+    job._quality_watch()
+    assert all(p.signals == [] for _, p in job._procs)
+    assert "stalled" not in capsys.readouterr().err
 
 
 class AliveP:

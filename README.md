@@ -73,21 +73,26 @@ divided across the cards (the GPU engine caps its producer pool at 4 anyway;
 the bundled msieve fork streams every new overall-best Murphy E to its log
 (`polyselect best E = … (ad = …)`) while the root optimizer keeps pace with
 the sweep, and yagfu watches those lines against the bar msieve itself
-prints ("expecting poly E from X to > Y") — the moment the best E reaches
-the bar, the whole search is SIGINTed and msieve writes out its best
-candidate. A search that never meets the bar ends with msieve's own range.
+prints ("expecting poly E from X to > Y") — a fit of what a full-length
+search *should* achieve, which bounded searches land well short of
+(measured: both GPU and 30-minute CPU searches saturate at 55–70% of it).
+The search is therefore stopped when the best E reaches `--poly-frac` of
+the bar (default 0.65), or when the record has stalled for 30 minutes at
+≥ 50% of it — extreme-value statistics make further records worth
+percent-level gains only — or when msieve's coefficient range is exhausted.
 The winner's `msieve.fb`/`np.log` are promoted to the NFS workdir root,
 which is exactly the single-process layout the downstream stages and resume
 paths expect. A shard that finds nothing is only retried on the CPU Gerbicz
 engine when *no* shard produced a polynomial (an unlucky empty slice is not
 worth CPU hours when the others hold a polynomial). An interrupted search is
-torn down cooperatively — SIGINT at the bar or cap, SIGTERM on Ctrl+C — and
-msieve saves its best-so-far candidate on the way out, so a rerun with the
-same workdir reuses the salvaged polynomial instead of re-searching.
+torn down cooperatively — SIGINT at the target or cap, SIGTERM on Ctrl+C —
+and msieve saves its best-so-far candidate on the way out, so a rerun with
+the same workdir reuses the salvaged polynomial instead of re-searching.
 (The pre-port GPU stage-1 emitted no candidates at c110–c119; the trunk-port
 engine does — verified at c110 and c137.)
 `--poly-budget` forces the legacy shape: one full-range search under a hard
-wall cap, best-so-far polynomial at the cap.
+wall cap, best-so-far polynomial at the cap (the quality gates still fire
+early when met).
 
 **Multi-GPU.** `--device` takes a comma-separated list (`--device 0,1` — the
 ordinals mean what they mean to CUDA in your shell, i.e. indices into

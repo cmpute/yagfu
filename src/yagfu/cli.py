@@ -94,9 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="NFS polyselect hard wall cap in seconds: one "
                          "full-range search, SIGINT at the cap, keep the "
                          "best-so-far polynomial.  Without it the search "
-                         "stops as soon as the streamed best E meets the "
-                         "bar msieve itself prints; if it never does, the "
-                         "whole range is searched")
+                         "stops at the quality target (see --poly-frac), "
+                         "or when the best E stalls near it, or when the "
+                         "whole coefficient range is searched")
+    ap.add_argument("--poly-frac", type=float, default=0.65,
+                    help="polyselect quality gate as a fraction of the E "
+                         "msieve says to expect (default 0.65: msieve's bar "
+                         "assumes a search several times longer than a "
+                         "bounded GPU one; 1.0 insists on the full bar)")
     ap.add_argument("--topup-frac", type=float, default=1.0,
                     help="NFS relation target growth per filter round: "
                          "new = have + max(1.2x deficit, frac x have). GPU "
@@ -370,6 +375,7 @@ def main(argv=None) -> int:
         kwargs["ecm_stage2_maxmem_mb"] = args.ecm_stage2_maxmem
     if args.poly_budget is not None:
         kwargs["poly_budget_s"] = args.poly_budget
+    kwargs["poly_frac"] = args.poly_frac
     ctx = RunContext(**kwargs)
     engine = Engine(ctx)
 

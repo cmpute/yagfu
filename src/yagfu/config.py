@@ -109,6 +109,9 @@ class RunContext:
     ecm_stage2_maxmem_mb: int | None = None     # gpuecm2 -maxmem; None = 90% of VRAM,
                                          # 0 = no cap (gpuecm2's own free-mem check)
     poly_budget_s: float | None = None   # NFS polyselect override
+    poly_frac: float = 0.65              # quality gate: stop polyselect when
+                                         # the best E reaches this fraction of
+                                         # msieve's printed expected E
     topup_frac: float = 1.0          # geometric growth per filter round; GPU sieve is cheap, -nc1 passes are not
     log_file: Path = field(default_factory=lambda: Path("yagfu.log"))
                                          # complete run log, appended (cwd)
