@@ -91,7 +91,7 @@ def test_sharded_spawn_pins_and_splits(tmp_path, monkeypatch, capsys):
     assert got == nfs._poly_ranges(C110, 4)
     err = capsys.readouterr().err
     assert "sharded across 4 GPUs" in err
-    assert "stops as soon as the best E" in err
+    assert "stops as soon" not in err
 
 
 def test_single_device_spawn_is_unchanged(tmp_path, monkeypatch):

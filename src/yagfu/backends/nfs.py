@@ -315,20 +315,17 @@ class PolyselectJob:
         self._procs: list[tuple[Path, subprocess.Popen]] = []
         self._shard(msieve)
         if self.sharded:
-            tail = (f"~{fmt_dur(self.budget)} expected, "
-                    f"cap {fmt_dur(self._cap)}" if self._hard_cap else
-                    "stops as soon as the best E meets msieve's "
-                    "expectation")
+            tail = (f"; ~{fmt_dur(self.budget)} expected, "
+                    f"cap {fmt_dur(self._cap)}" if self._hard_cap else "")
             ctx.log(f"nfs: polyselect sharded across {len(self._procs)} "
                     f"GPUs (leading coeffs 1..{self._coeff_top:,} split "
-                    f"{len(self._procs)} ways, -t {self._threads} each; "
+                    f"{len(self._procs)} ways, -t {self._threads} each"
                     f"{tail})")
         elif self._hard_cap:
             ctx.log(f"nfs: polyselect (msieve -np, ~{fmt_dur(self.budget)} "
                     f"expected, cap {fmt_dur(self._cap)})")
         else:
-            ctx.log("nfs: polyselect (msieve -np, stops as soon as the "
-                    "best E meets msieve's expectation)")
+            ctx.log("nfs: polyselect (msieve -np)")
         self._watch()
 
     def _shard(self, msieve) -> None:
