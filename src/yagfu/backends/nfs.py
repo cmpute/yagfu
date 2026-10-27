@@ -4,10 +4,15 @@ Ported from bench_factor.py's run_nfs (validated on this hardware), with
 the per-size parameter tables generalized by interpolation (params.py).
 Pipeline shape:
 
-* polyselect: msieve -np with a wall-clock budget (SIGINT cooperative cap)
-  for >= 85 digits, sharded one process per GPU over disjoint
-  leading-coefficient ranges; classic base-m polynomial below that (this
-  msieve build emits no GPU stage-1 candidates under ~85 digits).
+* polyselect: msieve -np in quality-gated blocks for >= 85 digits — the
+  leading-coefficient range is covered in naturally-completing rounds
+  (one process per GPU over disjoint slices, x4 growth per round), and
+  the search stops as soon as the best polynomial meets the E bar
+  msieve itself prints, else keeps searching fresh ground until the
+  range is exhausted; an explicit --poly-budget reverts to one
+  full-range search under a hard SIGINT cap.  Classic base-m polynomial
+  below that (this msieve build emits no GPU stage-1 candidates under
+  ~85 digits).
 * sieving: cuda-sieve bands with an adaptive width, special-q from alim/2,
   merged into msieve.dat; msieve -nc1 verdict drives the loop.
 * postprocessing: -nc2 matbuild, GPU Lanczos -nc2, sqrt -nc3.
@@ -44,11 +49,15 @@ from .runner import (
 )
 
 NP_TIMEOUT_S = 2 * 3600
-#: total wall cap for a polyselect: msieve's internal deadline only ends
-#: stage 1 (its stage-2 optimization keeps going, and the CPU-seconds
-#: estimate does not account for GPU stage-1 speed), so the search is
-#: trusted to finish on its own but never past this
+#: wall cap for the legacy --poly-budget mode and the CPU-engine retry.
+#: The default search has no cap: it runs quality-gated blocks until the
+#: polynomial meets msieve's own expectation or the range is exhausted
 POLY_MAX_WAIT_S = 2 * 3600
+#: each ladder round searches x4 longer than the one before (the sum is
+#: dominated by the last round, so restart overhead stays negligible)
+POLY_ROUND_GROWTH = 4
+#: smallest leading-coefficient block worth a process start
+POLY_MIN_BLOCK = 500
 SIEVE_TIMEOUT_S = 6 * 3600
 NC_TIMEOUT_S = 2 * 3600
 LA_TIMEOUT_S = 12 * 3600
@@ -242,18 +251,86 @@ def _poly_ranges(n: int, k: int) -> list[tuple[int, int] | None]:
     return out
 
 
-class PolyselectJob:
-    """msieve -np polynomial search, sharded across the GPUs when there
-    are several: each card runs one process over a disjoint slice of the
-    leading-coefficient range, and the best-scoring shard wins.
+def _even_ranges(lo: int, hi: int, k: int) -> list[tuple[int, int]]:
+    """[lo, hi] split into k contiguous chunks (the ladder's final round:
+    an even split of whatever the earlier rounds did not reach)."""
+    width = max(1, (hi - lo + 1) // k)
+    out = []
+    for i in range(k):
+        a = lo + i * width
+        b = hi if i == k - 1 else min(hi, a + width - 1)
+        if a <= b:
+            out.append((a, b))
+    return out
 
-    The winner's msieve.fb/np.log are promoted to the workdir root, so
-    run_nfs's downstream stages and the resume paths see exactly the
-    single-process layout.  A watcher thread per process enforces the
-    total wall cap — cooperative SIGINT first, so msieve writes out its
-    best candidate — and the same wall cap buys k-fold coverage, not an
-    earlier exit.  Interrupts and timeouts never leave a process alive;
-    an interrupted search still leaves the salvaged best-so-far fb for a
+
+#: msieve's own stage-1 CPU-time budget for the full default range
+#: (poly_param.c prebuilt_params_deg{4,5,6}, deadline column, seconds),
+#: which the default search prints as "poly select deadline".  yagfu
+#: replicates the table to size quality-gated search blocks up front.
+_POLY_DEADLINE = {
+    4: [(100, 12 * 60), (105, 23 * 60), (110, 45 * 60), (115, 90 * 60),
+        (120, 180 * 60), (125, 8 * 3600)],
+    5: [(100, 12 * 60), (105, 23 * 60), (110, 45 * 60), (115, 90 * 60),
+        (120, 180 * 60), (125, 360 * 60), (130, 720 * 60),
+        (135, 1320 * 60), (140, 2520 * 60), (145, 4900 * 60),
+        (150, 9000 * 60)] + [(d, 300 * 3600) for d in
+                             (159, 165, 170, 175, 180, 185, 190, 197,
+                              200, 205, 210, 215, 220)],
+    6: [(200, 300 * 3600), (205, 300 * 3600), (230, 300 * 3600),
+        (235, 300 * 3600), (305, 300 * 3600), (310, 300 * 3600)],
+}
+
+
+def _poly_deadline_s(digits: float) -> int:
+    """msieve's stage-1 deadline (CPU seconds) for this digit count:
+    exponential interpolation between the surrounding table rows, clamped
+    to the end rows (matches what msieve prints to within ~0.1%)."""
+    degree = 4 if digits < 108 else (5 if digits < 220 else 6)
+    table = _POLY_DEADLINE[degree]
+    if digits <= table[0][0]:
+        return table[0][1]
+    if digits >= table[-1][0]:
+        return table[-1][1]
+    for d, t in table:
+        if digits == d:
+            return t
+    for (d0, t0), (d1, t1) in zip(table, table[1:]):
+        if digits < d1:
+            j, k = digits - d0, d1 - digits
+            # msieve stores the interpolated value in a uint32: truncate,
+            # don't round, or deadlines land 1s off its printed value
+            return int(math.exp((math.log(t0) * k + math.log(t1) * j)
+                                / (d1 - d0)))
+    return table[-1][1]
+
+
+class PolyselectJob:
+    """msieve -np polynomial search that runs until the polynomial is
+    actually good, not merely until a timer fires.
+
+    Default (no explicit --poly-budget): the leading-coefficient range is
+    searched in naturally-completing blocks.  Each round hands every card
+    a fresh, disjoint slice sized so the round lasts about poly_budget()
+    (growing x4 per round); every process exits on its own, and the best
+    combined E across cards is compared against the bar msieve itself
+    prints ("expecting poly E from X to > Y").  At or above the bar the
+    search stops early; below it, the next round starts where the last
+    ended — blocks never overlap, so a continuation never re-searches
+    (the old budget-doubling ladder's flaw) — until the whole range has
+    been covered.  msieve logs no E until a process ends, which is why
+    the checkpoints are round boundaries rather than a watched file.
+
+    An explicit --poly-budget keeps the legacy shape instead: one search
+    over the whole default range, hard SIGINT at the cap, best-so-far
+    polynomial.  The CPU-engine retry uses the same legacy shape.
+
+    Multi-card: one process per card over its own slice, pinned via
+    CUDA_VISIBLE_DEVICES in a private poly-{i} subdir; the best
+    polynomial's fb/np.log are promoted to the workdir root, so run_nfs's
+    downstream stages and resume paths see exactly the single-process
+    layout.  Interrupts and timeouts never leave a process alive; an
+    interrupted search still leaves the salvaged best-so-far fb for a
     rerun to reuse.
     """
 
@@ -274,11 +351,12 @@ class PolyselectJob:
         self.engine = engine
         self._engine_retried = False
         self.budget = poly_budget(len(str(n)), ctx.poly_budget_s)
-        # an explicit --poly-budget is the total wall cap; otherwise the
-        # estimate above is informational and POLY_MAX_WAIT_S applies
-        cap = ctx.poly_budget_s if (
-            ctx.poly_budget_s is not None and ctx.poly_budget_s > 0
-        ) else POLY_MAX_WAIT_S
+        # an explicit --poly-budget is a hard cap on one full-range
+        # search; otherwise the quality-gated ladder applies and no cap
+        # exists (the range itself is the bound)
+        self._hard_cap = (ctx.poly_budget_s is not None
+                          and ctx.poly_budget_s > 0)
+        cap = self.budget if self._hard_cap else POLY_MAX_WAIT_S
         self.fb: dict[str, str] | None = None
         self.poly_e: float | None = None
         self.poly_method: str | None = None
@@ -287,36 +365,83 @@ class PolyselectJob:
         self._t0 = time.monotonic()
         self._deadline_at = self._t0 + cap
         self._cap_logged = False
-        # [(subdir, process)]: one private subdir per sharded card, or
-        # the bare workdir for a single-process search
+        # [(subdir, process)]: one private subdir per card in the ladder
+        # and sharded legacy modes, or the bare workdir for a single
+        # legacy search
         self._procs: list[tuple[Path, subprocess.Popen]] = []
-        self._shard(msieve)
-        if self.sharded:
-            ctx.log(f"nfs: polyselect sharded across {len(self._procs)} "
-                    f"GPUs (leading coeffs 1..{self._coeff_top:,} split "
-                    f"{len(self._procs)} ways, -t {self._threads} each, "
-                    f"~{fmt_dur(self.budget)} expected, cap {fmt_dur(cap)})")
+        self._coeff_top = _poly_coeff_max(n)
+        self.bar: float | None = None     # "expecting poly E from X"
+        self._cursor = 1                  # next unsearched leading coeff
+        self._round = 0
+        # one card's wall time for the full default range, from msieve's
+        # own stage-1 CPU budget (poly select deadline) — this is what
+        # sizes the ladder's blocks
+        threads = (self.ctx.threads if engine != "gpu_cubsort"
+                   else max(2, self.ctx.threads // len(self.ctx.devices)))
+        self._wall_full = _poly_deadline_s(math.log10(n)) / threads
+        if self._hard_cap:
+            self._shard(msieve)
+            if self.sharded:
+                ctx.log(f"nfs: polyselect sharded across {len(self._procs)} "
+                        f"GPUs (leading coeffs 1..{self._coeff_top:,} split "
+                        f"{len(self._procs)} ways, -t {self._threads} each, "
+                        f"~{fmt_dur(self.budget)} expected, cap {fmt_dur(cap)})")
+            else:
+                ctx.log(f"nfs: polyselect (msieve -np, ~{fmt_dur(self.budget)} "
+                        f"expected, cap {fmt_dur(cap)})")
+            self._watch()
         else:
-            ctx.log(f"nfs: polyselect (msieve -np, ~{fmt_dur(self.budget)} "
-                    f"expected, cap {fmt_dur(cap)})")
-        self._watch()
+            self._spawn_round(msieve)
 
     def _shard(self, msieve) -> None:
-        """Spawn one msieve -np per card: the default coefficient range
-        split k ways when sharding, whole and unpinned-from-args on a lone
-        card (exact single-process behavior).  A sharded process gets a
-        fresh private subdir — msieve reads msieve.fb *before* searching,
-        and a leftover file for the same N would skip the search."""
+        """Legacy spawn: the default coefficient range split k ways
+        ([None]: one whole, unpinned-range process on a lone card).
+        Used by the hard-cap mode and the CPU-engine retry."""
         k = len(self.ctx.devices) if self.engine == "gpu_cubsort" else 1
-        rng = _poly_ranges(self.n, k)
+        self._spawn(msieve, _poly_ranges(self.n, k))
+
+    def _spawn_round(self, msieve) -> None:
+        """One ladder round: every card searches a fresh, disjoint block
+        of the remaining leading-coefficient range, sized so the round
+        lasts about the current time budget (x4 each round); the last
+        round splits whatever remains."""
+        k = len(self.ctx.devices) if self.engine == "gpu_cubsort" else 1
+        top = self._coeff_top
+        interval = self.budget * POLY_ROUND_GROWTH ** self._round
+        width = max(POLY_MIN_BLOCK, int(top * interval / self._wall_full))
+        remaining = top - self._cursor + 1
+        if k * width >= remaining:
+            ranges = _even_ranges(self._cursor, top, k)
+            note = "final round: the rest of the range"
+        else:
+            ranges = []
+            for i in range(k):
+                lo = self._cursor + i * width
+                if lo > top:
+                    break
+                ranges.append((lo, min(top, lo + width - 1)))
+            note = (f"~{fmt_dur(interval)} per round, "
+                    f"growing x{POLY_ROUND_GROWTH}")
+        self._round += 1
+        self._spawn(msieve, ranges)
+        self._cursor = ranges[-1][1] + 1
+        self.ctx.log(f"nfs: polyselect round {self._round} across "
+                     f"{len(ranges)} card(s): leading coeffs "
+                     f"{ranges[0][0]:,}..{ranges[-1][1]:,} ({note}; stops "
+                     f"as soon as E meets msieve's expectation)")
+
+    def _spawn(self, msieve, ranges) -> None:
+        """One msieve -np process per range entry: a fresh private
+        subdir per ranged process — msieve reads msieve.fb *before*
+        searching, and a leftover file for the same N would skip the
+        search — or the bare workdir for the [None] legacy entry."""
         self._procs = []
-        self._cards = list(zip(self.ctx.devices[:len(rng)], rng))
-        self.sharded = len(rng) > 1
-        self._coeff_top = _poly_coeff_max(self.n)
+        self._cards = list(zip(self.ctx.devices[:len(ranges)], ranges))
+        self.sharded = len(ranges) > 1
         # GPU engines cap their producer pool at 4 anyway; -t also sizes
         # the stage-2/3 CPU pool, so sharded processes divide the cores
-        self._threads = (str(self.ctx.threads) if len(rng) == 1 else
-                         str(max(2, self.ctx.threads // len(rng))))
+        self._threads = (str(self.ctx.threads) if len(ranges) == 1 else
+                         str(max(2, self.ctx.threads // len(ranges))))
         for i, (dev, r) in enumerate(self._cards):
             d = self.wd if r is None else self.wd / f"poly-{i}"
             if r is not None:
@@ -350,6 +475,8 @@ class PolyselectJob:
         nothing.  The wall cap restarts; True when a process runs."""
         if self._engine_retried or self.engine == "cpu_gerbicz":
             return False
+        if (self.wd / "msieve.fb").exists():
+            return False                  # an earlier round produced one
         if any(p.poll() is None for _, p in self._procs):
             return False                          # still running
         if self.sharded:
@@ -360,8 +487,6 @@ class PolyselectJob:
                     self.ctx.log(f"nfs: polyselect shard(s) {', '.join(empty)}"
                                  " found no polynomial; keeping the others'")
                 return False
-        elif (self.wd / "msieve.fb").exists():
-            return False
         self._engine_retried = True
         self.engine = "cpu_gerbicz"
         self._t0 = time.monotonic()
@@ -413,37 +538,71 @@ class PolyselectJob:
                 p.wait()
 
     def wait(self, timeout: float | None = None) -> "PolyselectJob":
-        """Block until every process ends (the wall-cap watchers SIGINT
-        them at the deadline so each saves its best-so-far polynomial),
-        merge the shards, and only a search where no card produced a
-        polynomial retries once on the CPU engine.  Any exception (Ctrl+C
-        included) tears the processes down and salvages the best-so-far
-        polynomial before propagating."""
+        """Block until the search yields a polynomial meeting msieve's own
+        expectation, the whole range has been searched, or — in the legacy
+        --poly-budget mode — the wall cap fires; then merge the winner.
+        A search where no card produced a polynomial retries once on the
+        CPU engine.  Any exception (Ctrl+C included) tears the processes
+        down and salvages the best-so-far polynomial before propagating."""
         try:
-            self._join(timeout)
-            if self.sharded:
+            if self._hard_cap:
+                self._join(timeout)
                 self._merge()
+            else:
+                self._ladder()
             if self.engine_retry():
                 self._join(timeout)
+                self._merge()
             self._finish()
         except BaseException:
             self.cancel(drop_poly=False)
             raise
         return self
 
-    def _join(self, timeout: float | None) -> None:
+    def _ladder(self) -> None:
+        """Round loop: search a block, keep the best polynomial, stop as
+        soon as it meets msieve's printed expectation — else grow the
+        block x4 over fresh ground until the range is exhausted."""
+        while True:
+            self.ctx.check_deadline()
+            self._join(None)              # blocks end on their own
+            self._merge()
+            best = _poly_e_from_log(self.wd)
+            if self.bar is None:
+                self.bar = next((b for b in map(_poly_e_bar_from_log,
+                                                (d for d, _ in self._procs))
+                                 if b is not None), None)
+            if best is not None:
+                if self.bar is None:
+                    self.ctx.log("nfs: polyselect: msieve printed no E "
+                                 "expectation; keeping the polynomial")
+                    return
+                if best >= self.bar:
+                    self.ctx.log(f"nfs: polyselect met msieve's expectation "
+                                 f"(E={best:.3e} >= {self.bar:.3e})")
+                    return
+            if self._cursor > self._coeff_top:
+                self.ctx.log("nfs: polyselect searched the whole leading-"
+                             "coefficient range; keeping the best "
+                             "polynomial found")
+                return
+            self._spawn_round(find_bin("msieve", self.ctx.bin_dir))
+
+    def _join(self, timeout: float | None = NP_TIMEOUT_S) -> None:
         for _, p in self._procs:
             try:
-                p.wait(timeout=timeout or NP_TIMEOUT_S)
+                p.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 self._term_kill(p)
 
     def _merge(self) -> None:
         """Promote the best-scoring shard result to the workdir root: the
         polynomial (msieve.fb) plus its log (np.log carries the
-        combined-E line the finish/resume paths parse).  Also called from
-        cancel(): msieve writes its best on SIGTERM, so an interrupted
-        search still salvages the best-so-far polynomial."""
+        combined-E line the finish/resume paths parse).  A better
+        polynomial already at the root — the ladder's incumbent from an
+        earlier round — is never displaced.  Also called from cancel():
+        msieve writes its best on SIGTERM, so an interrupted search still
+        salvages the best-so-far polynomial."""
         scored = []
         for d, _ in self._procs:
             if d == self.wd or not (d / "msieve.fb").exists():
@@ -451,7 +610,12 @@ class PolyselectJob:
             scored.append((_poly_e_from_log(d) or -1.0, d))
         if not scored:
             return
-        _, best = max(scored)
+        best_e, best = max(scored)
+        incumbent = _poly_e_from_log(self.wd)
+        if incumbent is not None and incumbent >= best_e:
+            self.ctx.log(f"nfs: polyselect keeps the incumbent "
+                         f"E={incumbent:g} over this round's {best_e:g}")
+            return
         es = ", ".join(f"{e:g}" if e >= 0 else "?" for e, _ in scored)
         self.ctx.log(f"nfs: polyselect shards E = [{es}]; best from "
                      f"{best.name}")
@@ -482,7 +646,7 @@ class PolyselectJob:
         for _, p in self._procs:
             if p.poll() is None:
                 self._term_kill(p)
-        if self.sharded:
+        if any(d != self.wd for d, _ in self._procs):
             self._merge()
         if all(p.poll() is not None for _, p in self._procs) \
                 and drop_poly and self.fb is None:
@@ -536,6 +700,16 @@ def _poly_e_from_log(wd: Path) -> float | None:
     if not p.exists():
         return None
     m = re.search(r"combined = ([\d.e+-]+)", read_log(p))
+    return float(m.group(1)) if m else None
+
+
+def _poly_e_bar_from_log(wd: Path) -> float | None:
+    """The lower bound of msieve's own E expectation for a completed
+    search ("expecting poly E from X to > Y"), or None when absent."""
+    p = wd / "np.log"
+    if not p.exists():
+        return None
+    m = re.search(r"expecting poly E from ([\d.e+-]+)", read_log(p))
     return float(m.group(1)) if m else None
 
 

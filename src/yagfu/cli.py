@@ -91,9 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "of the GPU's total VRAM; 0 = no cap, gpuecm2's own "
                          "free-memory budgeting)")
     ap.add_argument("--poly-budget", type=float, default=None,
-                    help="NFS polyselect total wall cap in seconds; the "
-                         "search otherwise runs to completion under a 2h "
-                         "cap (0 = same 2h default)")
+                    help="NFS polyselect hard wall cap in seconds: one "
+                         "full-range search, SIGINT at the cap, keep the "
+                         "best-so-far polynomial.  Without it the search "
+                         "runs quality-gated blocks (growing x4) until "
+                         "the best E meets the bar msieve itself prints "
+                         "or the coefficient range is exhausted")
     ap.add_argument("--topup-frac", type=float, default=1.0,
                     help="NFS relation target growth per filter round: "
                          "new = have + max(1.2x deficit, frac x have). GPU "

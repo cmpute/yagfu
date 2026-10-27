@@ -56,35 +56,40 @@ sieve (`target < 15 && digits ≤ 45`) — cheap insurance given the shallower p
 cuda-mpqs, at or above it to the GNFS pipeline; the default crossover is 105,
 extrapolated from measured total-wall times on an RTX 4090 (mpqs wins through
 c100: 117 s vs 167 s). NFS parameters come from a per-size anchor table
-(c70…c150, piecewise-linear), polyselect gets a wall-clock budget of
-`max(60 s, 8% of predicted sieve time)` enforced by cooperative SIGINT, and the
+(c70…c150, piecewise-linear), polyselect is quality-gated (below), and the
 sieving loop is closed by msieve's filter verdict ("found N cycles, need M") with
 geometric relation top-ups. The SIQS-vs-NFS choice is made once, after the ECM
 ladder, on the cofactor that actually reaches the sieves.
 
 **Polyselect (multi-GPU, inside the NFS stage).** With several devices the
-polynomial search shards one `msieve -np` process per card over disjoint
+polynomial search runs one `msieve -np` process per card over disjoint
 leading-coefficient ranges — msieve's default range (`1 .. N^(1/(d(d−1)))/3`,
-replicated in `nfs.py`) split k ways; only multiples of msieve's ad-sieve
+replicated in `nfs.py`); only multiples of msieve's ad-sieve
 multiplier are ever searched and each process aligns its begin upward, so the
 slices partition the searched set exactly, with zero cross-card traffic. Each
 process gets its own `poly-*` subdir and `CUDA_VISIBLE_DEVICES` pin, `-t`
 divided across the cards (the GPU engine caps its producer pool at 4 anyway;
-`-t` also sizes the stage-2/3 CPU pool), and the same total wall cap as before
-(2h, or `--poly-budget`) — four cards buy four-fold range coverage under the
-cap, i.e. roughly a 4× speedup at equal quality. When every process ends, the
-shard with the best `combined` E wins and its `msieve.fb`/`np.log` are promoted
+`-t` also sizes the stage-2/3 CPU pool). The default search is
+**quality-gated**: the range is covered in naturally-completing blocks —
+round 1 lasts about `max(60 s, 8% of predicted sieve time)`, each later round
+grows ×4 — and after every round the best `combined` E is compared against
+the bar msieve itself prints ("expecting poly E from X to > Y"). At or above
+the bar the search stops early; below it, the next round continues over
+never-before-searched ground until the whole range is exhausted (msieve logs
+no E until a process ends, which is why the checkpoints are round
+boundaries). The winning `msieve.fb`/`np.log` are promoted
 to the NFS workdir root, which is exactly the single-process layout the
-downstream stages and resume paths expect. A shard that finds nothing is only
-retried on the CPU Gerbicz engine when *no* shard produced a polynomial (an
-unlucky empty slice is not worth CPU hours when the others hold a polynomial).
-An interrupted search is torn down cooperatively — SIGINT at the cap, SIGTERM on
+downstream stages and resume paths expect; a better incumbent is never
+displaced by a later, worse round. A shard that finds nothing is only
+retried on the CPU Gerbicz engine when *no* round produced a polynomial (an
+unlucky empty block is not worth CPU hours).
+An interrupted search is torn down cooperatively — SIGTERM on
 Ctrl+C — and msieve saves its best-so-far candidate on the way out, so a rerun
 with the same workdir reuses the salvaged polynomial instead of re-searching.
 (The pre-port GPU stage-1 emitted no candidates at c110–c119; the trunk-port
 engine does — verified at c110 and c137.)
-With one device the search runs exactly the single-process command line of
-old, in the bare NFS workdir.
+`--poly-budget` reverts to the legacy shape: one full-range search under a
+hard wall cap, best-so-far polynomial at the cap.
 
 **Multi-GPU.** `--device` takes a comma-separated list (`--device 0,1` — the
 ordinals mean what they mean to CUDA in your shell, i.e. indices into
@@ -108,10 +113,10 @@ including gpuecm2 stage 2 (its CLI has no device flag) and the GPU polyselect
   a single process, and a failed cluster falls back to the solo run.
   All inter-card traffic is relations over TCP through host memory — no
   NVLink/peer-to-peer GPU path is used anywhere.
-* **Polyselect** shards one `msieve -np` per card over disjoint
-  leading-coefficient ranges (best polynomial wins); **GPU Lanczos and NFS
-  sqrt** are single-card (first device): this msieve build has no multi-GPU
-  Lanczos without an MPI build.
+* **Polyselect** runs one `msieve -np` per card over disjoint, quality-gated
+  leading-coefficient blocks (best polynomial wins; see above); **GPU Lanczos
+  and NFS sqrt** are single-card (first device): this msieve build has no
+  multi-GPU Lanczos without an MPI build.
 
 
 Primality: Baillie–PSW (base-2 strong MR + strong Lucas, Selfridge method A);
