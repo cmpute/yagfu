@@ -423,7 +423,10 @@ class PolyselectJob:
         best_val: float | None = None
         best_at = 0.0
         while True:
-            if all(p.poll() is not None for _, p in self._procs):
+            # list(), not a generator: all() would short-circuit at the
+            # first live process and never poll (and reap) exited shards,
+            # leaving zombies behind for the whole search
+            if all([p.poll() is not None for _, p in self._procs]):
                 return
             if self.bar is None:
                 for d, _ in self._procs:
@@ -569,7 +572,7 @@ class PolyselectJob:
                 self._term_kill(p)
         if self.sharded:
             self._merge()
-        if all(p.poll() is not None for _, p in self._procs) \
+        if all([p.poll() is not None for _, p in self._procs]) \
                 and drop_poly and self.fb is None:
             for name in ("msieve.fb", "np.log"):
                 try:
