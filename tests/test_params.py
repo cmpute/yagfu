@@ -8,6 +8,7 @@ from yagfu.params import (
     nfs_params,
     poly_budget,
     sieve_time_estimate,
+    snfs_gnfs_equiv,
     snfs_params,
 )
 
@@ -114,3 +115,10 @@ def test_snfs_params_track_factordb_jobs():
     rlim, alim, lpb, logI = snfs_params(269.75)
     assert rlim == alim and 80_000_000 <= rlim <= 110_000_000
     assert lpb == 31 and logI == 14
+
+
+def test_snfs_gnfs_equiv():
+    # yafu's empirical rule; factordb's own page text pins the example:
+    # difficulty 169.75 "costs about as much as GNFS on a 125-digit number"
+    assert snfs_gnfs_equiv(169.75) == 125.06
+    assert snfs_gnfs_equiv(269.75) == 181.06

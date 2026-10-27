@@ -14,8 +14,8 @@ budget, cumulative ECM work ledger, independent final algorithm selector):
        msieve+cuda-sieve (GNFS) at/above it; each is the other's fallback.
        With a supplied SNFS polynomial (factordb's -snfs suggestion, or
        --snfs-job) the polynomial's number is sieved with it instead — the
-       ECM pretest sized by the SNFS difficulty — and only a failed SNFS
-       run falls back to the usual selection.
+       ECM pretest priced by the difficulty's GNFS equivalent — and only
+       a failed SNFS run falls back to the usual selection.
        In ecm-only mode the sieves are never reached: the ladder climbs
        every level to its full budget and then keeps sampling the t65
        level forever, until the number is factored or the user interrupts.
@@ -46,6 +46,7 @@ from .ecmledger import (
     target_depth,
 )
 from .fmt import fmt_count, fmt_dur
+from .params import snfs_gnfs_equiv
 from .primes import SPRP_2761_LIMIT, is_probable_prime
 
 if TYPE_CHECKING:
@@ -286,13 +287,18 @@ class Engine:
         is then sampled forever until the number factors or the user
         interrupts.
 
-        With an SNFS suggestion the pretest is sized by the SNFS
-        difficulty, not the raw digit count: an SNFS-170 number of 270
-        digits needs a t170 pretest, not a t270 one.
+        With an SNFS suggestion the pretest is priced against what the
+        sieving job actually costs: the yafu GNFS-equivalent of the
+        scaled difficulty (params.snfs_gnfs_equiv, 0.56 D + 30), not the
+        raw digit count and not the difficulty itself.  A c135 record
+        with an SNFS-170 suggestion is a ~c125-equivalent job and gets a
+        t38-class pretest, not t52.
         """
         ctx = self.ctx
-        # the effective size: scaled difficulty when sieving SNFS
-        sz = snfs.scaled if snfs is not None else _digits(m)
+        # the effective size: GNFS-equivalent of the difficulty when
+        # sieving SNFS, the digit count otherwise
+        sz = (snfs_gnfs_equiv(snfs.scaled) if snfs is not None
+              else _digits(m))
         top = NUM_LEVELS - 1
         if ctx.ecm_only:
             ctx.log(f"ecm: c{_digits(m)}, ecm-only: every level to full "
@@ -300,7 +306,8 @@ class Engine:
         else:
             target = min(target_depth(sz, ctx.plan), 65.0)
             ctx.log(f"ecm: c{_digits(m)}"
-                    + (f" (snfs difficulty {sz:g})" if snfs is not None
+                    + (f" (snfs {snfs.scaled:g} ~ gnfs c{sz:g})"
+                       if snfs is not None
                        else "")
                     + f", plan={ctx.plan}, target=t{target:.1f}")
 

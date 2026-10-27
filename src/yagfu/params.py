@@ -104,6 +104,29 @@ def snfs_params(difficulty: float) -> tuple[int, int, int, int]:
 
 
 # --------------------------------------------------------------------------
+# SNFS difficulty -> GNFS-equivalent digit count.
+#
+# The two scales are different: SNFS exploits small-coefficient
+# polynomials, so the same difficulty is easier than GNFS.  yafu's
+# empirical conversion (audited from the yafu source):
+#
+#     gnfs_digits ~= 0.56 * snfs_difficulty + 30
+#
+# factordb's record pages state exactly this: the 859465723^19-1
+# suggestion has difficulty 169.75 yet "costs about as much as GNFS on a
+# 125-digit number" (0.56 * 169.75 + 30 = 125.1).  This conversion is for
+# *cost comparisons* only — the ECM pretest sizes itself against what the
+# sieving job actually costs, and a future SNFS-vs-GNFS choice would use
+# it too.  The sieving parameters themselves stay keyed on the SNFS
+# difficulty (snfs_params above), like every SNFS parameter table.
+# --------------------------------------------------------------------------
+
+def snfs_gnfs_equiv(difficulty: float) -> float:
+    """GNFS-equivalent digit count of an SNFS job (yafu: 0.56 D + 30)."""
+    return 0.56 * difficulty + 30.0
+
+
+# --------------------------------------------------------------------------
 # NFS polyselect budget: YAFU allots 8% of predicted GNFS time; with GPU
 # sieving that degenerates to ~8% of the predicted SIEVE time, floored at
 # 60 s (stage-1 space exhaustion + rootopt drain).  T_sieve anchored on the

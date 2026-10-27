@@ -282,11 +282,16 @@ polynomials with difficulty scores. When the record being factored carries one
 * sieves the polynomial factordb ranks first — no local SNFS polynomial search,
   no GNFS polyselect; the special-q side follows the suggestion (`--sq-side 0`
   for rational-side polys);
-* sizes the ECM pretest and the sieve parameters (rlim/alim/lpbr/logI) by the
-  SNFS *scaled difficulty* instead of the raw digit count — a c270 number at
-  difficulty 170 gets a t170 pretest and c170-class sieve parameters
-  (`SNFS_PARAMS_ANCHORS` in `params.py`; initial anchors, the two
-  factordb-generated jobs pin the ends, not measured calibrations);
+* sizes the ECM pretest by the GNFS-equivalent of the suggestion's scaled
+  difficulty, using yafu's empirical conversion `gnfs ≈ 0.56·D + 30`
+  (factordb states the same thing on its record pages: the
+  `859465723^19−1` suggestion has difficulty 169.75 yet "costs about as
+  much as GNFS on a 125-digit number").  The pretest then breaks even
+  against what the sieving job actually costs.  The sieving parameters
+  themselves (rlim/alim/lpbr/logI) stay keyed on the SNFS difficulty,
+  like every SNFS parameter table (`SNFS_PARAMS_ANCHORS` in `params.py`;
+  initial anchors, the two factordb-generated jobs pin the ends, not
+  measured calibrations);
 * absorbs the factors of the original number, stripping whatever the ECM
   pretest already found (sieving the polynomial's number costs the same as
   sieving the cofactor, and covers both).

@@ -143,9 +143,10 @@ def test_snfs_failure_falls_back_to_siqs(monkeypatch, tmp_path):
     assert calls["siqs"] == [QB * QC]
 
 
-def test_ecm_pretest_sized_by_snfs_difficulty(monkeypatch, tmp_path):
-    """The ladder's target comes from the scaled difficulty, not the raw
-    digit count (a c91 number at difficulty 60 logs a t60 plan)."""
+def test_ecm_pretest_sized_by_gnfs_equivalent(monkeypatch, tmp_path):
+    """The ladder's target is priced by the difficulty's yafu GNFS
+    equivalent (0.56 D + 30), not the raw digit count and not the
+    difficulty itself: scaled 60 -> gnfs c63.6 -> t19.6 at normal plan."""
     log = tmp_path / "t.log"
 
     def fake_nfs(self, n, wd, snfs=None):
@@ -157,5 +158,5 @@ def test_ecm_pretest_sized_by_snfs_difficulty(monkeypatch, tmp_path):
     res = eng.factor(N3, tmp_path, snfs=_job(N3, scaled=60.0))
     assert res.complete, res.error
     text = log.read_text()
-    assert "snfs difficulty 60" in text
-    assert "target=t" in text
+    assert "snfs 60 ~ gnfs c63.6" in text
+    assert "target=t19.6" in text

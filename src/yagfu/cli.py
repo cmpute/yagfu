@@ -22,6 +22,7 @@ from pathlib import Path
 from . import __version__
 from .backends.nfs import parse_snfs_suggestion, snfs_job_from_file
 from .config import RunContext, cleanup_workdir, resolve_devices
+from .params import snfs_gnfs_equiv
 from .engine import Engine, FactorResult, FoundFactor
 from .fdb import (
     ECM_REPORT_MAX_DIGITS,
@@ -266,7 +267,8 @@ def factor_with_db(n: int, client: FactorDbClient, engine: Engine, wd: Path,
             engine.ctx.log(f"snfs: factordb suggests "
                            f"{snfs.form or 'a polynomial'} "
                            f"(difficulty {snfs.difficulty:g}, scaled "
-                           f"{snfs.scaled:g}{e})")
+                           f"{snfs.scaled:g} ~ gnfs "
+                           f"c{snfs_gnfs_equiv(snfs.scaled):g}{e})")
 
     if to_factor > 1:
         res = engine.factor(to_factor, wd, snfs=snfs)
