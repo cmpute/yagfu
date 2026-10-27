@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -17,6 +19,21 @@ def _nproc() -> int:
         return max(1, os.cpu_count() or 1)
 
 
+def _list_gpu_ords() -> list[str]:
+    """Physical ordinals of every GPU nvidia-smi sees, ascending.
+
+    Empty when nvidia-smi is missing, fails, or lists nothing — callers
+    decide whether that is fatal.
+    """
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return sorted(set(re.findall(r"^GPU (\d+):", out, re.MULTILINE)),
+                  key=int)
+
+
 def resolve_devices(specs) -> tuple[str, ...]:
     """Translate --device ordinals into physical device ids.
 
@@ -25,13 +42,30 @@ def resolve_devices(specs) -> tuple[str, ...]:
     physical ids otherwise.  Every backend subprocess is instead pinned with
     CUDA_VISIBLE_DEVICES=<physical id>, which needs the physical id; UUID
     entries pass through untouched (both CUDA and nvidia-smi -i accept
-    them).  Raises ValueError on anything that cannot be resolved.
+    them).  The special spec "all" expands to every card this shell can
+    see (the CUDA_VISIBLE_DEVICES entries when set, else nvidia-smi's
+    list) and must be the only spec.  Raises ValueError on anything that
+    cannot be resolved.
     """
     ambient = os.environ.get("CUDA_VISIBLE_DEVICES")
     entries = ([e.strip() for e in ambient.split(",") if e.strip()]
                if ambient is not None else [])
     if ambient is not None and not entries:
         raise ValueError("CUDA_VISIBLE_DEVICES is set but hides every GPU")
+
+    specs = [str(s).strip() for s in specs]
+    if any(s.lower() == "all" for s in specs):
+        if len(specs) != 1:
+            raise ValueError('"all" cannot be mixed with explicit devices')
+        if ambient is not None:
+            return tuple(entries)
+        all_ords = _list_gpu_ords()
+        if not all_ords:
+            raise ValueError(
+                '--device all: could not enumerate GPUs (nvidia-smi missing '
+                'or lists none); pass explicit ordinals instead')
+        return tuple(all_ords)
+
     out = []
     for spec in specs:
         s = str(spec).strip()

@@ -57,6 +57,38 @@ def test_resolve_devices_hidden_all(monkeypatch):
         resolve_devices(("0",))
 
 
+def test_resolve_devices_all_ambient(monkeypatch):
+    # "all" inside a restricted shell = the visible entries, in order
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    assert resolve_devices(("all",)) == ("2", "3")
+    assert resolve_devices(("ALL",)) == ("2", "3")  # case-insensitive
+
+
+def test_resolve_devices_all_enumerates(monkeypatch):
+    import yagfu.config as config
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(config, "_list_gpu_ords", lambda: ["0", "1", "2", "3"])
+    assert resolve_devices(("all",)) == ("0", "1", "2", "3")
+
+
+def test_resolve_devices_all_no_gpus(monkeypatch):
+    import yagfu.config as config
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(config, "_list_gpu_ords", lambda: [])
+    with pytest.raises(ValueError, match="enumerate"):
+        resolve_devices(("all",))
+
+
+def test_resolve_devices_all_mixed_rejected(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    with pytest.raises(ValueError, match="mixed"):
+        resolve_devices(("0", "all"))
+    with pytest.raises(ValueError, match="mixed"):
+        resolve_devices(("all", "all"))
+
+
 def test_pin_env():
     ctx = RunContext(device="3")
     assert ctx.pin_env() == {"CUDA_VISIBLE_DEVICES": "3"}

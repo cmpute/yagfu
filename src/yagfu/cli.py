@@ -53,11 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--xover", type=int, default=105,
                     help="SIQS -> NFS crossover in digits (default 105)")
     ap.add_argument("--device", default="0",
-                    help="CUDA device, or a comma-separated list to use "
-                         "several cards: ECM stage 1 and NFS sieving fan "
-                         "out across them; polyselect, ECM stage 2, "
-                         "Lanczos and SIQS use the first device (SIQS "
-                         "goes cluster across all cards from c80)")
+                    help='CUDA device, a comma-separated list, or "all" '
+                         "for every card visible in this shell: ECM stage "
+                         "1, NFS sieving and polyselect fan out across "
+                         "them; ECM stage 2 and Lanczos use the first "
+                         "device (SIQS goes cluster across all cards "
+                         "from c80)")
     ap.add_argument("--threads", type=int, default=None,
                     help="CPU threads for msieve stages (default nproc-2)")
     ap.add_argument("--sieve-procs", type=int, default=1,

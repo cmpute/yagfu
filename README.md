@@ -88,7 +88,9 @@ old, in the bare NFS workdir.
 
 **Multi-GPU.** `--device` takes a comma-separated list (`--device 0,1` — the
 ordinals mean what they mean to CUDA in your shell, i.e. indices into
-`CUDA_VISIBLE_DEVICES` when it is set). Every backend subprocess is pinned to
+`CUDA_VISIBLE_DEVICES` when it is set) or the form `--device all`, which
+expands to every card visible in this shell (the `CUDA_VISIBLE_DEVICES`
+entries when set, else nvidia-smi's list). Every backend subprocess is pinned to
 one physical card via `CUDA_VISIBLE_DEVICES` and addresses it as ordinal 0,
 which is also what makes single-card `--device 3` land every stage —
 including gpuecm2 stage 2 (its CLI has no device flag) and the GPU polyselect
