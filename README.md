@@ -55,11 +55,20 @@ sieve (`target < 15 && digits ≤ 45`) — cheap insurance given the shallower p
 **Independent final selector.** Below the crossover digit count the job goes to
 cuda-mpqs, at or above it to the GNFS pipeline; the default crossover is 105,
 extrapolated from measured total-wall times on an RTX 4090 (mpqs wins through
-c100: 117 s vs 167 s). NFS parameters come from a per-size anchor table
-(c70…c150, piecewise-linear), polyselect is quality-gated (below), and the
-sieving loop is closed by msieve's filter verdict ("found N cycles, need M") with
-geometric relation top-ups. The SIQS-vs-NFS choice is made once, after the ECM
-ladder, on the cofactor that actually reaches the sieves.
+c100: 117 s vs 167 s). NFS sieve parameters (rlim/alim/lpb/logI) come from a
+per-size anchor table (c70…c150, piecewise-linear); how many relations a job
+needs is not tabulated — the sieving loop derives it from measurements. The
+sieving loop is a reactive pipeline: small waves keep one
+`cuda-sieve` running continuously and queue for append while `msieve -nc1`
+filters in the background (msieve.dat only grows while nothing reads it).
+Every verdict lands the moment it exits — the next wave is aimed at the
+refreshed rung, and "found N cycles, need M" kills the wave in flight and
+drops the queue, so oversieving past the enough-point costs one wave, not one
+band. How much data the next -nc1 waits for is one topup step past the last
+filter (the ladder), capped by the requirement extrapolated from the measured
+excess-vs-unique curve — -nc1 re-reads everything, so the filter count, not
+the wave count, is the serial cost. The SIQS-vs-NFS choice is made once, after
+the ECM ladder, on the cofactor that actually reaches the sieves.
 
 **Polyselect (multi-GPU, inside the NFS stage).** With several devices the
 polynomial search runs one `msieve -np` process per card over disjoint

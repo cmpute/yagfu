@@ -22,9 +22,9 @@ def test_mpqs_lp1():
 
 
 def test_nfs_params_anchors_exact():
-    assert nfs_params(70) == (350_000, 350_000, 23, 12, 800_000)
-    assert nfs_params(100) == (3_000_000, 3_000_000, 27, 14, 15_000_000)
-    assert nfs_params(150) == (100_000_000, 100_000_000, 31, 14, 2_000_000_000)
+    assert nfs_params(70) == (350_000, 350_000, 23, 12)
+    assert nfs_params(100) == (3_000_000, 3_000_000, 27, 14)
+    assert nfs_params(150) == (100_000_000, 100_000_000, 31, 14)
 
 
 def test_nfs_params_clamps():
@@ -36,12 +36,12 @@ def test_nfs_params_clamps():
 def test_nfs_params_monotone_interpolation():
     prev = 0
     for d in range(70, 150, 5):
-        rlim, alim, lpb, logI, raw = nfs_params(d)
+        rlim, alim, lpb, logI = nfs_params(d)
         assert rlim == alim
         assert 12 <= logI <= 14
         assert lpb >= 23
-        assert raw >= prev
-        prev = raw
+        assert rlim >= prev
+        prev = rlim
 
 
 def test_poly_budget():

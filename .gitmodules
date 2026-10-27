@@ -21,4 +21,4 @@
 [submodule "msieve-cuda"]
 	path = msieve-cuda
 	url = https://github.com/cmpute/msieve-cuda/
-	branch = msieve-lacuda-nfsathome
+	branch = yagfu

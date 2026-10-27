@@ -11,12 +11,19 @@ Pipeline shape:
   (an explicit --poly-budget reverts to a hard wall cap).  Classic
   base-m polynomial below that (this msieve build emits no GPU stage-1
   candidates under ~85 digits).
-* sieving: cuda-sieve bands with an adaptive width, special-q from alim/2,
-  merged into msieve.dat; the msieve -nc1 verdict drives the loop and runs
-  in the background, overlapped with the next band (it only ever reads
-  msieve.dat, and a band is appended only after the verdict covering the
-  data so far has been collected — so the stop check stays exact while
-  the filter cost hides under GPU time).
+* sieving: cuda-sieve waves with an adaptive width, special-q from alim/2,
+  streamed to per-wave files and merged into msieve.dat; the msieve -nc1
+  verdict drives the loop and runs in the background (it only ever reads
+  msieve.dat, and msieve.dat only grows while no -nc1 is reading it — so
+  the stop check stays exact while the filter cost hides under GPU time).
+  One wave is always in flight, so a verdict that lands mid-wave acts on
+  the NEXT wave immediately, and "enough" additionally kills the wave in
+  flight and drops the queue: oversieving past the enough-point costs at
+  most one wave.  How much data the next -nc1 waits for is the estimator's
+  rung: one topup step past the last filter (the ladder), capped by the
+  requirement extrapolated from the measured excess-vs-unique curve —
+  -nc1 re-reads everything each round, so the filter count, not the wave
+  count, is the serial cost.
 * postprocessing: -nc2 matbuild, GPU Lanczos -nc2, sqrt -nc3.
 """
 
@@ -33,6 +40,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 from ..config import RunContext
 from ..fmt import fmt_count, fmt_dur
@@ -171,9 +179,10 @@ def _job_to_msieve_fb(job_text: str) -> tuple[str, str]:
 # sieving helpers
 # ---------------------------------------------------------------------------
 
-def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
+def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, tag: str,
                        timeout: float, devices: tuple[str, ...] = ("0",),
-                       beat=None, beat_s: float = 120.0):
+                       beat=None, beat_s: float = 120.0, stop=None,
+                       poll_s: float = 2.0):
     """Split one q band into chunks running concurrently, one GPU each.
 
     n_procs is per device: chunk i round-robins onto devices[i % len]
@@ -182,9 +191,12 @@ def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
     entries are physical ids.
 
     cmd_base ends with a (q_lo, q_hi) placeholder tuple for --qrange.
+    Output files are tagged `tag` (the wave id), not a round number.
     `beat(elapsed_s)` fires every beat_s while the band runs (long bands
-    would otherwise be silent for minutes).  Returns (rc, wall,
-    [relation file names]).
+    would otherwise be silent for minutes).  `stop` () -> bool and
+    `poll_s` pass through to run_procs_parallel: the wave re-checks stop
+    every poll_s and is killed wholesale when it fires.  Returns (rc,
+    wall, [relation file names]).
     """
     q_lo, q_hi = cmd_base[-1]
     base = cmd_base[:-1]
@@ -196,18 +208,104 @@ def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, round_idx: int,
     for i in range(n_procs):
         a = q_lo + i * chunk
         b = q_hi if i == n_procs - 1 else a + chunk
-        rels = f"band{round_idx}.{i}.rels"
+        rels = f"{tag}.{i}.rels"
         names.append(rels)
         cmd = [str(c) for c in base] + ["--qrange", f"{a}:{b}",
                                         "--relations", rels,
-                                        "--log", f"band{round_idx}.{i}.log"]
-        jobs.append((cmd, cwd / f"band{round_idx}.{i}.stdout", None))
+                                        "--log", f"{tag}.{i}.log"]
+        jobs.append((cmd, cwd / f"{tag}.{i}.stdout", None))
         envs.append({"CUDA_VISIBLE_DEVICES": devices[i % k]})
     results = run_procs_parallel(jobs, cwd, timeout, beat=beat,
-                                 beat_s=beat_s, envs=envs)
+                                 beat_s=beat_s, stop=stop, poll_s=poll_s,
+                                 envs=envs)
     rc = max(rc for rc, _ in results)
     wall = max(w for _, w in results)
     return rc, wall, names
+
+
+#: give up on convergence after this many shortfall verdicts; the ladder
+#: from the probe to a c150+ requirement is ~11-12 rungs, so leave room
+FILTER_MAX = 30
+
+
+def _read_verdict(text: str) -> dict:
+    """Parse one -nc1 -v log: the stop/shortfall verdict plus the raw
+    measurements the rung estimator consumes.  Everything but the verdict
+    lines is optional (older msieve builds, sparse logs); the field names
+    follow msieve-cuda's filter output:
+      found <D> duplicates and <U> unique relations     duplicate.c
+      keeping <J> ideals with weight <= 200,
+        target excess is <T>                            common/filter/singleton.c
+      pass <k>: found <S> singletons; <R> relations
+        and <I> ideals remain                           gnfs/filter/singleton.c
+      found <X> cycles, need <Y> / filtering wants <N> more relations
+    """
+    v: dict = {}
+    m = re.search(r"found (\d+) cycles, need (\d+)", text)
+    if m:
+        v["cycles"], v["need"] = int(m.group(1)), int(m.group(2))
+    m = re.search(r"filtering wants (\d+) more relations", text)
+    if m:
+        v["hint"] = int(m.group(1))
+    m = re.search(r"found (\d+) duplicates and (\d+) unique relations", text)
+    if m:
+        v["unique"] = int(m.group(2))
+    ms = re.findall(r"keeping (\d+) ideals with weight <= \d+, "
+                    r"target excess is (\d+)", text)
+    if ms:
+        v["ideals_kept"], v["target_excess"] = (int(x) for x in ms[-1])
+    ms = re.findall(r"pass \d+: found \d+ singletons; (\d+) relations "
+                    r"and (\d+) ideals remain", text)
+    if ms:
+        v["pass_relations"], v["pass_ideals"] = (int(x) for x in ms[-1])
+    return v
+
+
+def _measured_excess(v: dict) -> int | None:
+    """Excess at the filter's fixed point: exact after singleton removal
+    when the pass lines are there, else unique minus weight-kept ideals
+    (pre-singleton; a monotone stand-in with the same crossover)."""
+    if "pass_relations" in v:
+        return v["pass_relations"] - v["pass_ideals"]
+    if "unique" in v and "ideals_kept" in v:
+        return v["unique"] - v["ideals_kept"]
+    return None
+
+
+def _filter_rung(filters: list[tuple], topup_frac: float,
+                 safety: float) -> tuple[int | None, str]:
+    """When to run the next -nc1, as an appended-relation threshold.
+
+    The base rung is the ladder: one topup step past the last filter's
+    snapshot — each -nc1 re-reads everything, so filter count is the
+    serial cost and steps stay geometric.  Once at least two filters
+    measured the excess-vs-unique curve and it has turned over
+    (positive slope), the rung is capped by the extrapolated requirement:
+    the ideal count saturates, so the curve is convex and the secant
+    underestimates the slope ahead — linear extrapolation to excess ==
+    target_excess lands on the high side of the true crossover, which is
+    the safe side (surplus sieving is cheap and hidden; falling short
+    costs another full -nc1 pass).  `safety` covers the residual between
+    purge excess and merge-stage cycles.  Returns (rung, "ladder"|"estimate").
+    """
+    if not filters:
+        return None, "ladder"           # probe: filter as soon as anything lands
+    _, raw, unique, excess, texc = filters[-1]
+    # the 1.02 floor keeps a degenerate topup from refiltering the same
+    # data forever
+    ladder = max(int(raw * 1.02), int(raw * (1.0 + topup_frac)))
+    if len(filters) < 2 or unique is None or excess is None or texc is None:
+        return ladder, "ladder"
+    _, _, u0, e0, _ = filters[-2]
+    if u0 is None or e0 is None or unique <= u0:
+        return ladder, "ladder"
+    slope = (excess - e0) / (unique - u0)
+    if slope <= 1e-3:
+        return ladder, "ladder"
+    u_need = unique + (texc - excess) / slope
+    ratio = min(1.0, max(0.5, unique / raw))     # measured unique/raw, floored
+    est = u_need / ratio * safety
+    return max(int(raw * 1.02), min(ladder, int(est))), "estimate"
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +319,7 @@ class NfsResult:
     stages: dict[str, float] = field(default_factory=dict)
     poly_e: float | None = None
     poly_method: str | None = None
-    params: tuple = ()               # (rlim, alim, lpb, logI, initial_raw)
+    params: tuple = ()               # (rlim, alim, lpb, logI)
     raw_relations: int = 0
     bands: int = 0
     error: str | None = None
@@ -664,9 +762,9 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
     wd.mkdir(parents=True, exist_ok=True)
     digits = len(str(n))
     nproc = str(ctx.threads)
-    rlim, alim, lpb, logI, initial_raw = res.params
+    rlim, alim, lpb, logI = res.params
     ctx.log(f"nfs: c{digits}, rlim={rlim:,}, alim={alim:,}, lpb={lpb}, "
-            f"logI={logI}, target_raw~{initial_raw:,}")
+            f"logI={logI}")
 
     # ---- stage 1: polynomial selection (or reuse from a previous run) ----
     t = time.monotonic()
@@ -731,228 +829,281 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
     (wd / "worktodo.ini").write_text(ini_text)
 
     # ---- stage 3: sieving + filtering feedback loop ----------------------
-    # resumable: the polynomial (job file) and every sieved relation
-    # (msieve.dat) survive a kill; nfs-state.json pins q_next/target/have
+    # Resumable: the polynomial (job file) and every sieved relation
+    # (msieve.dat) survive a kill; nfs-state.json pins q_next, the
+    # appended count and the filter-measurement log; sieved-but-not-yet-
+    # appended waves are the w*.rels files still on disk.
+    #
+    # The loop is a small event pump keeping one wave and at most one
+    # -nc1 in flight:
+    #   * a wave streams relations into its own files; msieve.dat only
+    #     grows while no -nc1 is reading it, so the queue absorbs the
+    #     lag and the stop check stays exact;
+    #   * a verdict takes effect the moment it lands: the next wave is
+    #     aimed at the refreshed rung, and "enough" kills the wave in
+    #     flight (its output would be dropped anyway) and empties the
+    #     queue — oversieving past the enough-point costs at most one
+    #     wave, not one band;
+    #   * the next -nc1 waits for the estimator's rung: one topup step
+    #     past the last filter (the ladder), capped by the requirement
+    #     extrapolated from the measured excess-vs-unique curve.  -nc1
+    #     re-reads everything each round, so the filter count — not the
+    #     wave count — is the serial cost.
     state = _load_nfs_state(wd, n)
     if state is not None and not (wd / "msieve.dat").exists():
         state = None                # checkpoint without its relations: redo
     q_first = alim // 2
+    S = SimpleNamespace(q_next=q_first, q_cap=6 * q_first, appended=0,
+                        filters=[], filter_seq=0, wave_seq=0,
+                        last_cnt=0, last_width=0)
+    queued: list[tuple[list[str], int]] = []   # sieved, not appended yet
     if state is None:
-        q_next = q_first
-        q_cap = 6 * q_first
-        target_raw = initial_raw
-        have_raw = 0
-        round_idx = 0
-        bands_count = 0
-        last_cnt = last_width = 0
+        # a stale workdir may hold killed-run leftovers; a fresh start
+        # never appends to them
+        for pat in ("w*.rels", "band*.rels", "w*.log", "band*.log",
+                    "w*.stdout", "band*.stdout"):
+            for stale in wd.glob(pat):
+                stale.unlink(missing_ok=True)
         try:
             (wd / "msieve.dat").unlink()   # stateless leftovers: restart
         except OSError:
             pass
     else:
-        q_next = int(state["q_next"])
-        q_cap = int(state.get("q_cap", 6 * q_first))
-        target_raw = int(state["target_raw"])
-        have_raw = int(state["have_raw"])
-        round_idx = int(state.get("round_idx", 0))
-        bands_count = int(state.get("bands", 0))
-        last_cnt = int(state.get("last_cnt", 0))
-        last_width = int(state.get("last_width", 0))
-        ctx.log(f"nfs: resuming: {have_raw:,} relations in msieve.dat "
-                f"(round {round_idx}, q from {q_next:,}, "
-                f"target {target_raw:,})")
-    def _handle_verdict(out_text: str, filter_round: int) -> str:
-        """Classify one -nc1 result: "stop" (enough cycles), "bump"
-        (recalibrate the raw target from msieve's shortfall hint) or
-        "fail" (nothing usable — the loop reports non-convergence)."""
-        nonlocal target_raw, hint_floor
-        m = re.search(r"found (\d+) cycles, need (\d+)", out_text)
-        if m and int(m.group(1)) >= int(m.group(2)) \
-                and "too few cycles" not in out_text:
-            return "stop"
-        m = re.search(r"filtering wants (\d+) more relations", out_text)
-        if m and filter_round < 10:
-            deficit = int(m.group(1))
-            # msieve's hint is a floor; cycles grow superlinearly — grow the
-            # target geometrically (YAFU's filt-bump analog)
-            hint_floor = max(int(deficit * 1.2),
-                             int(have_raw * ctx.topup_frac))
-            target_raw = have_raw + hint_floor
-            _save_nfs_state(wd, n, q_next=q_next, q_cap=q_cap,
-                            target_raw=target_raw, have_raw=have_raw,
-                            round_idx=round_idx, bands=bands_count,
-                            last_cnt=last_cnt, last_width=last_width)
-            return "bump"
-        res.error = "filtering did not converge"
-        return "fail"
+        S.q_next = int(state["q_next"])
+        S.q_cap = int(state.get("q_cap", 6 * q_first))
+        S.appended = int(state.get("appended", state.get("have_raw", 0)))
+        S.filters = [tuple(f) for f in state.get("filters", [])]
+        S.filter_seq = int(state.get("filter_seq", state.get("round_idx", 0)))
+        S.wave_seq = int(state.get("wave_seq", 0))
+        S.last_cnt = int(state.get("last_cnt", 0))
+        S.last_width = int(state.get("last_width", 0))
+        for f in sorted(wd.glob("w*.rels")) + sorted(wd.glob("band*.rels")):
+            # appended waves are deleted right after the append, so any
+            # relation file still on disk was sieved but never appended
+            queued.append(([f.name], count_lines(f)))
+        ctx.log(f"nfs: resuming: {S.appended:,} relations in msieve.dat, "
+                f"{len(queued)} queued wave file(s), "
+                f"{len(S.filters)} filter point(s), q from {S.q_next:,}")
 
-    pending = None        # (proc, round, stdout path, t0): the -nc1 over
-                          # the data appended so far, overlapped with the
-                          # next band's sieving (the probe round's filter
-                          # is the exception — see the launch site)
-    hint_floor = 0        # last bump amount; while a verdict is in flight
-                          # it is the best guess for sizing the band that
-                          # the stale target cannot size
+    def _snapshot() -> None:
+        _save_nfs_state(wd, n, q_next=S.q_next, q_cap=S.q_cap,
+                        appended=S.appended,
+                        filters=[list(f) for f in S.filters],
+                        filter_seq=S.filter_seq, wave_seq=S.wave_seq,
+                        last_cnt=S.last_cnt, last_width=S.last_width)
 
-    def _collect_pending() -> tuple[str, int] | None:
-        """Wait out the in-flight -nc1 and classify its verdict; None when
-        nothing is pending.  Leaves the error text in res on "fail" — the
-        call sites own the logging and the control flow."""
-        nonlocal pending
-        if pending is None:
-            return None
-        proc, filter_round, path, t0 = pending
-        pending = None
-        while True:
+    next_filter_at, _rung_how = _filter_rung(S.filters, ctx.topup_frac,
+                                             ctx.target_safety)
+    running_filter = None   # (proc, raw snapshot, log path, t0) or None
+    wave = None             # {seq, thread, box, q}; at most one in flight
+    stop_wave = [False]     # watched by the wave's run_procs_parallel
+    waves_appended = 0
+
+    def _launch_wave() -> dict:
+        """Size and start the next sieve wave in a worker thread."""
+        have_total = S.appended + sum(c for _, c in queued)
+        if not S.filters and S.appended == 0 and not queued:
+            width = 30_000                                    # probe wave
+        else:
+            if running_filter is not None:
+                # the verdict in flight will set the rung; until it lands
+                # assume the ladder step past its snapshot (the estimate
+                # can only pull the rung down, and it lands mid-wave)
+                goal = running_filter[1] * (1.0 + ctx.topup_frac)
+            else:
+                goal = next_filter_at if next_filter_at is not None else 1
+            remaining = goal - have_total
+            # at/over the goal with a filter in flight: keep the GPU fed
+            # speculatively — the relations are either consumed by the
+            # next rung or dropped whole on "enough", and idling would
+            # cost the same wall time with nothing to show for it
+            rels = remaining if 0 < remaining < ctx.wave_max else ctx.wave_max
+            per_int = max(S.last_cnt / S.last_width, 1e-9)
+            width = max(int(rels / per_int * 1.05) + 2000, 2000)
+        qhi = min(S.q_next + width, S.q_cap)
+        if qhi <= S.q_next:
+            S.q_cap += 2 * q_first   # relax the duplicate-control window
+            qhi = min(S.q_next + width, S.q_cap)
+            ctx.log(f"nfs: q window exhausted, cap relaxed to {S.q_cap:,}")
+        seq = S.wave_seq
+        S.wave_seq += 1
+        tag = f"w{seq:04d}"
+        base = [cuda_sieve, "--pipeline", "--cofactor",
+                "--poly", job_path.name, "--logI", logI, "--region",
+                min(logI, 14), "--device", 0, (S.q_next, qhi)]
+        ctx.log(f"nfs: wave {tag}: q {S.q_next}:{qhi} "
+                f"(have {fmt_count(have_total)})"
+                + (f" [{ctx.sieve_procs} proc x {len(ctx.devices)} gpu]"
+                   if len(ctx.devices) > 1 else ""))
+        box: dict = {}
+
+        def _run_wave():
             try:
-                proc.wait(timeout=30)
-                break
-            except subprocess.TimeoutExpired:
-                if time.monotonic() - t0 > NC_TIMEOUT_S:
-                    proc.kill()
-                    proc.wait()
-                    break
-        res.stages["filter_s"] = res.stages.get("filter_s", 0.0) \
-            + time.monotonic() - t0
-        if proc.returncode != 0:
-            res.error = f"filtering failed (rc={proc.returncode})"
-            return "fail", filter_round
-        return _handle_verdict(read_log(path), filter_round), filter_round
+                box["rc"], box["wall"], box["names"] = _run_band_parallel(
+                    base, wd, ctx.sieve_procs, tag, SIEVE_TIMEOUT_S,
+                    ctx.devices, stop=lambda: stop_wave[0], poll_s=0.25)
+            except BaseException as e:   # re-raised on the loop thread
+                box["exc"] = e
+
+        th = threading.Thread(target=_run_wave, daemon=True)
+        th.start()
+        return {"seq": seq, "thread": th, "box": box, "q": (S.q_next, qhi)}
+
     try:
         while True:
             ctx.check_deadline()
-            round_idx += 1
-            if bands_count:
-                per_int = max(last_cnt / last_width, 1e-9)
-                need = target_raw - have_raw
-                if pending is not None:
-                    # the verdict in flight cannot size this band (it is
-                    # collected only after the sieve, before the append);
-                    # when the stale target is already reached, keep the
-                    # band at the last bump amount instead of collapsing
-                    # it to a stub — the fresher target arrives mid-round
-                    need = max(need, hint_floor)
-                width = max(int(need / per_int * 1.05) + 2000, 2000)
-            else:
-                width = 30_000  # probe band
-            qhi = min(q_next + width, q_cap)
-            if qhi <= q_next:
-                q_cap += 2 * q_first  # relax the duplicate-control window
-                qhi = min(q_next + width, q_cap)
-                ctx.log(f"nfs: q window exhausted, cap relaxed to {q_cap}")
-            ctx.log(f"nfs: round {round_idx}{' (probe)' if not bands_count else ''}: "
-                    f"q {q_next}:{qhi}"
-                    + (f" (have {have_raw:,}, target {target_raw:,})"
-                       if bands_count else "")
-                    + (f" [{ctx.sieve_procs} proc x {len(ctx.devices)} gpu]"
-                       if len(ctx.devices) > 1 else ""))
-            base = [cuda_sieve, "--pipeline", "--cofactor",
-                    "--poly", job_path.name, "--logI", logI, "--region",
-                    min(logI, 14), "--device", 0, (q_next, qhi)]
-            for stale in wd.glob(f"band{round_idx}.*"):
-                # a killed run may have left this round's partial outputs; the
-                # same round index repeats on resume, so never append to them
-                stale.unlink(missing_ok=True)
-            try:
-                rc, wall, relnames = _run_band_parallel(
-                    base, wd, ctx.sieve_procs, round_idx, SIEVE_TIMEOUT_S,
-                    ctx.devices)
-            except subprocess.TimeoutExpired:
-                res.error = "sieve band timed out"
-                ctx.log(f"nfs: {res.error}")
-                return res
-            res.stages["sieve_s"] = res.stages.get("sieve_s", 0.0) + wall
-            if rc != 0:
-                res.error = f"sieve band {round_idx} failed (rc={rc})"
-                ctx.log(f"nfs: {res.error}")
-                return res
 
-            # collect the filter that overlapped this band: it covers
-            # every relation appended before the band, and it must be
-            # done before the band itself is appended (msieve is reading
-            # msieve.dat while we would be writing to it)
-            got = _collect_pending()
-            if got is not None:
-                act, _ = got
-                if act == "fail":
-                    ctx.log(f"nfs: {res.error}")
-                    return res
-                # the verdict covers exactly the data appended so far (the
-                # band just sieved is not in it), so on "stop" that band
-                # turned out to be unnecessary and is dropped instead of
-                # bloating the matrix past the enough-point
-                if act == "stop":
-                    ctx.log(f"nfs: enough at {have_raw:,} relations; "
-                            f"discarding the overlapped band")
-                    for f in relnames:
-                        (wd / f).unlink(missing_ok=True)
-                    break
-
-            cnt = sum(count_lines(wd / f) for f in relnames)
-            _append_band_rels(wd, relnames)     # one copy on disk, then delete
-            last_cnt, last_width = cnt, qhi - q_next
-            have_raw += cnt
-            q_next = qhi
-            bands_count += 1
-            _save_nfs_state(wd, n, q_next=q_next, q_cap=q_cap,
-                            target_raw=target_raw, have_raw=have_raw,
-                            round_idx=round_idx, bands=bands_count,
-                            last_cnt=last_cnt, last_width=last_width)
-            rate = cnt / wall if wall > 0 else 0.0
-            if rate > 0 and target_raw > have_raw:
-                ctx.log(f"nfs: +{cnt:,} rels in {fmt_dur(wall)} "
-                        f"({fmt_count(rate)}/s); have {fmt_count(have_raw)} / "
-                        f"target {fmt_count(target_raw)}, "
-                        f"ETA {fmt_dur((target_raw - have_raw) / rate)}")
-            elif rate > 0:
-                ctx.log(f"nfs: +{cnt:,} rels in {fmt_dur(wall)} "
-                        f"({fmt_count(rate)}/s); have {fmt_count(have_raw)}, "
-                        f"filtering")
-
-            # start the next -nc1 over the data just appended; it is
-            # collected after the next band's sieve, before that band is
-            # appended.  The stop granularity is unchanged — msieve's
-            # shortfall hint is a measurement, so a verdict can only call
-            # the stop on the very data it filtered — and when it does,
-            # the band sieved under it is simply never appended (its
-            # relations were not needed after all)
-            cmd = [msieve, "-s", "msieve.dat", "-l",
-                   f"nc1-r{round_idx}.log", "-nc1", "-t", nproc, "-v"]
-            f = open(wd / f"nc1-r{round_idx}.stdout", "wb")
-            try:
-                proc = subprocess.Popen([str(c) for c in cmd],
-                                        cwd=str(wd), stdout=f,
-                                        stderr=subprocess.STDOUT)
-            finally:
-                f.close()
-            pending = (proc, round_idx, wd / f"nc1-r{round_idx}.stdout",
-                       time.monotonic())
-            ctx.log(f"nfs: filtering round {round_idx} in the background, "
-                    f"overlapping the next band")
-            if round_idx == 1:
-                # the probe's filter is seconds and its hint is the only
-                # thing standing between round 2 and the deliberately
-                # generous initial target (c135: probe says +1M, the
-                # table says 550M) — collect it before sizing instead of
-                # overlapping it.  Later rounds overlap as usual: their
-                # filters run over 100M+ relations and genuinely pay to
-                # hide under the next band
-                got = _collect_pending()
-                if got is not None:
-                    act, _ = got
-                    if act == "fail":
+            # reap a finished wave into the queue
+            if wave is not None and not wave["thread"].is_alive():
+                wave["thread"].join()
+                box = wave["box"]
+                if "exc" in box:
+                    if isinstance(box["exc"], subprocess.TimeoutExpired):
+                        res.error = "sieve wave timed out"
                         ctx.log(f"nfs: {res.error}")
                         return res
-                    if act == "stop":
-                        ctx.log(f"nfs: enough at {have_raw:,} relations")
+                    raise box["exc"]
+                if stop_wave[0]:
+                    wave = None             # the verdict path owns cleanup
+                elif box.get("rc", 1) != 0:
+                    for f in box.get("names") or []:
+                        (wd / f).unlink(missing_ok=True)
+                    res.error = (f"sieve wave w{wave['seq']:04d} failed "
+                                 f"(rc={box.get('rc')})")
+                    ctx.log(f"nfs: {res.error}")
+                    return res
+                else:
+                    names = box["names"]
+                    cnt = sum(count_lines(wd / f) for f in names)
+                    queued.append((names, cnt))
+                    wall = box.get("wall", 0.0)
+                    res.stages["sieve_s"] = res.stages.get("sieve_s", 0.0) \
+                        + wall
+                    S.last_cnt = cnt
+                    S.last_width = wave["q"][1] - wave["q"][0]
+                    S.q_next = wave["q"][1]
+                    have_total = S.appended + sum(c for _, c in queued)
+                    rate = cnt / wall if wall > 0 else 0.0
+                    if rate > 0:
+                        ctx.log(f"nfs: wave w{wave['seq']:04d}: +{cnt:,} "
+                                f"rels in {fmt_dur(wall)} "
+                                f"({fmt_count(rate)}/s); "
+                                f"have {fmt_count(have_total)}")
+                    _snapshot()
+                    wave = None
+
+            # poll the in-flight filter; its verdict lands here no later
+            # than one loop tick after it exits
+            if running_filter is not None:
+                proc, snapshot, logp, t0 = running_filter
+                rc = proc.poll()
+                timed_out = False
+                if rc is None and time.monotonic() - t0 > NC_TIMEOUT_S:
+                    proc.kill()
+                    proc.wait()
+                    rc = proc.returncode
+                    timed_out = True
+                if rc is not None:
+                    running_filter = None
+                    res.stages["filter_s"] = res.stages.get("filter_s", 0.0) \
+                        + time.monotonic() - t0
+                    if rc != 0:
+                        res.error = ("filtering timed out" if timed_out
+                                     else f"filtering failed (rc={rc})")
+                        ctx.log(f"nfs: {res.error}")
+                        return res
+                    text = read_log(logp)
+                    v = _read_verdict(text)
+                    if "cycles" in v and v["cycles"] >= v["need"] \
+                            and "too few cycles" not in text:
+                        # enough — and everything sieved since this filter
+                        # launched is surplus: kill the wave in flight
+                        # (its output would be dropped anyway) and empty
+                        # the queue
+                        stop_wave[0] = True
+                        surplus = sum(c for _, c in queued)
+                        if wave is not None:
+                            wave["thread"].join(timeout=30)
+                            for f in wave["box"].get("names") or []:
+                                (wd / f).unlink(missing_ok=True)
+                            wave = None
+                        for names, _ in queued:
+                            for f in names:
+                                (wd / f).unlink(missing_ok=True)
+                        queued.clear()
+                        ctx.log(f"nfs: enough at {S.appended:,} relations; "
+                                f"wave in flight stopped, queue dropped "
+                                f"({surplus:,} surplus relation(s))")
                         break
+                    if "cycles" not in v and "hint" not in v:
+                        res.error = "filtering did not converge"
+                        ctx.log(f"nfs: {res.error}")
+                        return res
+                    excess = _measured_excess(v)
+                    S.filters.append((S.filter_seq, snapshot,
+                                      v.get("unique"), excess,
+                                      v.get("target_excess")))
+                    next_filter_at, rung_how = _filter_rung(
+                        S.filters, ctx.topup_frac, ctx.target_safety)
+                    ctx.log(f"nfs: filter r{S.filter_seq}: {snapshot:,} raw"
+                            + (f" -> {v['unique']:,} unique, excess "
+                               f"{excess:,} / {v['target_excess']:,}"
+                               if excess is not None
+                               and "target_excess" in v else "")
+                            + f"; next filter at {next_filter_at:,} "
+                              f"({rung_how})")
+                    _snapshot()
+                    if len(S.filters) >= FILTER_MAX:
+                        res.error = "filtering did not converge"
+                        ctx.log(f"nfs: {res.error}")
+                        return res
+
+            # msieve.dat only grows while no -nc1 is reading it
+            if running_filter is None and queued:
+                for names, cnt in queued:
+                    _append_band_rels(wd, names)
+                    S.appended += cnt
+                waves_appended += len(queued)
+                queued.clear()
+                _snapshot()
+
+            # launch a filter once the appended data reaches its rung
+            if running_filter is None and S.appended > 0 and (
+                    not S.filters
+                    or (next_filter_at is not None
+                        and S.appended >= next_filter_at)):
+                S.filter_seq += 1
+                cmd = [msieve, "-s", "msieve.dat", "-l",
+                       f"nc1-r{S.filter_seq}.log", "-nc1", "-t", nproc, "-v"]
+                fh = open(wd / f"nc1-r{S.filter_seq}.stdout", "wb")
+                try:
+                    proc = subprocess.Popen([str(c) for c in cmd],
+                                            cwd=str(wd), stdout=fh,
+                                            stderr=subprocess.STDOUT)
+                finally:
+                    fh.close()
+                running_filter = (proc, S.appended,
+                                  wd / f"nc1-r{S.filter_seq}.stdout",
+                                  time.monotonic())
+                ctx.log(f"nfs: filter r{S.filter_seq}: filtering "
+                        f"{S.appended:,} relations in the background")
+
+            # keep exactly one wave in flight
+            if wave is None:
+                wave = _launch_wave()
+
+            time.sleep(0.05)
     finally:
-        # a return inside the loop (band failure, non-convergence) or an
-        # exception must not leave a background -nc1 reading msieve.dat
-        if pending is not None and pending[0].poll() is None:
+        # a return inside the loop (wave failure, non-convergence) or an
+        # exception must not leave wave chunks or a background -nc1
+        # running over msieve.dat
+        stop_wave[0] = True
+        if wave is not None:
+            wave["thread"].join(timeout=30)
+        if running_filter is not None and running_filter[0].poll() is None:
             try:
-                pending[0].kill()
-                pending[0].wait()
+                running_filter[0].kill()
+                running_filter[0].wait()
             except OSError:
                 pass
 
@@ -1007,8 +1158,8 @@ def run_nfs(n: int, ctx: RunContext, wd: Path) -> NfsResult:
         factors = [int(x) for x in re.findall(r"Found [a-z]+ factor of \d+ digits: (\d+)", log3)]
     res.factors = [f for f in factors if n % f == 0]
     res.ok = bool(res.factors)
-    res.raw_relations = have_raw
-    res.bands = bands_count
+    res.raw_relations = S.appended
+    res.bands = waves_appended
     ctx.log(f"nfs: complete, {len(res.factors)} factor(s), "
-            f"{bands_count} sieve band(s), {have_raw:,} relations")
+            f"{waves_appended} sieve wave(s), {S.appended:,} relations")
     return res

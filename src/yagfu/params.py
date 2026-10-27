@@ -1,8 +1,9 @@
 """Per-size parameter tables (bench_factor.py heritage) with interpolation.
 
 The anchor rows were measured/validated on an RTX 4090; between anchors the
-values are piecewise-linear, and the NFS sieve loop's feedback adapts the
-relation target anyway.
+values are piecewise-linear.  How many relations a job needs is deliberately
+not tabulated — the NFS sieve loop's estimator derives it from the measured
+excess curve.
 """
 
 from __future__ import annotations
@@ -28,21 +29,21 @@ def mpqs_lp1_bound(digits: int) -> int | None:
 
 
 # --------------------------------------------------------------------------
-# GNFS sieve parameters: (rlim, alim, lpb, logI, initial_raw_relations).
+# GNFS sieve parameters: (rlim, alim, lpb, logI).
 # Anchors 70..100 are measured (bench_factor.py); 110..150 track the usual
 # GGNFS/CADO tables — logI stays <= 14 (cuda-sieve's sweet spot).
 # --------------------------------------------------------------------------
 
-NFS_PARAMS_ANCHORS: tuple[tuple[int, tuple[int, int, int, int, int]], ...] = (
-    (70,  (350_000,     350_000,     23, 12,   800_000)),
-    (80,  (800_000,     800_000,     24, 13, 1_600_000)),
-    (90,  (1_500_000,   1_500_000,   26, 13, 8_000_000)),
-    (100, (3_000_000,   3_000_000,   27, 14, 15_000_000)),
-    (110, (6_000_000,   6_000_000,   28, 14, 40_000_000)),
-    (120, (12_000_000,  12_000_000,  29, 14, 100_000_000)),
-    (130, (25_000_000,  25_000_000,  30, 14, 300_000_000)),
-    (140, (50_000_000,  50_000_000,  30, 14, 800_000_000)),
-    (150, (100_000_000, 100_000_000, 31, 14, 2_000_000_000)),
+NFS_PARAMS_ANCHORS: tuple[tuple[int, tuple[int, int, int, int]], ...] = (
+    (70,  (350_000,     350_000,     23, 12)),
+    (80,  (800_000,     800_000,     24, 13)),
+    (90,  (1_500_000,   1_500_000,   26, 13)),
+    (100, (3_000_000,   3_000_000,   27, 14)),
+    (110, (6_000_000,   6_000_000,   28, 14)),
+    (120, (12_000_000,  12_000_000,  29, 14)),
+    (130, (25_000_000,  25_000_000,  30, 14)),
+    (140, (50_000_000,  50_000_000,  30, 14)),
+    (150, (100_000_000, 100_000_000, 31, 14)),
 )
 
 #: msieve -np's GPU stage-1 search emits nothing below ~90 digits (verified:
@@ -51,8 +52,8 @@ NFS_PARAMS_ANCHORS: tuple[tuple[int, tuple[int, int, int, int, int]], ...] = (
 NFS_MSIEVE_POLY_MIN_DIGITS = 90
 
 
-def nfs_params(digits: int) -> tuple[int, int, int, int, int]:
-    """(rlim, alim, lpb, logI, initial_raw) for a digits-digit GNFS job."""
+def nfs_params(digits: int) -> tuple[int, int, int, int]:
+    """(rlim, alim, lpb, logI) for a digits-digit GNFS job."""
     anchors = NFS_PARAMS_ANCHORS
     if digits <= anchors[0][0]:
         return anchors[0][1]

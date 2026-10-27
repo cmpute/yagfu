@@ -112,7 +112,15 @@ class RunContext:
     poly_frac: float = 0.65              # quality gate: stop polyselect when
                                          # the best E reaches this fraction of
                                          # msieve's printed expected E
-    topup_frac: float = 1.0          # geometric growth per filter round; GPU sieve is cheap, -nc1 passes are not
+    topup_frac: float = 1.0          # NFS ladder step: the next -nc1 waits at
+                                     # most one topup step past the last
+                                     # filter's data; caps every rung (GPU
+                                     # sieving is cheap, -nc1 passes are not)
+    target_safety: float = 1.15      # margin over the requirement extrapolated
+                                     # from the measured excess-vs-unique curve
+    wave_max: int = 16_000_000       # max relations per sieve wave: the
+                                     # verdict reaction granularity (~2 min
+                                     # of 4-GPU sieving)
     log_file: Path = field(default_factory=lambda: Path("yagfu.log"))
                                          # complete run log, appended (cwd)
 

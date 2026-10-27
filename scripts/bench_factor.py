@@ -195,6 +195,25 @@ def bench_nfs(digits: int, ctx: RunContext, args) -> dict:
 NFS_POST_FRAC = 1.10
 NFS_TOPUP = 1.25
 
+#: Full-job raw-relation targets, for the probe's ETA only: the runtime
+#: keeps no such table (its sieve loop derives the target from the
+#: measured excess curve); the probe needs a model to turn a measured
+#: band rate into a predicted job time.
+_BENCH_TARGET_RELS = ((90, 8_000_000), (100, 15_000_000), (110, 40_000_000),
+                      (120, 100_000_000), (130, 300_000_000),
+                      (140, 800_000_000), (150, 2_000_000_000))
+
+
+def _target_rels(digits: int) -> int:
+    if digits <= _BENCH_TARGET_RELS[0][0]:
+        return _BENCH_TARGET_RELS[0][1]
+    for (d0, r0), (d1, r1) in zip(_BENCH_TARGET_RELS,
+                                  _BENCH_TARGET_RELS[1:]):
+        if d0 <= digits <= d1:
+            t = (digits - d0) / (d1 - d0)
+            return int(round(r0 + t * (r1 - r0)))
+    return _BENCH_TARGET_RELS[-1][1]
+
 _RE_TARGET_RELS = re.compile(r"Target Relations: (\d+)")
 _RE_EST = {
     "sieve_s": re.compile(r"Sieve time:\s+([\d.]+)\s*s"),
@@ -259,7 +278,7 @@ def probe_nfs(n: int, ctx: RunContext, wd: Path, band_width: int,
     digits = len(str(n))
     msieve = find_bin("msieve", ctx.bin_dir)
     sieve_bin = find_bin("cuda-sieve", ctx.bin_dir)
-    rlim, alim, lpb, logI, initial_raw = nfs_params(digits)
+    rlim, alim, lpb, logI = nfs_params(digits)
 
     # short polyselect; the sieve rate depends on polynomial quality, so a
     # probe needs the real -np search.  Below ~90 digits -np emits nothing
@@ -300,12 +319,13 @@ def probe_nfs(n: int, ctx: RunContext, wd: Path, band_width: int,
         return {"error": f"band rc={rc}, {got} relations "
                          f"(see {wd}/probe.stdout)"}
     rate = got / band_s
-    est_sieve = initial_raw * NFS_TOPUP / rate
+    target_rels = _target_rels(digits)
+    est_sieve = target_rels * NFS_TOPUP / rate
     return {
         "poly_s": round(poly_s, 1), "poly_method": poly_method,
         "band_rels": got,
         "band_s": round(band_s, 1), "rate_rels_s": round(rate, 1),
-        "target_rels": int(initial_raw * NFS_TOPUP),
+        "target_rels": int(target_rels * NFS_TOPUP),
         "est_sieve_s": round(est_sieve, 1),
         "est_total_s": round(poly_s + est_sieve * (1 + NFS_POST_FRAC), 1),
     }

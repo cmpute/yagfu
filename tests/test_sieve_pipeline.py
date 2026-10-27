@@ -1,9 +1,10 @@
-"""The sieving loop's overlapped filter: fake cuda-sieve/msieve binaries
-drive run_nfs's round loop end-to-end (base-m polynomial path, no GPU),
-and the recorded call order proves the probe round's -nc1 is collected
-inline (its hint sizes band 2), that round k>=2's -nc1 overlaps band
-k+1, and that bands never collapse to stubs while a verdict is in
-flight.  No GPU, no real msieve."""
+"""The reactive sieving pipeline: fake cuda-sieve/msieve binaries drive
+run_nfs's wave loop end-to-end (base-m polynomial path, no GPU).  The
+recorded call order proves the append gate (msieve.dat only grows while
+no -nc1 reads it), verdict reactivity (the next wave is aimed at the
+refreshed rung, "enough" kills the wave in flight and drops the queue),
+and that the rung estimator homes in on the measured excess curve.  No
+GPU, no real msieve."""
 
 import os
 import time
@@ -11,7 +12,7 @@ import time
 import pytest
 
 import yagfu.backends.nfs as nfs
-from yagfu.backends.nfs import run_nfs
+from yagfu.backends.nfs import _filter_rung, run_nfs
 from yagfu.config import RunContext
 
 N71 = 10 ** 70 + 3            # 71 digits: base-m poly, below the msieve
@@ -29,11 +30,12 @@ def mark(what):
 if "-nc1" in args:
     round_ = [a.split("nc1-r")[1].split(".")[0]
               for a in args if a.startswith("nc1-r")][0]
-    mark(f"nc1 start r{round_} pid={os.getpid()}")
+    dat = sum(1 for _ in open(os.path.join(os.getcwd(), "msieve.dat")))
+    mark(f"nc1 start r{round_} dat={dat} pid={os.getpid()}")
     sleep_s = float(os.environ.get("YAGFU_TEST_NC1_SLEEP", "0"))
     if round_ == "1":
-        sleep_s = 0.0    # the probe filter is collected inline; the sleep
-                         # exists to keep a later round's filter in flight
+        sleep_s = 0.0    # the probe filter is instant; the sleep exists
+                         # to keep a later round's filter in flight
     time.sleep(sleep_s)
     if os.environ.get("YAGFU_TEST_NC1_FAIL"):
         mark(f"nc1 fail r{round_}")
@@ -50,7 +52,7 @@ sys.exit(0)
 '''
 
 SIEVE_FAKE = '''#!/usr/bin/env python3
-import os, sys
+import os, sys, time
 args = sys.argv[1:]
 calls = os.environ["YAGFU_TEST_CALLS"]
 
@@ -60,7 +62,8 @@ def mark(what):
 
 lo, hi = args[args.index("--qrange") + 1].split(":")
 relname = args[args.index("--relations") + 1]
-mark(f"band start {lo}:{hi}")
+mark(f"band start {lo}:{hi} pid={os.getpid()}")
+time.sleep(float(os.environ.get("YAGFU_TEST_SIEVE_SLEEP", "0")))
 per_q = float(os.environ.get("YAGFU_TEST_RELS_PER_Q", "0.001"))
 n = max(1, int((int(hi) - int(lo)) * per_q))
 with open(relname, "w") as f:
@@ -99,57 +102,140 @@ def _index(seq, prefix):
     raise ValueError(f"{prefix!r} not in call sequence")
 
 
-def test_filter_overlaps_next_band(harness, tmp_path):
-    """The probe round's -nc1 is collected inline before band 2 is sized
-    (its hint replaces the generous initial target); round k>=2's -nc1
-    still runs while band k+1 is sieved and is only collected afterwards;
-    when its verdict says enough, the band sieved under it is discarded
-    instead of appended."""
+def _bands(seq):
+    """(lo, hi, call index) per sieve wave, in launch order."""
+    return [(int(s.split()[2].split(":")[0]), int(s.split()[2].split(":")[1]),
+             i) for i, s in enumerate(seq) if s.startswith("band start ")]
+
+
+def test_verdict_reacts_midwave_and_stop_kills(harness, tmp_path):
+    """A stop verdict that lands while a wave is still sieving kills the
+    wave outright and drops the queue: the loop never starts another
+    wave, and msieve.dat stops exactly at the enough-point."""
     ctx, calls, verdicts = harness
+    # the probe's filter is instant; give the second filter a stop
+    # verdict so it lands while wave 2 (1s sleeper) is still running
     verdicts.write_text(
         "found 10 cycles, need 5000\nfiltering wants 60 more relations\n"
         "%%\n"
         "found 6000 cycles, need 5000\n")
-    os.environ["YAGFU_TEST_NC1_SLEEP"] = "0.5"
+    os.environ["YAGFU_TEST_NC1_SLEEP"] = "0.2"
+    os.environ["YAGFU_TEST_SIEVE_SLEEP"] = "1.0"
     try:
         wd = tmp_path / "wd"
         res = run_nfs(N71, ctx, wd)
     finally:
         os.environ.pop("YAGFU_TEST_NC1_SLEEP", None)
+        os.environ.pop("YAGFU_TEST_SIEVE_SLEEP", None)
 
     seq = _seq(calls)
-    bands = [(s.split()[2], _index(seq, s))
-             for s in seq if s.startswith("band start ")]
-    n1 = {s.split()[2]: _index(seq, s)
-          for s in seq if s.startswith("nc1 start ")}
-    n1e = {s.split()[2]: _index(seq, s)
-           for s in seq if s.startswith("nc1 end ")}
-    (_, i_b2), (_, i_b3) = bands[1], bands[2]
-    # the probe verdict was in hand before band 2 was sized, and band 2
-    # carries the hint's size, not the (much larger) initial target
-    assert n1e["r1"] < i_b2
-    lo, hi = (int(x) for x in bands[1][0].split(":"))
-    assert hi - lo < 100_000
-    # rounds past the probe overlap as before: round 2's filter was still
-    # running after band 3 had started (the only ordering the scheduler
-    # lets us assert deterministically)
-    assert i_b3 < n1e["r2"]
-    assert n1["r1"] < n1e["r1"] and n1["r2"] < n1e["r2"]
-    # the stopping verdict covers the data through band 2 — band 3 (the
-    # one sieved under that filter) is discarded, never appended
+    bands = _bands(seq)
+    # wave 1 (probe) + wave 2 (appended) + wave 3, which started before
+    # the stop verdict landed and was killed mid-run
+    assert len(bands) == 3, bands
+    assert not any(s.startswith("band end 261000:") for s in seq)
+    # only waves 1-2 were appended: the stop covers exactly their data
     assert res.bands == 2
-    assert res.raw_relations == 107
-    # the discarded band's relations were dropped, not appended:
-    # msieve.dat stops exactly at the enough-point (band 2)
-    assert sum(1 for _ in open(wd / "msieve.dat")) == 107
-    assert not list(wd.glob("band3.*.rels"))
+    assert res.raw_relations == 63
+    assert sum(1 for _ in open(wd / "msieve.dat")) == 63
+    # the killed wave's partial output and the queue are gone
+    assert not list(wd.glob("w*.rels"))
+    # the wave processes did not survive the kill
+    pids = [int(s.split("pid=")[1]) for s in seq
+            if s.startswith("band start") and "pid=" in s]
+    for pid in pids:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
     assert res.error is None or "no factor" in (res.error or "")
 
 
-def test_bands_track_measured_deficit(harness, tmp_path):
-    """While a verdict is in flight the stale target is already reached;
-    the last bump amount sizes the band instead (no 2000-q stubs), and
-    once fresh hints arrive the bands track msieve's measured shortfall."""
+def test_waves_track_refreshed_rung(harness, tmp_path):
+    """The full measurement loop: two filters measure the excess curve,
+    the rung switches from the ladder to the extrapolated estimate, and
+    the stop lands one rung earlier than the ladder would have sieved."""
+    ctx, calls, verdicts = harness
+    ctx.wave_max = 100          # small waves: deterministic, no speculation
+    verdicts.write_text(
+        # r1 (30 raw): 28 unique, excess -9 / 5
+        "found 2 duplicates and 28 unique relations\n"
+        "keeping 37 ideals with weight <= 200, target excess is 5\n"
+        "filtering wants 1000000 more relations\n"
+        "%%\n"
+        # r2 (63 raw): 58 unique, excess 0 / 5: slope 0.3 turned the
+        # curve; extrapolation lands at 93, under the ladder's 126
+        "found 5 duplicates and 58 unique relations\n"
+        "keeping 58 ideals with weight <= 200, target excess is 5\n"
+        "filtering wants 1000000 more relations\n"
+        "%%\n"
+        # r3: enough
+        "found 90 cycles, need 5\n")
+    # r2 sleeps long enough that wave 3 (speculative) is guaranteed in
+    # flight when its verdict lands, and gets killed by it
+    os.environ["YAGFU_TEST_NC1_SLEEP"] = "0.55"
+    os.environ["YAGFU_TEST_SIEVE_SLEEP"] = "0.3"
+    try:
+        wd = tmp_path / "wd"
+        res = run_nfs(N71, ctx, wd)
+    finally:
+        os.environ.pop("YAGFU_TEST_NC1_SLEEP", None)
+        os.environ.pop("YAGFU_TEST_SIEVE_SLEEP", None)
+    seq = _seq(calls)
+    bands = _bands(seq)
+    for lo, hi, _ in bands:
+        assert hi - lo > 20_000            # no stub waves anywhere
+    # the estimate rung (93) is live and under the ladder's 126
+    rung = [s for s in open(tmp_path / "t.log") if "(estimate)" in s]
+    assert any("next filter at 93" in s for s in rung)
+    # r3 fired the moment the drain crossed the estimate rung (appended
+    # 132), and its stop verdict killed the speculative wave in flight:
+    # total sieving stays at 132 where the pure ladder would have run to
+    # 2 x 63 = 126 -> 252 before the next verdict
+    assert any(s.startswith("nc1 start r3 dat=132") for s in seq)
+    assert res.bands == 3
+    assert res.raw_relations == 132
+    assert sum(1 for _ in open(wd / "msieve.dat")) == 132
+    assert not list(wd.glob("w*.rels"))
+    assert "queue dropped" in (tmp_path / "t.log").read_text()
+    assert res.error is None or "no factor" in (res.error or "")
+
+
+def test_append_gate_holds_while_filter_reads(harness, tmp_path):
+    """msieve.dat never grows while a filter is running: waves completed
+    in that window queue up and are appended wholesale when it exits
+    (the r2 nc1 covers everything the queue had accumulated)."""
+    ctx, calls, verdicts = harness
+    ctx.wave_max = 100
+    verdicts.write_text(
+        "found 2 duplicates and 28 unique relations\n"
+        "keeping 50 ideals with weight <= 200, target excess is 5\n"
+        "filtering wants 1000000 more relations\n"
+        "%%\n"
+        "found 6000 cycles, need 5\n")
+    os.environ["YAGFU_TEST_NC1_SLEEP"] = "0.5"
+    os.environ["YAGFU_TEST_SIEVE_SLEEP"] = "0.05"
+    try:
+        wd = tmp_path / "wd"
+        res = run_nfs(N71, ctx, wd)
+    finally:
+        os.environ.pop("YAGFU_TEST_NC1_SLEEP", None)
+        os.environ.pop("YAGFU_TEST_SIEVE_SLEEP", None)
+
+    seq = _seq(calls)
+    n1s = [s for s in seq if s.startswith("nc1 start ")]
+    assert len(n1s) == 2
+    # r1 launched right after the probe append (dat = 30)
+    assert "dat=30" in n1s[0]
+    # r2 launched only after r1 exited, with every wave queued in the
+    # meantime appended first: its dat exceeds r1's snapshot
+    dat2 = int(n1s[1].split("dat=")[1].split()[0])
+    assert dat2 >= 60
+    assert res.raw_relations == dat2
+    assert res.error is None or "no factor" in (res.error or "")
+
+
+def test_old_style_verdicts_still_converge(harness, tmp_path):
+    """Logs with only the legacy verdict lines (no unique/keeping
+    measurements) degrade to the pure ladder and still reach the stop."""
     ctx, calls, verdicts = harness
     verdicts.write_text(
         "found 10 cycles, need 5000\nfiltering wants 60 more relations\n"
@@ -160,22 +246,19 @@ def test_bands_track_measured_deficit(harness, tmp_path):
     wd = tmp_path / "wd"
     res = run_nfs(N71, ctx, wd)
     seq = _seq(calls)
-    bands = [(int(s.split()[2].split(":")[0]),
-              int(s.split()[2].split(":")[1]))
-             for s in seq if s.startswith("band start ")]
+    bands = _bands(seq)
     assert len(bands) >= 4
-    for lo, hi in bands:
-        assert hi - lo > 20000             # no stub bands anywhere
-    # the stopping verdict discards the band sieved under it (band 4);
-    # bands 1-3 are the appended ones
-    assert res.bands == 3
-    assert res.raw_relations == 185
+    for lo, hi, _ in bands:
+        assert hi - lo > 20_000             # no stub waves anywhere
+    assert res.bands >= 3
+    assert res.raw_relations == sum(1 for _ in open(wd / "msieve.dat"))
+    assert res.error is None or "no factor" in (res.error or "")
 
 
 def test_verdict_exhaustion_reports_non_convergence(harness, tmp_path):
     """Verdicts that keep asking for more, then run dry: the loop reports
     non-convergence instead of spinning, and every filter was still
-    backgrounded (started after its band's append)."""
+    backgrounded (started after its data's append)."""
     ctx, calls, verdicts = harness
     verdicts.write_text(
         "found 10 cycles, need 5000\nfiltering wants 870 more relations\n"
@@ -190,10 +273,10 @@ def test_verdict_exhaustion_reports_non_convergence(harness, tmp_path):
     res = run_nfs(N71, ctx, wd)
     assert res.error == "filtering did not converge"
     seq = _seq(calls)
-    starts = [i for i, s in enumerate(seq) if s.startswith("band start ")]
-    n1s = [(i, s) for i, s in enumerate(seq) if s.startswith("nc1 start ")]
+    starts = [s for s in seq if s.startswith("band start ")]
+    n1s = [s for s in seq if s.startswith("nc1 start ")]
     assert len(starts) >= 4
-    assert len(n1s) >= 3
+    assert len(n1s) >= 4
 
 
 def test_filter_failure_reports_error(harness, tmp_path, monkeypatch):
@@ -205,24 +288,23 @@ def test_filter_failure_reports_error(harness, tmp_path, monkeypatch):
     assert res.error == "filtering failed (rc=1)"
 
 
-def test_interrupt_kills_pending_filter(harness, tmp_path, monkeypatch):
-    """Ctrl+C mid-band tears down the background -nc1 instead of
-    orphaning it over msieve.dat.  The probe's filter is collected
-    inline, so the interrupt lands on round 3 with round 2's filter
-    (a 30s sleeper) still in flight."""
+def test_interrupt_kills_wave_and_filter(harness, tmp_path, monkeypatch):
+    """Ctrl+C mid-wave tears down the background -nc1 and the wave's
+    sieve chunks instead of orphaning them over msieve.dat."""
     ctx, calls, verdicts = harness
     verdicts.write_text("filtering wants 500 more relations\n")
     monkeypatch.setenv("YAGFU_TEST_NC1_SLEEP", "30")
 
     real_band = nfs._run_band_parallel
 
-    def exploding_band(base, cwd, n_procs, round_idx, timeout,
-                       devices=("0",), beat=None, beat_s=120.0):
-        if round_idx >= 3:
+    def exploding_band(base, cwd, n_procs, tag, timeout,
+                       devices=("0",), beat=None, beat_s=120.0,
+                       stop=None, poll_s=2.0):
+        if int(tag[1:]) >= 2:
             time.sleep(0.3)        # let the background -nc1 come up first
             raise KeyboardInterrupt("simulated Ctrl+C")
-        return real_band(base, cwd, n_procs, round_idx, timeout,
-                         devices=devices, beat=beat, beat_s=beat_s)
+        return real_band(base, cwd, n_procs, tag, timeout, devices=devices,
+                         beat=beat, beat_s=beat_s, stop=stop, poll_s=poll_s)
 
     monkeypatch.setattr(nfs, "_run_band_parallel", exploding_band)
     wd = tmp_path / "wd"
@@ -234,3 +316,57 @@ def test_interrupt_kills_pending_filter(harness, tmp_path, monkeypatch):
     for pid in pids:
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)                # the filter did not survive
+
+
+def test_resume_reuses_appended_data(harness, tmp_path, monkeypatch):
+    """A failed run's msieve.dat, filter points and q cursor carry over:
+    the resumed run does not re-sieve the probe and its first -nc1
+    covers exactly the data the first run appended plus the queued
+    waves it left on disk."""
+    ctx, calls, verdicts = harness
+    ctx.wave_max = 100
+    verdicts.write_text(
+        "found 2 duplicates and 28 unique relations\n"
+        "keeping 50 ideals with weight <= 200, target excess is 5\n"
+        "filtering wants 1000000 more relations\n")
+    monkeypatch.setenv("YAGFU_TEST_NC1_FAIL", "1")
+    wd = tmp_path / "wd"
+    res1 = run_nfs(N71, ctx, wd)
+    assert res1.error == "filtering failed (rc=1)"
+    dat1 = sum(1 for _ in open(wd / "msieve.dat"))
+    queued = sum(sum(1 for _ in open(wd / f)) for f in wd.glob("w*.rels"))
+    q_next = __import__("json").loads((wd / "nfs-state.json").read_text())["q_next"]
+    monkeypatch.delenv("YAGFU_TEST_NC1_FAIL")
+    calls2 = tmp_path / "calls2.log"
+    calls2.write_text("")
+    monkeypatch.setenv("YAGFU_TEST_CALLS", str(calls2))
+    verdicts.write_text("found 6000 cycles, need 5\n")
+    res2 = run_nfs(N71, ctx, wd)
+    seq = _seq(calls2)
+    n1 = [s for s in seq if s.startswith("nc1 start ")]
+    assert n1 and f"dat={dat1 + queued}" in n1[0]   # nothing lost, redone
+    first_band = _bands(seq)[0]
+    assert first_band[0] >= q_next                  # the q cursor carried over
+    assert res2.raw_relations >= dat1
+
+
+def test_filter_rung_estimator():
+    """The rung: ladder below two measured points and on non-positive
+    slopes; the secant extrapolation caps the ladder once the excess
+    curve turns over; a near-flat positive slope extrapolates past the
+    ladder and is capped by it."""
+    assert _filter_rung([], 1.0, 1.15) == (None, "ladder")
+    assert _filter_rung([(1, 100, 90, -10, 5)], 1.0, 1.15) == (200, "ladder")
+    turning = [(1, 100, 90, -10, 5), (2, 200, 180, -25, 5)]
+    assert _filter_rung(turning, 1.0, 1.15) == (400, "ladder")   # slope < 0
+    # slope 0.125, u_need = 380 + 5/0.125 = 420, ratio 0.95 -> 508 < ladder
+    turned = turning + [(3, 400, 380, 0, 5)]
+    assert _filter_rung(turned, 1.0, 1.15) == (508, "estimate")
+    # slope 0.002 -> extrapolates far past the ladder; capped by it
+    flat = [(1, 100, 90, -10, 5), (2, 200, 180, -9.8, 5)]
+    assert _filter_rung(flat, 1.0, 1.15) == (400, "estimate")
+    # unparseable measurements (older logs) keep the ladder
+    blind = [(1, 100, None, None, None), (2, 200, 180, -25, 5)]
+    assert _filter_rung(blind, 1.0, 1.15) == (400, "ladder")
+    # a tiny topup still leaves a minimum growth step (no filter spam)
+    assert _filter_rung([(1, 100, 90, -10, 5)], 0.0, 1.15) == (102, "ladder")

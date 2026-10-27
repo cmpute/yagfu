@@ -103,10 +103,20 @@ def build_parser() -> argparse.ArgumentParser:
                          "assumes a search several times longer than a "
                          "bounded GPU one; 1.0 insists on the full bar)")
     ap.add_argument("--topup-frac", type=float, default=1.0,
-                    help="NFS relation target growth per filter round: "
-                         "new = have + max(1.2x deficit, frac x have). GPU "
-                         "sieving is cheap here while -nc1 passes are not, "
-                         "so growing fast saves filter rounds (default 1.0)")
+                    help="NFS ladder step: the next -nc1 waits for at most "
+                         "one topup step past the last filter's data "
+                         "(raw x (1 + frac)); every rung is capped at this "
+                         "even when the estimator aims lower (default 1.0 = "
+                         "double each filter round)")
+    ap.add_argument("--target-safety", type=float, default=1.15,
+                    help="NFS margin over the requirement extrapolated from "
+                         "the measured excess curve; the extrapolation "
+                         "already lands on the high side, this covers the "
+                         "residual (default 1.15)")
+    ap.add_argument("--wave-max", type=int, default=16_000_000,
+                    help="NFS max relations per sieve wave: the verdict "
+                         "reaction granularity, ~2 min of 4-GPU sieving "
+                         "(default 16000000)")
     ap.add_argument("--db-token", default=None,
                     help="factordb token file (default ~/.factordb_token)")
     ap.add_argument("--db-no-report", action="store_true",
@@ -368,6 +378,8 @@ def main(argv=None) -> int:
         ecm_only=args.ecm_only,
         no_ecm=args.no_ecm,
         topup_frac=args.topup_frac,
+        target_safety=args.target_safety,
+        wave_max=args.wave_max,
     )
     if args.threads:
         kwargs["threads"] = args.threads
