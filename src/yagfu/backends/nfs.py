@@ -1230,8 +1230,13 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
                     or (next_filter_at is not None
                         and S.appended >= next_filter_at)):
                 S.filter_seq += 1
+                # dup_cache: reuse dedup state across filters (msieve-cuda
+                #   merge-batch; writes msieve.dat.dup, ~16 bytes/relation);
+                # merge_batch: batched parallel full merge (matrix differs
+                #   from the serial merge's, quality statistics identical)
                 cmd = [msieve, "-s", "msieve.dat", "-l",
-                       f"nc1-r{S.filter_seq}.log", "-nc1", "-t", nproc, "-v"]
+                       f"nc1-r{S.filter_seq}.log", "-nc1",
+                       "dup_cache=1,merge_batch=2048", "-t", nproc, "-v"]
                 fh = open(wd / f"nc1-r{S.filter_seq}.stdout", "wb")
                 try:
                     proc = subprocess.Popen([str(c) for c in cmd],

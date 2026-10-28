@@ -46,7 +46,9 @@ from .ecmledger import (
     target_depth,
 )
 from .fmt import fmt_count, fmt_dur
-from .params import snfs_gnfs_equiv
+import shutil
+
+from .params import nfs_disk_estimate, snfs_gnfs_equiv
 from .primes import SPRP_2761_LIMIT, is_probable_prime
 
 if TYPE_CHECKING:
@@ -110,6 +112,8 @@ class Engine:
         self.ctx.deadline = (time.monotonic() + self.ctx.timeout_s
                              if self.ctx.timeout_s else None)
         self.ctx.log(f"fac: factoring {n} (c{_digits(n)})")
+        if snfs is not None or _digits(n) >= self.ctx.xover:
+            self._nfs_disk_report(snfs, n, wd, pre_flight=True)
         try:
             self._factor_rec(n, wd, res, depth=0, snfs=snfs)
         except KeyboardInterrupt:
@@ -379,10 +383,61 @@ class Engine:
             j += 1
         return m
 
+    def _nfs_disk_report(self, snfs: "SnfsJob | None", m: int, wd: Path,
+                         pre_flight: bool = False) -> None:
+        """Log the NFS working-set estimate for this job and the workdir's
+        free space.  SNFS estimates key on the polynomial's scaled
+        difficulty (its sieving size is fixed by the poly, ECM splits
+        cannot shrink it); GNFS on the current composite, so the post-ECM
+        re-check sees the difficulty the pretest actually left."""
+        import shutil
+        if snfs is not None:
+            equiv = snfs_gnfs_equiv(snfs.scaled)
+            kind = f"SNFS d{snfs.scaled:g} (GNFS-equiv c{equiv:.0f})"
+        else:
+            equiv = float(_digits(m))
+            kind = f"c{equiv:.0f}"
+        est = nfs_disk_estimate(round(equiv))
+        free = shutil.disk_usage(wd).free / 1e9
+        margin = self.ctx.nfs_disk_margin
+        self.ctx.log(
+            f"nfs: disk estimate for {kind}: ~{est['total_gb']:.0f} GB "
+            f"(~{est['raw_rels']/1e6:.0f}M raw relations -> dat "
+            f"{est['dat_gb']:.0f} + dup {est['dup_gb']:.0f} + lp "
+            f"{est['lp_gb']:.0f} + mat/cyc {est['mat_gb']:.0f}); workdir "
+            f"has {free:.0f} GB free "
+            f"({free/est['total_gb']:.0%} of the estimate, "
+            f"margin {margin:.0%})")
+        if pre_flight and free < margin * est["total_gb"]:
+            self.ctx.log(
+                f"nfs: BELOW the disk margin - the run will be aborted "
+                f"when the ECM stage ends unless space is freed first "
+                f"(ECM factors may shrink this estimate)")
+
     def _sieve_stage(self, m: int, wd: Path, res: FactorResult,
                      depth: int, snfs: "SnfsJob | None" = None) -> None:
         ctx = self.ctx
         digits = _digits(m)
+
+        # disk pre-flight, recomputed on the post-ECM cofactor: an ECM
+        # split can shrink a GNFS job (an SNFS job sieves its polynomial's
+        # number, so its estimate cannot shrink).  Runs before anything
+        # is sieved; failing here costs only the pretest.
+        if snfs is not None or digits >= ctx.xover \
+                or ctx.force_method == "nfs":
+            self._nfs_disk_report(snfs, m, wd)
+            equiv = (snfs_gnfs_equiv(snfs.scaled) if snfs is not None
+                     else float(digits))
+            est = nfs_disk_estimate(round(equiv))
+            free = shutil.disk_usage(wd).free / 1e9
+            if free < ctx.nfs_disk_margin * est["total_gb"]:
+                raise FactorError(
+                    f"disk: the NFS path needs ~{est['total_gb']:.0f} GB "
+                    f"but the workdir has {free:.0f} GB free (<"
+                    f"{ctx.nfs_disk_margin:.0%} of the estimate).  Free "
+                    f"space (or point the workdir at a larger volume) and "
+                    f"restart; the ECM pretest factors are in the log")
+
         if snfs is not None:
             # the suggestion maps its own number, which may be larger than
             # the post-ECM cofactor: sieve the polynomial's number (the

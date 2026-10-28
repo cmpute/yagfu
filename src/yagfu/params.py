@@ -127,6 +127,78 @@ def snfs_gnfs_equiv(difficulty: float) -> float:
 
 
 # --------------------------------------------------------------------------
+# NFS disk pre-flight: how big a working set a job of this size should be
+# planned against, before anything is sieved.  Relations: c107 and c137 are
+# yagfu-measured deciding filters (27.3M / 72.5M raw); above 137 the growth
+# is one lpb step (+1 bit ≈ x2 pair space) plus digit growth.  Bytes per
+# relation line: c137 measured 126.  Interpolation is log-linear on the
+# relation axis (the curve is exponential, linear interpolation would
+# undershoot every midpoint).
+# --------------------------------------------------------------------------
+
+NFS_RAW_REL_ANCHORS: tuple[tuple[int, float], ...] = (
+    (100, 6e6), (107, 27e6), (115, 40e6), (125, 55e6), (137, 72e6),
+    (150, 200e6), (160, 400e6), (170, 800e6), (180, 1.6e9),
+    (190, 3.2e9), (200, 6.0e9),
+)
+
+NFS_BYTES_PER_REL_ANCHORS: tuple[tuple[int, int], ...] = (
+    (100, 70), (137, 126), (160, 150), (190, 175), (200, 185),
+)
+
+
+def _interp_log(anchors: tuple[tuple[int, float], ...],
+                x: float) -> float:
+    """piecewise-linear in log10(value), i.e. exponential between anchors"""
+    import math
+    if x <= anchors[0][0]:
+        return anchors[0][1]
+    if x >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (d0, v0), (d1, v1) in zip(anchors, anchors[1:]):
+        if d0 <= x <= d1:
+            t = (x - d0) / (d1 - d0)
+            return 10 ** ((1 - t) * math.log10(v0) + t * math.log10(v1))
+    raise AssertionError("unreachable")
+
+
+def nfs_relations_estimate(digits: int) -> int:
+    """raw relations a deciding GNFS of this size collects (pre-ladder)"""
+    return int(_interp_log(NFS_RAW_REL_ANCHORS, digits))
+
+
+def nfs_bytes_per_rel(digits: int) -> int:
+    return int(_interp_log([(d, float(b)) for d, b in
+                            NFS_BYTES_PER_REL_ANCHORS], digits))
+
+
+def nfs_disk_estimate(digits: int) -> dict:
+    """working-set estimate (GB) for an NFS job of this size.
+
+    Components as fractions of the raw relation file: the dup cache writes
+    ~16 B/relation (coordinates) + ~2.5 B (bitmaps); the LP intermediate
+    peaked at 0.27x the dat on c137 (0.35 planned); matrix/cycles/dep
+    ~0.15x; plus a couple of GB of sieve-wave transient."""
+    rels = nfs_relations_estimate(digits)
+    bpr = nfs_bytes_per_rel(digits)
+    dat = rels * bpr / 1e9
+    dup = rels * 18 / 1e9
+    lp = 0.35 * dat
+    mat = 0.15 * dat
+    total = dat + dup + lp + mat + 2.0
+    return {
+        "digits": digits,
+        "raw_rels": rels,
+        "bytes_per_rel": bpr,
+        "dat_gb": dat,
+        "dup_gb": dup,
+        "lp_gb": lp,
+        "mat_gb": mat,
+        "total_gb": total,
+    }
+
+
+# --------------------------------------------------------------------------
 # NFS polyselect budget: YAFU allots 8% of predicted GNFS time; with GPU
 # sieving that degenerates to ~8% of the predicted SIEVE time, floored at
 # 60 s (stage-1 space exhaustion + rootopt drain).  T_sieve anchored on the

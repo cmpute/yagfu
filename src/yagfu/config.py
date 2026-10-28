@@ -118,6 +118,9 @@ class RunContext:
                                      # sieving is cheap, -nc1 passes are not)
     target_safety: float = 1.15      # margin over the requirement extrapolated
                                      # from the measured excess-vs-unique curve
+    nfs_disk_margin: float = 0.8     # abort the NFS path after ECM when the
+                                     # workdir's free space is below this
+                                     # fraction of the pre-flight estimate
     wave_max: int = 16_000_000       # max relations per sieve wave: the
                                      # verdict reaction granularity (~2 min
                                      # of 4-GPU sieving)
