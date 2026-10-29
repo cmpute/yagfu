@@ -183,13 +183,11 @@ build_msieve() {
   log "building msieve-cuda (fork with the trunk polyselect port, sm_${SM})"
   cd "$ROOT/msieve-cuda"
 
-  # the polyselect-from-trunk branch carries the port; check it out if the
-  # submodule still points at the pre-port commit
-  if ! git rev-parse --verify HEAD >/dev/null 2>&1 \
-     || ! git merge-base --is-ancestor "$(git rev-parse HEAD)" polyselect-from-trunk 2>/dev/null; then
-    log "  checking out branch polyselect-from-trunk"
-    git checkout polyselect-from-trunk
-  fi
+  # build whatever the main repo has pinned/checked out: the pinned commits
+  # live on the yagfu branch (a descendant of polyselect-from-trunk) and
+  # already carry the trunk polyselect port plus the yagfu-only fixes
+  # (streaming best-E, batched merge, resumable dedup).  Do NOT auto-checkout
+  # a branch here — that rewound the submodule and silently dropped them.
 
   # msieve's GPU code calls the CUDA *driver* API (cuCtxCreate etc.). With a
   # newer toolkit than driver (CUDA 13 toolkit on a 550/12.4 driver) the
