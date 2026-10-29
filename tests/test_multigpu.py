@@ -395,3 +395,15 @@ def test_cluster_procs_timeout_kills_all(tmp_path, monkeypatch):
     rc = siqs._run_cluster_procs(work, specs, 1.0)
     assert rc == -9
     assert flag.exists()
+
+
+def test_stdout_capture_is_per_attempt(tmp_path):
+    import yagfu.backends.nfs as nfs
+    first = nfs._attempt_stdout(tmp_path, "w0019.0.stdout")
+    assert first == tmp_path / "w0019.0.stdout"
+    first.write_text("first attempt's error lines")    # must survive a relaunch
+    assert nfs._attempt_stdout(tmp_path, "w0019.0.stdout") == \
+        tmp_path / "w0019.0.stdout.attempt2"
+    (tmp_path / "w0019.0.stdout.attempt2").write_text("x")
+    assert nfs._attempt_stdout(tmp_path, "w0019.0.stdout") == \
+        tmp_path / "w0019.0.stdout.attempt3"

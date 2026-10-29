@@ -400,6 +400,19 @@ class Engine:
         est = nfs_disk_estimate(round(equiv))
         free = shutil.disk_usage(wd).free / 1e9
         margin = self.ctx.nfs_disk_margin
+        if pre_flight:
+            # startup banner: one line; the full working-set breakdown
+            # comes with the pre-sieve re-check, when the ECM pretest has
+            # settled the composite the NFS run will actually see
+            self.ctx.log(
+                f"nfs: disk estimate for {kind}: ~{est['total_gb']:.0f} GB; "
+                f"workdir has {free:.0f} GB free")
+            if free < margin * est["total_gb"]:
+                self.ctx.log(
+                    f"nfs: BELOW the disk margin - the run will be aborted "
+                    f"when the ECM stage ends unless space is freed first "
+                    f"(ECM factors may shrink this estimate)")
+            return
         self.ctx.log(
             f"nfs: disk estimate for {kind}: ~{est['total_gb']:.0f} GB "
             f"(~{est['raw_rels']/1e6:.0f}M raw relations -> dat "
@@ -408,11 +421,6 @@ class Engine:
             f"has {free:.0f} GB free "
             f"({free/est['total_gb']:.0%} of the estimate, "
             f"margin {margin:.0%})")
-        if pre_flight and free < margin * est["total_gb"]:
-            self.ctx.log(
-                f"nfs: BELOW the disk margin - the run will be aborted "
-                f"when the ECM stage ends unless space is freed first "
-                f"(ECM factors may shrink this estimate)")
 
     def _sieve_stage(self, m: int, wd: Path, res: FactorResult,
                      depth: int, snfs: "SnfsJob | None" = None) -> None:
@@ -442,8 +450,7 @@ class Engine:
             # the suggestion maps its own number, which may be larger than
             # the post-ECM cofactor: sieve the polynomial's number (the
             # job cost is the same) and strip what the pretest already
-            # found when absorbing.  A failed suggestion is consumed —
-            # retrying it on the fallback path would fail the same way.
+            # found when absorbing.
             attach = snfs.n
             ctx.log(f"snfs: sieving c{_digits(attach)} with the supplied "
                     f"polynomial (difficulty {snfs.scaled:g})")
@@ -456,6 +463,34 @@ class Engine:
                 res.bump("snfs_runs")
                 self._absorb_snfs(r.factors, attach, m, wd, res, depth)
                 return
+            from .backends.nfs import has_sieved_relations
+            if has_sieved_relations(wd / "nfs"):
+                # the failed run sieved into this workdir: the relations,
+                # the dup cache and the sieve's checkpoint fingerprints all
+                # belong to this polynomial, side and lpb.  A fallback that
+                # reselects params would resume them under a different
+                # selection (and when the suggestion's number differs from
+                # the cofactor, discard them wholesale as a foreign
+                # checkpoint), so rerun the same selection once instead —
+                # transient wave failures are exactly what this recovers.
+                # A deterministic failure just pays one extra attempt.
+                ctx.log(f"snfs: failed ({r.error}); the workdir holds this "
+                        "run's relations, retrying the same selection once")
+                ctx.check_deadline()
+                t = time.monotonic()
+                r = self._nfs(attach, wd, snfs=snfs)
+                res.spend("nfs", time.monotonic() - t)
+                res.bump("nfs_runs")
+                if r.ok and r.factors:
+                    res.bump("snfs_runs")
+                    self._absorb_snfs(r.factors, attach, m, wd, res, depth)
+                    return
+                raise FactorError(
+                    f"snfs failed on c{digits} and a same-selection retry "
+                    f"failed too ({r.error}); sieve state kept in {wd}")
+            # nothing was sieved: the workdir is clean, and a failed
+            # suggestion is consumed — re-detecting it on the fallback
+            # path would fail the same way
             ctx.log(f"snfs: failed ({r.error}); falling back to the "
                     f"usual sieve selection")
             snfs = None

@@ -305,6 +305,41 @@ def _snfs_job_text(job: SnfsJob, rlim: int, alim: int, lpb: int) -> str:
 # sieving helpers
 # ---------------------------------------------------------------------------
 
+def _attempt_stdout(wd: Path, name: str) -> Path:
+    """A fresh stdout capture per attempt: a relaunched wave or filter
+    reuses its tag/seq, so the plain name would overwrite the previous
+    attempt's capture — the only place a failed run's own error lines
+    land (the child appends to its own --log, but the captured stdout is
+    truncated on open).  The first attempt keeps the plain name; the k-th
+    relaunch writes <name>.attempt<k>."""
+    if not (wd / name).exists():
+        return wd / name
+    k = 2
+    while (wd / f"{name}.attempt{k}").exists():
+        k += 1
+    return wd / f"{name}.attempt{k}"
+
+
+def has_sieved_relations(wd: Path) -> bool:
+    """True when a previous NFS run left relations in the workdir: a
+    non-empty msieve.dat, or a checkpoint recording appended relations
+    or filter points.  Such a workdir belongs to the selection that
+    produced them — the relations, the dup cache and the sieve's
+    checkpoint fingerprints all bake in the polynomial, the lim/lpb and
+    the special-q side — so a fallback that reselects sieve params must
+    not run on top of it."""
+    try:
+        if (wd / "msieve.dat").stat().st_size > 0:
+            return True
+    except OSError:
+        pass
+    try:
+        s = json.loads((wd / _NFS_STATE).read_text())
+    except (OSError, ValueError):
+        return False
+    return bool(s.get("appended") or s.get("have_raw") or s.get("filters"))
+
+
 def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, tag: str,
                        timeout: float, devices: tuple[str, ...] = ("0",),
                        beat=None, beat_s: float = 120.0, stop=None,
@@ -339,7 +374,7 @@ def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, tag: str,
         cmd = [str(c) for c in base] + ["--qrange", f"{a}:{b}",
                                         "--relations", rels,
                                         "--log", f"{tag}.{i}.log"]
-        jobs.append((cmd, cwd / f"{tag}.{i}.stdout", None))
+        jobs.append((cmd, _attempt_stdout(cwd, f"{tag}.{i}.stdout"), None))
         envs.append({"CUDA_VISIBLE_DEVICES": devices[i % k]})
     results = run_procs_parallel(jobs, cwd, timeout, beat=beat,
                                  beat_s=beat_s, stop=stop, poll_s=poll_s,
@@ -1012,9 +1047,13 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
     queued: list[tuple[list[str], int]] = []   # sieved, not appended yet
     if state is None:
         # a stale workdir may hold killed-run leftovers; a fresh start
-        # never appends to them
-        for pat in ("w*.rels", "band*.rels", "w*.log", "band*.log",
-                    "w*.stdout", "band*.stdout"):
+        # never appends to them.  The .rels.* and .stdout.* arms sweep
+        # uncommitted .part/.lock sidecars and per-attempt stdout
+        # captures, which the plain patterns miss
+        for pat in ("w*.rels", "band*.rels", "w*.rels.*", "band*.rels.*",
+                    "w*.log", "band*.log",
+                    "w*.stdout", "band*.stdout",
+                    "w*.stdout.*", "band*.stdout.*"):
             for stale in wd.glob(pat):
                 stale.unlink(missing_ok=True)
         try:
@@ -1237,15 +1276,16 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
                 cmd = [msieve, "-s", "msieve.dat", "-l",
                        f"nc1-r{S.filter_seq}.log", "-nc1",
                        "dup_cache=1,merge_batch=2048", "-t", nproc, "-v"]
-                fh = open(wd / f"nc1-r{S.filter_seq}.stdout", "wb")
+                filter_out = _attempt_stdout(
+                        wd, f"nc1-r{S.filter_seq}.stdout")
+                fh = open(filter_out, "wb")
                 try:
                     proc = subprocess.Popen([str(c) for c in cmd],
                                             cwd=str(wd), stdout=fh,
                                             stderr=subprocess.STDOUT)
                 finally:
                     fh.close()
-                running_filter = (proc, S.appended,
-                                  wd / f"nc1-r{S.filter_seq}.stdout",
+                running_filter = (proc, S.appended, filter_out,
                                   time.monotonic())
                 ctx.log(f"nfs: filter r{S.filter_seq}: filtering "
                         f"{S.appended:,} relations in the background")

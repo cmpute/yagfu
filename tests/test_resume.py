@@ -75,3 +75,17 @@ def test_nfs_state_corrupt(tmp_path):
     from yagfu.backends.nfs import _load_nfs_state
     (tmp_path / "nfs-state.json").write_text("{not json")
     assert _load_nfs_state(tmp_path, 1) is None
+
+
+def test_has_sieved_relations(tmp_path):
+    from yagfu.backends.nfs import has_sieved_relations
+    assert not has_sieved_relations(tmp_path)          # empty workdir
+    (tmp_path / "nfs-state.json").write_text(
+        '{"n": "1", "q_next": 5}')                     # checkpoint, no progress
+    assert not has_sieved_relations(tmp_path)
+    (tmp_path / "nfs-state.json").write_text(
+        '{"n": "1", "q_next": 5, "appended": 9657}')
+    assert has_sieved_relations(tmp_path)              # appended relations
+    (tmp_path / "nfs-state.json").unlink()
+    (tmp_path / "msieve.dat").write_text("relation line\n")
+    assert has_sieved_relations(tmp_path)              # relations on disk
