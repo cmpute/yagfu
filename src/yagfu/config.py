@@ -124,6 +124,16 @@ class RunContext:
     wave_max: int = 16_000_000       # max relations per sieve wave: the
                                      # verdict reaction granularity (~2 min
                                      # of 4-GPU sieving)
+    sieve_logI: int | None = None    # NFS: override the params-table logI.
+                                     # A q-window-limited job needs a wider
+                                     # rectangle for relations/q even at a
+                                     # worse per-relation cost (RUNBOOK:
+                                     # area and lpb are one joint choice)
+    sieve_J: int | None = None       # NFS: cuda-sieve J; None keeps the
+                                     # binary default 2^(logI-1).  Raising
+                                     # logI while pinning J doubles the
+                                     # a-range only, which leaves the
+                                     # rational (hard) side's norms alone
     log_file: Path = field(default_factory=lambda: Path("yagfu.log"))
                                          # complete run log, appended (cwd)
 

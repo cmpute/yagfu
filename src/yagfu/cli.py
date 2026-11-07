@@ -131,6 +131,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="NFS max relations per sieve wave: the verdict "
                          "reaction granularity, ~2 min of 4-GPU sieving "
                          "(default 16000000)")
+    ap.add_argument("--sieve-logI", type=int, default=None, metavar="N",
+                    dest="sieve_logI",
+                    help="NFS: override the params table's siever width "
+                         "(log2 I).  A job limited by the special-q window "
+                         "needs a wider rectangle even at a worse "
+                         "per-relation cost.  Default: the params table")
+    ap.add_argument("--sieve-J", type=int, default=None, metavar="N",
+                    dest="sieve_J",
+                    help="NFS: cuda-sieve J (sieve height).  Default "
+                         "2^(logI-1).  Pin it when raising --sieve-logI to "
+                         "widen the a-range without widening the b-range")
     ap.add_argument("--db-token", default=None,
                     help="factordb token file (default ~/.factordb_token)")
     ap.add_argument("--db-no-report", action="store_true",
@@ -453,6 +464,8 @@ def main(argv=None) -> int:
         topup_frac=args.topup_frac,
         target_safety=args.target_safety,
         wave_max=args.wave_max,
+        sieve_logI=args.sieve_logI,
+        sieve_J=args.sieve_J,
     )
     if args.threads:
         kwargs["threads"] = args.threads

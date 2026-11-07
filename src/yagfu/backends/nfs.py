@@ -78,6 +78,18 @@ POLY_POLL_S = 20.0
 POLY_STALL_S = 30 * 60
 POLY_STALL_FLOOR = 0.5
 SIEVE_TIMEOUT_S = 6 * 3600
+#: wall-clock target for one sieve wave.  A wave is sized by its relation
+#: target *and* capped so the last completed wave's measured wall/width
+#: ratio predicts no more than this; the cap is 3/4 of SIEVE_TIMEOUT_S, so a
+#: slow q band or an operator geometry change cannot reach the hard timeout
+#: (a timed-out wave resumes from its checkpoint, but it spends the engine's
+#: single same-selection retry).
+WAVE_TARGET_S = int(4.5 * 3600)
+#: relations/q grows sublinearly with the sieve area: doubling the area
+#: measured 1.50x relations here (1.3-1.5x in bench/RUNBOOK), i.e.
+#: area^0.59.  Used only to rescale the first wave after an operator changes
+#: logI/J, when the state's relations/q still describes the old geometry.
+GEOM_YIELD_EXP = 0.6
 NC_TIMEOUT_S = 2 * 3600
 LA_TIMEOUT_S = 12 * 3600
 SQRT_TIMEOUT_S = 2 * 3600
@@ -467,6 +479,45 @@ def _filter_rung(filters: list[tuple], topup_frac: float,
     ratio = min(1.0, max(0.5, unique / raw))     # measured unique/raw, floored
     est = u_need / ratio * safety
     return max(int(raw * 1.02), min(ladder, int(est))), "estimate"
+
+
+def _wave_width(rels: int, last_cnt: int, last_width: int,
+                last_wall: float, geom_scale: float = 1.0) -> int:
+    """Width, in q units, of the next sieve wave for a target relation count.
+
+    The target is priced with the last completed wave's measured
+    relations/q.  After an operator changes logI/J that measurement still
+    describes the old geometry, so `geom_scale` (the old/new area ratio
+    raised to GEOM_YIELD_EXP) rescales the width for the new one.  The width
+    is then capped by the same wave's measured wall/width ratio so the
+    prediction lands under WAVE_TARGET_S: q-driven cost drift and geometry
+    changes both move the per-q wall, and the measurement follows one wave
+    behind.  A state without a per-q measurement (last_width == 0) falls
+    back to the probe width - slow to adapt, but never oversized.
+    """
+    if last_cnt > 0 and last_width > 0:
+        per_int = max(last_cnt / last_width, 1e-9)
+        width = int(rels / per_int * 1.05) + 2000
+    else:
+        width = 30_000
+    width = max(int(width * geom_scale), 2000)
+    if last_wall > 0 and last_width > 0:
+        wall_cap = int(last_width * (WAVE_TARGET_S / last_wall))
+        width = min(width, max(wall_cap, 2000))
+    return max(width, 2000)
+
+
+def _geom_area_scale(old_logI: int, old_J: int, logI: int, J: int) -> float:
+    """Width rescale for a resume whose state was sieved at another area.
+
+    relations/q follows area^GEOM_YIELD_EXP, so the same relation target
+    needs width * (old_area/new_area)^exp at the new geometry.  Clamped to
+    [0.5, 2.0] so a bad state entry cannot size a wave absurdly; the
+    measured wall cap is the second line of defence.
+    """
+    old_area = float(1 << old_logI) * float(old_J)
+    new_area = float(1 << logI) * float(J)
+    return max(0.5, min(2.0, (old_area / new_area) ** GEOM_YIELD_EXP))
 
 
 # ---------------------------------------------------------------------------
@@ -921,6 +972,16 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
     as-is: no polyselect, parameters from the SNFS difficulty table."""
     rlim, alim, lpb, logI = (snfs_params(snfs.scaled) if snfs is not None
                              else nfs_params(len(str(n))))
+    if ctx.sieve_logI is not None:
+        # operator override: the tables cap logI at cuda-sieve's per-relation
+        # sweet spot, but a job whose special-q window is the binding limit
+        # needs relations/q more than per-relation efficiency (RUNBOOK:
+        # area and lpb are one joint choice, and the q span is a real cap)
+        logI = ctx.sieve_logI
+    # the geometry actually handed to cuda-sieve; persisted in the state so a
+    # resume can tell whether its measured relations/q still applies
+    eff_J = ctx.sieve_J if ctx.sieve_J is not None else (1 << (logI - 1))
+    geom = [logI, eff_J]
     res = NfsResult(params=(rlim, alim, lpb, logI))
     msieve = find_bin("msieve", ctx.bin_dir)
     cuda_sieve = find_bin("cuda-sieve", ctx.bin_dir)
@@ -1043,7 +1104,11 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
     q_first = alim // 2
     S = SimpleNamespace(q_next=q_first, q_cap=6 * q_first, appended=0,
                         filters=[], filter_seq=0, wave_seq=0,
-                        last_cnt=0, last_width=0)
+                        last_cnt=0, last_width=0, last_wall=0.0,
+                        timed_wall=0.0)
+    #: one-shot rescale of the first wave after an operator changes the
+    #: sieve geometry; 1.0 otherwise.  See _wave_width.
+    geom_scale = 1.0
     queued: list[tuple[list[str], int]] = []   # sieved, not appended yet
     if state is None:
         # a stale workdir may hold killed-run leftovers; a fresh start
@@ -1069,6 +1134,8 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
         S.wave_seq = int(state.get("wave_seq", 0))
         S.last_cnt = int(state.get("last_cnt", 0))
         S.last_width = int(state.get("last_width", 0))
+        S.last_wall = float(state.get("last_wall", 0.0) or 0.0)
+        S.timed_wall = float(state.get("timed_wall", 0.0) or 0.0)
         for f in sorted(wd.glob("w*.rels")) + sorted(wd.glob("band*.rels")):
             # appended waves are deleted right after the append, so any
             # relation file still on disk was sieved but never appended
@@ -1076,13 +1143,33 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
         ctx.log(f"nfs: resuming: {S.appended:,} relations in msieve.dat, "
                 f"{len(queued)} queued wave file(s), "
                 f"{len(S.filters)} filter point(s), q from {S.q_next:,}")
+        prev_geom = state.get("geometry")
+        if prev_geom is None:
+            # state written before geometry was recorded: its relations/q
+            # may belong to any earlier logI/J, so shrink one wave and let
+            # the fresh measurement take over from there
+            geom_scale = 0.6
+            ctx.log("nfs: state carries no sieve geometry; the first wave "
+                    "is sized conservatively")
+        else:
+            try:
+                old_logI, old_J = int(prev_geom[0]), int(prev_geom[1])
+            except (TypeError, ValueError, IndexError):
+                old_logI, old_J = logI, eff_J
+            if (old_logI, old_J) != (logI, eff_J):
+                geom_scale = _geom_area_scale(old_logI, old_J, logI, eff_J)
+                ctx.log(f"nfs: sieve geometry changed (logI {old_logI}->"
+                        f"{logI}, J {old_J}->{eff_J}); the first wave is "
+                        f"sized {geom_scale:.2f}x")
 
     def _snapshot() -> None:
         _save_nfs_state(wd, n, q_next=S.q_next, q_cap=S.q_cap,
                         appended=S.appended,
                         filters=[list(f) for f in S.filters],
                         filter_seq=S.filter_seq, wave_seq=S.wave_seq,
-                        last_cnt=S.last_cnt, last_width=S.last_width)
+                        last_cnt=S.last_cnt, last_width=S.last_width,
+                        last_wall=S.last_wall, timed_wall=S.timed_wall,
+                        geometry=geom)
 
     next_filter_at, _rung_how = _filter_rung(S.filters, ctx.topup_frac,
                                              ctx.target_safety)
@@ -1093,6 +1180,7 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
 
     def _launch_wave() -> dict:
         """Size and start the next sieve wave in a worker thread."""
+        nonlocal geom_scale
         have_total = S.appended + sum(c for _, c in queued)
         if not S.filters and S.appended == 0 and not queued:
             width = 30_000                                    # probe wave
@@ -1110,8 +1198,9 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
             # next rung or dropped whole on "enough", and idling would
             # cost the same wall time with nothing to show for it
             rels = remaining if 0 < remaining < ctx.wave_max else ctx.wave_max
-            per_int = max(S.last_cnt / S.last_width, 1e-9)
-            width = max(int(rels / per_int * 1.05) + 2000, 2000)
+            width = _wave_width(rels, S.last_cnt, S.last_width,
+                                S.last_wall, geom_scale)
+            geom_scale = 1.0     # one-shot, see the resume geometry check
         qhi = min(S.q_next + width, S.q_cap)
         if qhi <= S.q_next:
             S.q_cap += 2 * q_first   # relax the duplicate-control window
@@ -1123,6 +1212,12 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
         base = [cuda_sieve, "--pipeline", "--cofactor",
                 "--poly", job_path.name, "--logI", logI, "--region",
                 min(logI, 14), "--device", 0]
+        if ctx.sieve_J is not None:
+            # pin J instead of letting it default to 2^(logI-1): raising
+            # logI alone widens the a-range, whose extra candidates keep
+            # the rational (binding) norms unchanged; widening b instead
+            # grows a-bm by a full bit per doubling
+            base += ["--J", str(ctx.sieve_J)]
         if snfs is not None and snfs.side == "r":
             base += ["--sq-side", 0]    # SNFS: factordb wants the
                                         # special-q on the rational side
@@ -1157,6 +1252,13 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
                     if isinstance(box["exc"], subprocess.TimeoutExpired):
                         res.error = "sieve wave timed out"
                         ctx.log(f"nfs: {res.error}")
+                        # the attempt ran for exactly the cap: carry that
+                        # wall into the retry's completion accounting, or
+                        # the resumed wave looks an order of magnitude
+                        # faster than it was and the wall cap loses its
+                        # reference
+                        S.timed_wall += SIEVE_TIMEOUT_S
+                        _snapshot()
                         return res
                     raise box["exc"]
                 if stop_wave[0]:
@@ -1172,11 +1274,16 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
                     names = box["names"]
                     cnt = sum(count_lines(wd / f) for f in names)
                     queued.append((names, cnt))
-                    wall = box.get("wall", 0.0)
+                    # a resumed wave's own attempt wall only covers the
+                    # retry; the timed-out attempt(s) are carried in
+                    # timed_wall so rate and the width cap see the truth
+                    wall = box.get("wall", 0.0) + S.timed_wall
+                    S.timed_wall = 0.0
                     res.stages["sieve_s"] = res.stages.get("sieve_s", 0.0) \
                         + wall
                     S.last_cnt = cnt
                     S.last_width = wave["q"][1] - wave["q"][0]
+                    S.last_wall = wall
                     S.q_next = wave["q"][1]
                     have_total = S.appended + sum(c for _, c in queued)
                     rate = cnt / wall if wall > 0 else 0.0
