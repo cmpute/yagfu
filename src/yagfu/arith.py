@@ -104,8 +104,12 @@ def _brent(n: int, c: int, max_batches: int, batch_len: int = RHO_BATCH_LEN) -> 
                 q = q * abs(x - y) % n
             k += steps
             batches += 1
-            if q:
-                g = gcd(q, n)
+            # gcd(0, n) == n is the "backtrack" signal: a zero product
+            # means the differences covered every prime of n this batch
+            # (routine on small n, where the walk cycles almost at once).
+            # Skipping the gcd here would keep q == 0 forever and rho
+            # would burn its whole budget reporting no factor.
+            g = gcd(q, n)
         r <<= 1
     if g == 1:
         return None

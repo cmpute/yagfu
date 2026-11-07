@@ -8,7 +8,12 @@ import time
 import pytest
 
 from yagfu import engine as engine_mod
-from yagfu.backends.ecm import EcmProvenance, EcmRunResult, parse_stage2_log
+from yagfu.backends.ecm import (
+    EcmProvenance,
+    EcmRunResult,
+    _parse_stage1_log,
+    parse_stage2_log,
+)
 from yagfu.backends.runner import run_cmd_progress
 from yagfu.config import RunContext, cleanup_workdir
 from yagfu.engine import Engine
@@ -56,6 +61,42 @@ def test_parse_stage2_log_no_factor():
     assert b2 == 1873422
 
 
+# ------------------------------------------------------------- stage 1 log
+
+def test_parse_stage1_log_drops_input_number():
+    # for tiny n every curve's stage-1 gcd is n itself; gmp-ecm reports it
+    # as a found factor (its log then says "Found input number N") — that
+    # is not a split and must never be recursed on
+    log = (
+        "GPU: factor 183641 found in Step 1 with curve 0 (-sigma 3:42)\n"
+        "GPU: factor 183641 found in Step 1 with curve 1 (-sigma 3:43)\n"
+        "Computing 128 Step 1 took 18ms of CPU time / 69ms of GPU time\n"
+    )
+    factors, ran = _parse_stage1_log(log, 2000, 183641)
+    assert factors == {} and ran == 128
+
+
+def test_parse_stage1_log_keeps_proper_factors():
+    log = (
+        "GPU: factor 183641 found in Step 1 with curve 0 (-sigma 3:42)\n"
+        "GPU: factor 409 found in Step 1 with curve 7 (-sigma 3:49)\n"
+        "Computing 128 Step 1 took 18ms of CPU time / 69ms of GPU time\n"
+    )
+    factors, ran = _parse_stage1_log(log, 2000, 183641)
+    assert list(factors) == [409]
+    assert factors[409].stage == 1 and factors[409].sigma == 49
+    assert ran == 128
+
+
+def test_parse_stage1_log_credits_no_work_as_zero():
+    # a stale -save file makes gmp-ecm exit before running anything; the
+    # requested curve count must not be credited as done
+    log = ("GMP-ECM 7.0.6 [configured with GMP 6.3.0] [ECM]\n"
+           "Save file ecm-l0-1.1.residues already exists, will not overwrite\n")
+    factors, ran = _parse_stage1_log(log, 2000, 183641)
+    assert factors == {} and ran == 0
+
+
 # ------------------------------------------- ECM ladder survives splits
 
 P1 = (1 << 31) - 1     # 10-digit prime
@@ -97,6 +138,130 @@ def test_ecm_ladder_survives_split_ecm_only(monkeypatch, tmp_path):
     assert res.complete, res.error
     assert [b1 for b1, _ in calls] == [2000, 11000]
     assert calls[1][1] == P2 * P3
+
+
+# ------------------------------------------------ stage-1 save-file handling
+
+#: mimics gmp-ecm's -save behavior: refuses to run when the file exists,
+#: otherwise records a residue and reports the work it did
+_FAKE_ECM = """\
+#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-save" ]; then save="$a"; fi
+  prev="$a"
+done
+if [ -e "$save" ]; then
+  echo "Save file $save already exists, will not overwrite"
+  exit 1
+fi
+echo "METHOD=ECM; PARAM=3; B1=2000; N=1; X=0x0;" > "$save"
+echo "Computing 128 Step 1 took 1ms of CPU time / 2ms of GPU time"
+exit 0
+"""
+
+
+def _fake_bin_dir(tmp_path, body):
+    d = tmp_path / "bin"
+    d.mkdir()
+    p = d / "ecm"
+    p.write_text(body)
+    p.chmod(0o755)
+    return d
+
+
+def test_stage1_clears_stale_save_file(tmp_path):
+    """gmp-ecm exits immediately if its -save file exists.  A residue file
+    from an earlier attempt (same number, same ladder tag) must be cleared,
+    or the retry is a silent no-op."""
+    from yagfu.backends.ecm import _stage1
+
+    ctx = RunContext(bin_dir=_fake_bin_dir(tmp_path, _FAKE_ECM),
+                     device="0", devices=("0",))
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    first = _stage1(409 * 449, 2000, 128, ctx, wd, "l0-1", "0")
+    assert first[:3] == (0, {}, 128) and first[4] is None
+    # the fake left its save file behind: the second call must still run
+    second = _stage1(409 * 449, 2000, 128, ctx, wd, "l0-1", "0")
+    assert second[:3] == (0, {}, 128) and second[4] is None
+
+
+def test_stage1_failed_run_is_an_error_not_progress(tmp_path):
+    """rc=1 with no stage-1 work in the log: ran must be 0 and the failure
+    surfaced, not credited as 128 curves."""
+    from yagfu.backends.ecm import _stage1
+
+    body = ("#!/bin/sh\n"
+            "echo 'Could not open file -save target'\n"
+            "exit 1\n")
+    ctx = RunContext(bin_dir=_fake_bin_dir(tmp_path, body),
+                     device="0", devices=("0",))
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    rc, factors, ran, _wall, err, _killed = _stage1(183641, 2000, 128, ctx,
+                                                    wd, "l0-1", "0")
+    assert (rc, factors, ran) == (1, {}, 0)
+    assert "rc=1" in err and "Could not open" in err
+
+
+def test_stage1_killed_run_is_not_an_error(monkeypatch, tmp_path):
+    """KILLED_RC is an early-yield request, not a failure: no curves are
+    credited, and no error is reported."""
+    import yagfu.backends.ecm as ecm
+    from yagfu.backends.runner import KILLED_RC
+
+    ctx = RunContext(bin_dir=_fake_bin_dir(tmp_path, _FAKE_ECM),
+                     device="0", devices=("0",))
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    def fake_run_cmd(cmd, cwd, log_path, **k):
+        open(log_path, "wb").close()        # like run_cmd's log file
+        return KILLED_RC, 0.5
+
+    monkeypatch.setattr(ecm, "run_cmd", fake_run_cmd)
+    rc, factors, ran, _wall, err, killed = ecm._stage1(
+        183641, 2000, 128, ctx, wd, "l0-1", "0")
+    assert (rc, factors, ran, err, killed) == (KILLED_RC, {}, 0, None, True)
+
+
+def test_run_ecm_curves_killed_round_is_not_no_progress(monkeypatch, tmp_path):
+    """A killed stage-1 round is an early-yield: run_ecm_curves stops
+    without an error (not "no progress") and never starts stage 2."""
+    import yagfu.backends.ecm as ecm
+    from yagfu.backends.runner import KILLED_RC
+
+    def fake_stage1(n, b1, curves, ctx, wd, tag, device):
+        return KILLED_RC, {}, 0, 0.1, None, True
+
+    def no_stage2(*a, **k):
+        raise AssertionError("stage 2 must not run after a killed round")
+
+    monkeypatch.setattr(ecm, "_stage1", fake_stage1)
+    monkeypatch.setattr(ecm, "_stage2", no_stage2)
+    ctx = RunContext(device="0", devices=("0",))
+    out = ecm.run_ecm_curves(183641, 2000, 128, ctx, tmp_path, "t")
+    assert out.error is None and out.curves_done == 0
+
+
+def test_run_ecm_curves_killed_shard_is_not_no_progress(monkeypatch, tmp_path):
+    """Same for the fan-out path: every shard killed is an early-yield,
+    not a failure."""
+    import yagfu.backends.ecm as ecm
+    from yagfu.backends.runner import KILLED_RC
+
+    def fake_shards(n_, b1, counts, devices, ctx_, wd, tag, stop_check=None):
+        return [ecm._Shard(d, {}, 0, 0.1, tmp_path / f"r{d}.res", None, True)
+                for d in devices]
+
+    def no_stage2(*a, **k):
+        raise AssertionError("stage 2 must not run after a killed round")
+
+    monkeypatch.setattr(ecm, "_stage1_shards", fake_shards)
+    monkeypatch.setattr(ecm, "_stage2", no_stage2)
+    ctx = RunContext(devices=("0", "1"))
+    out = ecm.run_ecm_curves(183641, 2000, 128, ctx, tmp_path, "t")
+    assert out.error is None and out.curves_done == 0
 
 
 # ------------------------------------------------------------ workdir
@@ -162,7 +327,8 @@ def test_no_ecm_skips_ladder_to_sieve(monkeypatch, tmp_path):
     monkeypatch.setattr(engine_mod, "run_ecm_curves", fail_ecm)
     monkeypatch.setattr(engine_mod, "pollard_rho", lambda m: ([], m))
 
-    p, q = 1_000_000_007, 1_000_000_009
+    # c25: at/above the sieves' floor (the fake stands in for cuda-mpqs)
+    p, q = 1_000_000_000_039, 1_000_000_000_061
     sieved = []
 
     def fake_siqs(m, ctx, wd):
@@ -312,7 +478,7 @@ def test_run_ecm_curves_fanout_accounting(monkeypatch, tmp_path):
     assert calls["counts"] == [100, 100]        # equal cold-start split
     assert out.curves_done == 200
     assert out.b2 == 999_982
-    assert calls["merged"].startswith("ecm-t.1.merged")
+    assert calls["merged"].startswith(f"ecm-t.1.{ecm._nkey(n)}.merged")
     assert calls["env"] == {"CUDA_VISIBLE_DEVICES": "0"}
     assert ctx.ecm_device_rates["0"] > 0 and ctx.ecm_device_rates["1"] > 0
 

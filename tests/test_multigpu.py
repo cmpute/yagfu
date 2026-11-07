@@ -161,8 +161,9 @@ def test_stage1_shards_pin_each_card(monkeypatch, tmp_path):
     # ...and each is pinned to a different physical card
     assert cap["kw"]["envs"] == [{"CUDA_VISIBLE_DEVICES": "3"},
                                  {"CUDA_VISIBLE_DEVICES": "5"}]
+    key = ecm._nkey(101 * 103)          # per-number suffix: no cross-number clash
     assert [s.res_path.name for s in shards] == \
-        ["ecm-t.s0.residues", "ecm-t.s1.residues"]
+        [f"ecm-t.s0.{key}.residues", f"ecm-t.s1.{key}.residues"]
 
 
 def test_single_device_stage2_pinned(monkeypatch, tmp_path):
@@ -173,8 +174,8 @@ def test_single_device_stage2_pinned(monkeypatch, tmp_path):
     seen = {}
 
     def fake_stage1(n, b1, curves, ctx, wd, tag, device, stop_check=None):
-        (wd / f"ecm-{tag}.residues").write_bytes(b"SIGMA=1\n")
-        return 0, {}, 128, 0.1, None
+        (wd / f"ecm-{tag}.{ecm._nkey(n)}.residues").write_bytes(b"SIGMA=1\n")
+        return 0, {}, 128, 0.1, None, False
 
     def fake_stage2(n, b1, res_path, ctx, wd, tag, maxmem, env_extra=None):
         seen["env"] = env_extra

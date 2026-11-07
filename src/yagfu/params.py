@@ -20,6 +20,11 @@ from __future__ import annotations
 # --------------------------------------------------------------------------
 
 
+#: cuda-mpqs's tuning stage refuses smaller inputs ("Minimum supported:
+#: ~24 digits (~80 bits)"); below this only TD/rho/ECM can split a number.
+MPQS_MIN_DIGITS = 24
+
+
 def mpqs_lp1_bound(digits: int) -> int | None:
     if digits < 80:
         return None
@@ -51,6 +56,12 @@ NFS_PARAMS_ANCHORS: tuple[tuple[int, tuple[int, int, int, int]], ...] = (
 #: Python poly is used below this.
 NFS_MSIEVE_POLY_MIN_DIGITS = 90
 
+#: smallest size the GNFS table covers.  Clamping a smaller composite to
+#: the c70 row is not a valid job: with lpb 23 and rlim 350k on a tiny n
+#: nearly every (a, b) survives the norm bound, and the sieve dies in its
+#: first special-q ("candidates exceeds the cofactor queue").
+NFS_MIN_DIGITS = NFS_PARAMS_ANCHORS[0][0]
+
 
 def _interp(anchors, x: float) -> tuple[int, int, int, int]:
     if x <= anchors[0][0]:
@@ -69,7 +80,16 @@ def _interp(anchors, x: float) -> tuple[int, int, int, int]:
 
 
 def nfs_params(digits: int) -> tuple[int, int, int, int]:
-    """(rlim, alim, lpb, logI) for a digits-digit GNFS job."""
+    """(rlim, alim, lpb, logI) for a digits-digit GNFS job.
+
+    Raises ValueError below the smallest tabulated size instead of clamping:
+    a c6 sieved with the c70 row floods the cofactor queue and fails, and a
+    number this small is TD/rho/ECM territory, not a GNFS job.
+    """
+    if digits < NFS_MIN_DIGITS:
+        raise ValueError(
+            f"GNFS parameters are tabulated from c{NFS_MIN_DIGITS}; "
+            f"c{digits} is not a sieve job")
     return _interp(NFS_PARAMS_ANCHORS, digits)
 
 

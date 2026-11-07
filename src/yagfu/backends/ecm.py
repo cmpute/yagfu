@@ -17,6 +17,7 @@ Validated contract (RTX 4090, gmp-ecm 7.0.6 --enable-gpu + gpuecm2 0.1.0):
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 import time
@@ -50,6 +51,29 @@ _RE_STEP2_FACTOR = re.compile(r"Factor found in step (\d+): (\d+)")
 _RE_UNSUPPORTED = re.compile(
     r"input number should be stricly lower|Bits exceeded|exceeds the .* limit|"
     r"no kernel|kernel size")
+
+#: gmp-ecm's bit-coded result codes (ecm-ecm.h): 0 = no factor, 2|6|10|14 =
+#: a proper factor was found (2: factor, 4: factor is prime, 8: cofactor is
+#: prime/1), 8 = the "factor" was the input number itself (no split at all).
+#: 1 is ECM_EXIT_ERROR; anything else is unexpected.
+_ECM_OK_RC = (0, 2, 6, 8, 10, 14)
+
+
+def _nkey(n: int) -> str:
+    """Short stable suffix identifying one number's ECM artifacts.
+
+    The ladder tag repeats across recursions (``l0-1`` is the first level
+    for every composite) while one workdir holds every recursion, so
+    without the number in the file name two composites would collide on
+    the same ``-save`` file.
+    """
+    return hashlib.sha1(str(n).encode()).hexdigest()[:8]
+
+
+def _log_tail(log: str, lines: int = 3) -> str:
+    """Last non-empty log lines, for one-line error messages."""
+    tail = [ln.strip() for ln in log.splitlines() if ln.strip()][-lines:]
+    return " | ".join(tail)[:300] or "(no output)"
 
 
 class EcmUnsupported(Exception):
@@ -115,31 +139,54 @@ class EcmRunResult:
     error: str | None = None
 
 
-def _parse_stage1_log(log: str, b1: int, requested: int
+def _parse_stage1_log(log: str, b1: int, n: int
                       ) -> tuple[dict[int, EcmProvenance], int]:
-    """(factors, curves actually run) from an ``ecm -gpu`` log."""
+    """(factors, curves actually run) from an ``ecm -gpu`` log.
+
+    The input number itself is not a factor.  When B1 exceeds the group
+    order of every prime factor (tiny n), stage 1 returns n on every curve
+    and gmp-ecm reports it as a found factor (its own log then says
+    ``Found input number N``); recursing on it would never terminate.  This
+    is the same guard parse_stage2_log already applies.
+
+    Curves run is read from the log only: a run that never started (for
+    example a stale ``-save`` file makes gmp-ecm exit at once) must credit
+    zero curves, not the requested count.
+    """
     if _RE_UNSUPPORTED.search(log):
         raise EcmUnsupported(log.strip().splitlines()[-1])
     factors: dict[int, EcmProvenance] = {}
     for m in _RE_STEP1_FACTOR.finditer(log):
         f, _param, sigma = int(m.group(1)), m.group(2), int(m.group(3))
+        if f in (1, n):
+            continue
         factors.setdefault(f, EcmProvenance(b1=b1, stage=1, sigma=sigma))
     m = _RE_COMPUTING.search(log) or _RE_CURVES_HDR.search(log)
-    ran = int(m.group(1)) if m else requested
+    ran = int(m.group(1)) if m else 0
     return factors, ran
 
 
 def _stage1(n: int, b1: int, curves: int, ctx: RunContext, wd: Path,
             tag: str, device: str
-            ) -> tuple[int, dict[int, EcmProvenance], int, float, str | None]:
-    """One GPU stage-1 invocation; returns (rc, factors, curves, wall, error).
+            ) -> tuple[int, dict[int, EcmProvenance], int, float,
+                       str | None, bool]:
+    """One GPU stage-1 invocation; returns (rc, factors, curves, wall,
+    error, killed).
 
     `device` is a physical id: the process is pinned to it via
-    CUDA_VISIBLE_DEVICES and addresses it as ordinal 0.
+    CUDA_VISIBLE_DEVICES and addresses it as ordinal 0.  killed=True marks
+    a deliberate early-yield (a stop callback fired): no curves are
+    credited and it is not an error — the caller must stop cleanly, not
+    report no-progress.
     """
     ecm = find_bin("ecm", ctx.bin_dir)
-    res_path = wd / f"ecm-{tag}.residues"
-    log_path = wd / f"ecm-{tag}.stage1.log"
+    key = _nkey(n)
+    res_path = wd / f"ecm-{tag}.{key}.residues"
+    log_path = wd / f"ecm-{tag}.{key}.stage1.log"
+    # gmp-ecm refuses to overwrite an existing -save file (it prints and
+    # exits 1).  yagfu never resumes stage 1, so a file left by an earlier
+    # attempt is stale: clear it or this run becomes a silent no-op.
+    res_path.unlink(missing_ok=True)
     cmd = [ecm, "-gpu", "-gpudevice", 0, "-save", res_path.name,
            "-gpucurves", curves, str(b1), "1"]
     pin = ctx.pin_env(device)
@@ -151,10 +198,14 @@ def _stage1(n: int, b1: int, curves: int, ctx: RunContext, wd: Path,
     except Exception as e:  # noqa: BLE001
         return -1, {}, 0, time.monotonic() - t0, f"ecm failed to run: {e!r}"
     wall = time.monotonic() - t0
-    factors, ran = _parse_stage1_log(read_log(log_path), b1, curves)
-    if rc == KILLED_RC:
+    log = read_log(log_path)
+    factors, ran = _parse_stage1_log(log, b1, n)
+    killed = rc == KILLED_RC
+    if killed:
         ran = 0
-    return rc, factors, ran, wall, None
+    elif rc not in _ECM_OK_RC and not factors:
+        return rc, {}, 0, wall, f"ecm rc={rc}: {_log_tail(log)}", False
+    return rc, factors, ran, wall, None, killed
 
 
 @dataclass
@@ -165,6 +216,8 @@ class _Shard:
     ran: int
     wall_s: float
     res_path: Path
+    err: str | None = None
+    killed: bool = False       # deliberate early-yield, not an error
 
 
 def _split_curves(total: int, weights: list[float]) -> list[int]:
@@ -202,15 +255,20 @@ def _stage1_shards(n: int, b1: int, counts: list[int], devices: tuple,
     up to that card's own granularity, and the parsed per-log `ran` keeps
     the accounting exact on heterogeneous cards."""
     ecm = find_bin("ecm", ctx.bin_dir)
+    key = _nkey(n)
     jobs, envs, metas = [], [], []
     for i, (dev, cnt) in enumerate(zip(devices, counts)):
         if cnt <= 0:
             continue
         stag = f"{tag}.s{i}"          # index, not device: --device 0,0 is legal
-        res_path = wd / f"ecm-{stag}.residues"
+        res_path = wd / f"ecm-{stag}.{key}.residues"
+        # stale save file from an earlier attempt: gmp-ecm would exit at
+        # once instead of running (see _stage1)
+        res_path.unlink(missing_ok=True)
         cmd = [ecm, "-gpu", "-gpudevice", 0, "-save", res_path.name,
                "-gpucurves", cnt, str(b1), "1"]
-        jobs.append((cmd, wd / f"ecm-{stag}.stage1.log", f"{n}\n".encode()))
+        jobs.append((cmd, wd / f"ecm-{stag}.{key}.stage1.log",
+                     f"{n}\n".encode()))
         envs.append({"CUDA_VISIBLE_DEVICES": str(dev)})   # dev is physical
         metas.append((i, str(dev), cnt, res_path))
     results = run_procs_parallel(jobs, wd, max(600, 4 * 86400),
@@ -218,13 +276,18 @@ def _stage1_shards(n: int, b1: int, counts: list[int], devices: tuple,
     shards = []
     for (rc, wall), (i, dev, cnt, res_path) in zip(results, metas):
         try:
-            log = read_log(wd / f"ecm-{tag}.s{i}.stage1.log")
+            log = read_log(wd / f"ecm-{tag}.s{i}.{key}.stage1.log")
         except OSError:
             log = ""
-        factors, ran = _parse_stage1_log(log, b1, cnt)
-        if rc == KILLED_RC:
+        factors, ran = _parse_stage1_log(log, b1, n)
+        killed = rc == KILLED_RC
+        err = None
+        if killed:
             ran = 0
-        shards.append(_Shard(dev, factors, ran, wall, res_path))
+        elif rc not in _ECM_OK_RC and not factors:
+            ran = 0
+            err = f"ecm shard {i} rc={rc}: {_log_tail(log)}"
+        shards.append(_Shard(dev, factors, ran, wall, res_path, err, killed))
         ctx.logv(f"ecm: shard {i} (device {dev}): {ran:,} curves in "
                  f"{fmt_dur(wall)} "
                  f"({fmt_count(ran / wall) if wall else 0}/s)")
@@ -271,9 +334,12 @@ def parse_stage2_log(log: str, b1: int, n: int
         m = _RE_STEP2_FACTOR.search(line)
         if m:
             f = int(m.group(2))
-            if f != n:  # "found the input number" is not a factorization
-                factors.setdefault(f, EcmProvenance(
-                    b1=b1, stage=int(m.group(1)), sigma=sigma, b2=b2))
+            if f in (1, n):
+                # "found the input number" (or a bogus 1) is not a
+                # factorization — same guard _parse_stage1_log applies
+                continue
+            factors.setdefault(f, EcmProvenance(
+                b1=b1, stage=int(m.group(1)), sigma=sigma, b2=b2))
     return factors, b2_used
 
 
@@ -282,7 +348,7 @@ def _stage2(n: int, b1: int, res_path: Path, ctx: RunContext, wd: Path,
             ) -> tuple[dict[int, EcmProvenance], float, str | None, int | None]:
     """gpuecm2 on the saved residues; returns (factors, wall, error, b2)."""
     g2 = find_bin("gpuecm2", ctx.bin_dir)
-    log_path = wd / f"ecm-{tag}.stage2.log"
+    log_path = wd / f"ecm-{tag}.{_nkey(n)}.stage2.log"
     cmd = [g2, "-v"]
     if maxmem:
         cmd += ["-maxmem", maxmem]
@@ -300,7 +366,7 @@ def _stage2(n: int, b1: int, res_path: Path, ctx: RunContext, wd: Path,
         raise EcmUnsupported(log.strip().splitlines()[-1])
 
     factors, b2 = parse_stage2_log(log, b1, n)
-    err = None if rc in (0, 2, 6, 8, 10, 14) else f"gpuecm2 rc={rc}"
+    err = None if rc in _ECM_OK_RC else f"gpuecm2 rc={rc}: {_log_tail(log)}"
     return factors, wall, err, b2
 
 
@@ -335,8 +401,8 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
             want = min(remaining, ctx.ecm_maxcurves)
             want = min(((want + _CURVES_GRANULARITY - 1) // _CURVES_GRANULARITY)
                        * _CURVES_GRANULARITY, ctx.ecm_maxcurves)
-            rc, facts, ran, wall, err = _stage1(n, b1, want, ctx, wd,
-                                                f"{tag}.{inv}", s2_dev)
+            rc, facts, ran, wall, err, killed = _stage1(n, b1, want, ctx, wd,
+                                                        f"{tag}.{inv}", s2_dev)
             out.stage1_s += wall
             out.curves_done += ran
             round_ran = ran
@@ -345,10 +411,20 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
                 out.error = err
                 return out
             if out.factors:
-                # keep only factors of n (paranoia: verify everything)
-                out.factors = {f: p for f, p in out.factors.items() if n % f == 0}
+                # keep only proper factors of n (paranoia: verify
+                # everything; f == n is not a split)
+                out.factors = {f: p for f, p in out.factors.items()
+                               if 0 < f < n and n % f == 0}
+                if out.factors:
+                    return out
+            if killed:
+                # an early-yield request, not a failure: stop cleanly
+                # instead of reporting the round as no-progress
                 return out
-            res_paths = [wd / f"ecm-{tag}.{inv}.residues"]
+            if round_ran == 0:
+                out.error = "ecm made no progress (no curves ran)"
+                return out
+            res_paths = [wd / f"ecm-{tag}.{inv}.{_nkey(n)}.residues"]
             round_wall = wall
         else:
             weights = [ctx.ecm_device_rates.get(d) or 1.0 for d in devices]
@@ -366,10 +442,21 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
             for s in shards:
                 out.factors.update(s.factors)
             if out.factors:
-                out.factors = {f: p for f, p in out.factors.items() if n % f == 0}
+                out.factors = {f: p for f, p in out.factors.items()
+                               if 0 < f < n and n % f == 0}
+                if out.factors:
+                    return out
+            shard_errs = [s.err for s in shards if s.err]
+            if shard_errs:
+                out.error = shard_errs[0]
+                return out
+            if any(s.killed for s in shards):
+                return out      # early-yield, as in the single-device path
+            if round_ran == 0:
+                out.error = "ecm made no progress (no curves ran)"
                 return out
             res_paths = [s.res_path for s in shards]
-        merged = wd / f"ecm-{tag}.{inv}.merged"
+        merged = wd / f"ecm-{tag}.{inv}.{_nkey(n)}.merged"
         n_res = _merge_residues(res_paths, merged)
         if n_res == 0:
             return out  # no residues: nothing to resume
@@ -385,7 +472,8 @@ def run_ecm_curves(n: int, b1: int, total_curves: int, ctx: RunContext,
             return out
         if b2 is not None and out.b2 is None:
             out.b2 = b2
-        out.factors.update({f: p for f, p in facts2.items() if n % f == 0})
+        out.factors.update({f: p for f, p in facts2.items()
+                            if 0 < f < n and n % f == 0})
         done += round_ran
     out.wall_s = out.stage1_s + out.stage2_s
     return out

@@ -48,7 +48,7 @@ from .ecmledger import (
 from .fmt import fmt_count, fmt_dur
 import shutil
 
-from .params import nfs_disk_estimate, snfs_gnfs_equiv
+from .params import MPQS_MIN_DIGITS, nfs_disk_estimate, snfs_gnfs_equiv
 from .primes import SPRP_2761_LIMIT, is_probable_prime
 
 if TYPE_CHECKING:
@@ -367,19 +367,30 @@ class Engine:
             if r.curves_done == 0 and not r.factors:
                 raise FactorError("ecm made no progress")
             if r.factors:
+                split = False
                 for f in sorted(r.factors, key=lambda x: -len(str(x))):
+                    if f <= 1 or f == m:
+                        # "factor == input" is not a split (tiny n at a B1
+                        # above every group order); recursing on it would
+                        # reproduce this exact stage forever
+                        ctx.logv(f"ecm: ignoring {f} (the input itself, "
+                                 f"not a proper factor)")
+                        continue
                     if m % f:
                         continue
                     res.bump("ecm_factors")
                     self._collect(f, "ecm", wd, res, depth, ecm=r.factors[f])
                     m //= f
+                    split = True
                     if m == 1 or is_probable_prime(m):
                         return m
-                # curves already run count for the cofactor: keep the
-                # ledger and the ladder position, just switch numbers
-                ctx.log(f"ecm: cofactor now c{_digits(m)}, "
-                        f"continuing at t{T_LEVELS[j]}")
-                continue
+                if split:
+                    # curves already run count for the cofactor: keep the
+                    # ledger and the ladder position, just switch numbers
+                    ctx.log(f"ecm: cofactor now c{_digits(m)}, "
+                            f"continuing at t{T_LEVELS[j]}")
+                    continue
+                # nothing usable: keep climbing instead of stalling here
             j += 1
         return m
 
@@ -495,6 +506,17 @@ class Engine:
                     f"usual sieve selection")
             snfs = None
 
+        if digits < MPQS_MIN_DIGITS:
+            # cuda-mpqs rejects N below ~24 digits and the GNFS table starts
+            # at c70: a leftover this small means TD/rho/ECM did not split
+            # something they should have.  Handing it to a sieve produces
+            # either an immediate refusal (SIQS) or a flood of degenerate
+            # relations (NFS), never a factorization.
+            raise FactorError(
+                f"c{digits} left after TD/rho/ECM is below the sieves' "
+                f"minimum (SIQS needs >= {MPQS_MIN_DIGITS} digits); "
+                f"cannot factor it")
+
         want_nfs = ctx.force_method == "nfs" or (
             ctx.force_method != "siqs" and digits >= ctx.xover)
         order = ("nfs", "siqs") if want_nfs else ("siqs", "nfs")
@@ -510,17 +532,22 @@ class Engine:
                     ctx.log(f"siqs: rc={r.rc} in {r.wall_s:.1f}s "
                             f"({r.error or 'ok'})")
                     if r.ok:
-                        self._absorb(r.factors, m, "siqs", wd, res, depth)
-                        return
+                        if self._absorb(r.factors, m, "siqs", wd, res, depth):
+                            return
+                        # garbage dump (the input itself at best): let the
+                        # other sieve take its turn instead of aborting
+                        ctx.log(f"siqs: no proper factor of c{digits}")
                 else:
                     t = time.monotonic()
                     r = self._nfs(m, wd)
                     res.spend("nfs", time.monotonic() - t)
                     res.bump("nfs_runs")
                     if r.ok and r.factors:
-                        self._absorb(r.factors, m, "nfs", wd, res, depth)
-                        return
-                    ctx.log(f"nfs: no factors ({r.error})")
+                        if self._absorb(r.factors, m, "nfs", wd, res, depth):
+                            return
+                        ctx.log(f"nfs: no proper factor of c{digits}")
+                    else:
+                        ctx.log(f"nfs: no factors ({r.error})")
             except TimeoutError:
                 raise
             except (FactorError, EcmUnsupported):
@@ -561,15 +588,26 @@ class Engine:
             self._factor_rec(cof, wd, res, depth + 1)
 
     def _absorb(self, raw_factors: list[int], m: int, source: str, wd: Path,
-                res: FactorResult, depth: int) -> None:
-        """Turn a sieve's factor dump into verified prime FoundFactors."""
+                res: FactorResult, depth: int) -> bool:
+        """Turn a sieve's factor dump into verified prime FoundFactors.
+
+        Returns False when the dump holds no proper factor of m at all (at
+        best the input itself): the caller then falls back to the other
+        sieve instead of recursing on this same number forever."""
         cof = m
         for f in sorted(set(raw_factors)):
+            if f <= 1 or f == m:
+                # the input itself is not a split (and would recurse on
+                # this very number); same guard as the ECM stage
+                continue
             while cof % f == 0:
                 self._collect(f, source, wd, res, depth)
                 cof //= f
         if cof > 1:
+            if cof == m:
+                return False
             self._factor_rec(cof, wd, res, depth + 1)
+        return True
 
     def _nfs(self, n: int, wd: Path, snfs: "SnfsJob | None" = None):
         if self._run_nfs is None:

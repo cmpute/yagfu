@@ -29,10 +29,30 @@ def test_nfs_params_anchors_exact():
     assert nfs_params(150) == (100_000_000, 100_000_000, 31, 14)
 
 
-def test_nfs_params_clamps():
-    # below/above the table: clamp to the end rows
-    assert nfs_params(40) == nfs_params(70)
+def test_nfs_params_clamps_above():
+    # above the table: clamp to the last row
     assert nfs_params(200) == nfs_params(150)
+
+
+def test_nfs_params_below_table_raises():
+    # clamping a tiny composite to the c70 row is not a valid sieve job
+    # (norms under the bounds, cofactor-queue overflow at the first q)
+    with pytest.raises(ValueError, match="from c70"):
+        nfs_params(40)
+    with pytest.raises(ValueError, match="from c70"):
+        nfs_params(6)
+
+
+def test_run_nfs_refuses_below_table(tmp_path):
+    """The backend must not even set a workdir up for a tiny composite."""
+    from yagfu.backends.nfs import run_nfs
+    from yagfu.config import RunContext
+
+    wd = tmp_path / "nfs"
+    res = run_nfs(409 * 449, RunContext(quiet=True,
+                                        log_file=tmp_path / "run.log"), wd)
+    assert not res.ok and "c70" in res.error
+    assert not wd.exists()
 
 
 def test_nfs_params_monotone_interpolation():

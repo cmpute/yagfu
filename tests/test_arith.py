@@ -2,7 +2,15 @@ import random
 
 import pytest
 
-from yagfu.arith import _brent, iroot, perfect_power, pollard_rho, trial_divide
+from yagfu.arith import (
+    RHO_MAX_BATCHES,
+    RHO_POLYNOMIALS,
+    _brent,
+    iroot,
+    perfect_power,
+    pollard_rho,
+    trial_divide,
+)
 from yagfu.primes import PRIMES_UNDER_256, _sieve
 
 gmpy2 = pytest.importorskip("gmpy2")
@@ -69,6 +77,19 @@ def test_brent_finds_small_factors():
         p, q = semiprime(dp, dq, rng)
         f = _brent(p * q, 1, batches)
         assert f in (p, q)
+
+
+def test_brent_tiny_n_zero_product_still_splits():
+    """Regression: on 409*449 (both factors above TD's 256 bound) the batch
+    product q reaches 0 mod n within a few batches.  The old `if q:` guard
+    skipped the gcd from then on (q stays 0 forever), so rho burned its
+    whole budget and reported no factor — the trigger for the c6 ECM/NFS
+    failure chain."""
+    n = 409 * 449
+    for c in RHO_POLYNOMIALS:
+        assert _brent(n, c, RHO_MAX_BATCHES) in (409, 449)
+    factors, cof = pollard_rho(n)
+    assert sorted(factors + ([cof] if cof > 1 else [])) == [409, 449]
 
 
 def test_rho_pipeline():

@@ -48,6 +48,7 @@ from types import SimpleNamespace
 from ..config import RunContext
 from ..fmt import fmt_count, fmt_dur
 from ..params import (
+    NFS_MIN_DIGITS,
     NFS_MSIEVE_POLY_MIN_DIGITS,
     nfs_params,
     poly_budget,
@@ -970,8 +971,18 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
     """Factor n with GNFS inside wd (polyselect runs here when nothing
     reusable is on disk).  With `snfs`, that supplied polynomial is used
     as-is: no polyselect, parameters from the SNFS difficulty table."""
+    digits = len(str(n))
+    if snfs is None and digits < NFS_MIN_DIGITS:
+        # the table has nothing below c70; the clamped c70 row sieves a
+        # small n with norms far under its own bounds, so every candidate
+        # survives and the first special-q overflows the cofactor queue.
+        res = NfsResult()
+        res.error = (f"GNFS is tabulated from c{NFS_MIN_DIGITS}; c{digits} "
+                     f"belongs to SIQS or the prework stages")
+        ctx.log(f"nfs: {res.error}")
+        return res
     rlim, alim, lpb, logI = (snfs_params(snfs.scaled) if snfs is not None
-                             else nfs_params(len(str(n))))
+                             else nfs_params(digits))
     if ctx.sieve_logI is not None:
         # operator override: the tables cap logI at cuda-sieve's per-relation
         # sweet spot, but a job whose special-q window is the binding limit
@@ -986,7 +997,6 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
     msieve = find_bin("msieve", ctx.bin_dir)
     cuda_sieve = find_bin("cuda-sieve", ctx.bin_dir)
     wd.mkdir(parents=True, exist_ok=True)
-    digits = len(str(n))
     nproc = str(ctx.threads)
     ctx.log(f"nfs: c{digits}"
             + (f" snfs (difficulty {snfs.scaled:g}"
