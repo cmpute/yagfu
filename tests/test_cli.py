@@ -182,14 +182,18 @@ def test_db_ff_never_runs_engine():
 # ------------------------------------------------------------------- snfs
 
 def _snfs_rec(n, scaled=40.0, status="C"):
-    """A factordb record carrying an SNFS suggestion (probe shape)."""
+    """A factordb record carrying an SNFS suggestion (probe shape).
+
+    The poly x^2-49 with y0=-7/y1=1 has its root exactly (f(-y0/y1)=0 for
+    every n), so it survives parse_snfs_suggestion's root-mod-n filter
+    regardless of the fixture's n."""
     return {"fid": "fid1", "status": status,
             "snfs": {"n": str(n), "status": status,
-                     "polys": [{"c": ["1", "0", "0", "1"],
+                     "polys": [{"c": ["-49", "0", "1"],
                                 "difficulty": scaled, "scaled": scaled,
                                 "side": "a", "skew": 1.0,
                                 "y0": "-7", "y1": "1",
-                                "form": "x^3+1", "e": 1e-4}]}}
+                                "form": "x^2-49", "e": 1e-4}]}}
 
 
 def test_db_snfs_suggestion_reaches_engine():

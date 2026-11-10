@@ -279,19 +279,33 @@ suggests it: for open composites of 80–400 digits the record query asks for th
 polynomials with difficulty scores. When the record being factored carries one
 (and nothing was divided out of it first), yagfu:
 
-* sieves the polynomial factordb ranks first — no local SNFS polynomial search,
-  no GNFS polyselect; the special-q side follows the suggestion (`--sq-side 0`
-  for rational-side polys);
+* drops the suggestion's polys that have no root mod the number (factordb
+  lists polys of the source *expression*; for quotient terms not all of
+  them divide the stored cofactor), then re-ranks the survivors by
+  normalized Murphy E — `E · 1.6^(6 − degree)`, the msieve
+  polyselect normalization that phi.kyleaskine.com also uses — with the
+  bundled `score-poly` helper (msieve's `analyze_poly_murphy` plus a
+  golden-section E-optimal skew; CPU only).  factordb orders by scaled
+  difficulty, which is not the same ranking.  Without the helper, the
+  factordb order stands;
+* sieves the winning polynomial — no local SNFS polynomial search, no
+  GNFS polyselect; the special-q side follows the suggestion
+  (`--sq-side 0` for rational-side polys);
+* sizes the job with the per-side GPU profile (`snfs_sieve_params` in
+  `params.py`): factor-base limits calibrated on this GPU — Kyle
+  Askine's review of the `15^253−1` suggestion ("the factordb lims are
+  really low ... 2LP is bad for this poly ... 600M/400M at least, and
+  would definitely go 95/63 for mfb") pins the d≈135 anchor — with
+  `lpb 32` and a 3LP `mfb 95` on the special-q side against a 2LP
+  `mfb 63` on the other (cuda-sieve's rule: the q and the 3LP mfb go
+  to the same side).  The classic symmetric 2LP table
+  (`SNFS_PARAMS_ANCHORS`) is kept only as a reference;
 * sizes the ECM pretest by the GNFS-equivalent of the suggestion's scaled
   difficulty, using yafu's empirical conversion `gnfs ≈ 0.56·D + 30`
   (factordb states the same thing on its record pages: the
   `859465723^19−1` suggestion has difficulty 169.75 yet "costs about as
   much as GNFS on a 125-digit number").  The pretest then breaks even
-  against what the sieving job actually costs.  The sieving parameters
-  themselves (rlim/alim/lpbr/logI) stay keyed on the SNFS difficulty,
-  like every SNFS parameter table (`SNFS_PARAMS_ANCHORS` in `params.py`;
-  initial anchors, the two factordb-generated jobs pin the ends, not
-  measured calibrations);
+  against what the sieving job actually costs;
 * absorbs the factors of the original number, stripping whatever the ECM
   pretest already found (sieving the polynomial's number costs the same as
   sieving the cofactor, and covers both).

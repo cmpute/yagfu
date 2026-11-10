@@ -119,8 +119,89 @@ SNFS_PARAMS_ANCHORS: tuple[tuple[int, tuple[int, int, int, int]], ...] = (
 
 
 def snfs_params(difficulty: float) -> tuple[int, int, int, int]:
-    """(rlim, alim, lpb, logI) for an SNFS job of this scaled difficulty."""
+    """(rlim, alim, lpb, logI) for an SNFS job of this scaled difficulty.
+
+    Superseded for sieving by snfs_sieve_params (per-side LP profile);
+    kept as the classic-table reference for tests and size estimates."""
     return _interp(SNFS_PARAMS_ANCHORS, difficulty)
+
+
+# --------------------------------------------------------------------------
+# SNFS sieve profile for cuda-sieve: per-side limits and large-prime bounds.
+#
+# The classic symmetric 2LP tables above price sieving like a CPU lasieve:
+# per-special-q cost is the scarce resource, so the FB stays small and
+# mfb = 2*lpb.  cuda-sieve's per-q cost is near-flat, so the wall time is
+# (relations needed) / (yield per q) and yield per q is what the large
+# primes buy.  Two consequences (Kyle Askine's review of the 15^253-1
+# suggestion, Nov 2026: "2LP is bad for this poly, and the factordb lims
+# are really low ... especially on your GPU I'd be fine with like 600M/400M
+# at least (and bigger still might just be strictly better), and would
+# definitely go 95/63 for mfb"):
+#
+#   * the factor-base limits grow an order of magnitude or more;
+#   * the special-q side carries a 3LP mfb (95 = 3*32 - 1) while the other
+#     side stays 2LP (63 = 2*32 - 1).  cuda-sieve's own rule ("the q and
+#     the 3LP mfb go there with it") puts both on the side factordb's
+#     `side` names.  For halved-cyclotomic SNFS forms the other side's
+#     norms are minuscule and a symmetric 2*lpb mfb kills essentially
+#     every candidate: the 15^253-1 halved-Phi11 form has ~2^100 rational
+#     norms that 2LP at lpb 26 (yagfu's old table) can never cover.
+#
+# Only the 600M/400M @ scaled-275 point is operator-calibrated — Kyle
+# Askine's review was of the 15^253-1 suggestion at factordb scaled
+# difficulty 274.74, so the anchor sits on factordb's own scale (the
+# scale run_nfs keys on), NOT on the halved form's true norm difficulty
+# (~half of it).  The rest of the ladder extrapolates at ~x1.6/+20d and
+# is an estimate, not a measurement; the top is capped where the device
+# factor base (pi(rlim) ideals) would outgrow a 24 GB card.
+# --------------------------------------------------------------------------
+
+SNFS_SIEVE_ANCHORS: tuple[tuple[int, tuple[int, int, int]], ...] = (
+    (90,  (4_000_000,     3_000_000,     12)),
+    (110, (10_000_000,    7_000_000,     12)),
+    (125, (16_000_000,    11_000_000,    13)),
+    (145, (25_000_000,    17_000_000,    13)),
+    (165, (40_000_000,    27_000_000,    13)),
+    (185, (65_000_000,    43_000_000,    13)),
+    (205, (100_000_000,   68_000_000,    14)),
+    (225, (160_000_000,   108_000_000,   14)),
+    (245, (250_000_000,   168_000_000,   14)),
+    (265, (380_000_000,   255_000_000,   14)),
+    (275, (600_000_000,   400_000_000,   14)),
+    (295, (900_000_000,   600_000_000,   14)),
+    (320, (1_500_000_000, 1_000_000_000, 14)),
+    (350, (2_400_000_000, 1_600_000_000, 14)),
+)
+
+#: scaled difficulty at or above which the special-q side goes 3LP
+SNFS_3LP_MIN_DIFFICULTY = 125.0
+
+#: lambdas follow CADO's automatic rule 0.3 + mfb/lpb
+def _snfs_lambda(mfb: int, lpb: int) -> float:
+    return round(0.3 + mfb / lpb, 2)
+
+
+def snfs_sieve_params(scaled: float, side: str) -> tuple:
+    """Per-side sieve profile (rlim, alim, lpbr, lpba, mfbr, mfba,
+    rlambda, alambda, logI) for an SNFS job of this scaled difficulty with
+    factordb's special-q `side` ("a" or "r")."""
+    rlim, alim, logI = _interp(SNFS_SIEVE_ANCHORS, scaled)
+    if scaled >= SNFS_3LP_MIN_DIFFICULTY:
+        # 3LP on the special-q side, 2LP on the other (cuda-sieve's rule)
+        sq_lpb, sq_mfb = 32, 95
+        other_lpb, other_mfb = 32, 63
+    else:
+        sq_lpb, sq_mfb = 29, 58
+        other_lpb, other_mfb = 29, 58
+    if side == "r":
+        lpbr, mfbr = sq_lpb, sq_mfb
+        lpba, mfba = other_lpb, other_mfb
+    else:
+        lpba, mfba = sq_lpb, sq_mfb
+        lpbr, mfbr = other_lpb, other_mfb
+    return (rlim, alim, lpbr, lpba, mfbr, mfba,
+            _snfs_lambda(mfbr, lpbr), _snfs_lambda(mfba, lpba), logI)
 
 
 # --------------------------------------------------------------------------

@@ -202,6 +202,15 @@ build_msieve() {
   # matrices yagfu runs. The single-binary build embeds every kernel.
   make -j"$JOBS" all CUDA="$SM" VBITS=128 LDFLAGS="$drv"
   install_bin "$ROOT/msieve-cuda/msieve" msieve
+
+  # score-poly: Murphy-E scorer for SNFS poly candidates (CPU only; the
+  # static lib carries CUDA objects, hence the same link line as msieve)
+  gcc -O2 -o "$BIN/score-poly" "$ROOT/tools/score_poly.c" \
+    -I"$ROOT/msieve-cuda/ms_include" -I"$ROOT/msieve-cuda/include" \
+    -I"$ROOT/msieve-cuda" -I"$ROOT/msieve-cuda/gnfs" \
+    "$ROOT/msieve-cuda/libmsieve.a" \
+    -lgmp -lm -lpthread -lstdc++ -lgomp -lz -lcuda \
+    -L"$CUDA_ROOT/lib64" -lcudart
 }
 
 # ---------------------------------------------------------------------------

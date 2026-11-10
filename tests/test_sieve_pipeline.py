@@ -375,10 +375,10 @@ def test_filter_rung_estimator():
 
 # ------------------------------------------------------------------- snfs
 
-def _snfs_job(n, side="a"):
+def _snfs_job(n, side="a", scaled=70.6):
     return SnfsJob(n=n, coeffs=[1, 0, 0, 0, 0, 0, 3], y0=-100, y1=1,
-                   skew=1.0, difficulty=70.1, scaled=70.6, side=side,
-                   form="x^6+3", e=1e-4)
+                   skew=1.0, difficulty=scaled - 0.5, scaled=scaled,
+                   side=side, form="x^6+3", e=1e-4)
 
 
 def test_snfs_run_skips_polyselect_and_writes_job(harness, tmp_path):
@@ -427,11 +427,11 @@ def test_snfs_job_file_roundtrip():
     the difficulty/side comments; a factordb snfs.php-style file parses
     with its params ignored (yagfu picks them from the difficulty)."""
     from yagfu.backends.nfs import snfs_job_from_file
-    from yagfu.params import snfs_params
+    from yagfu.params import snfs_sieve_params
 
     job = _snfs_job(N71, side="r")
-    rlim, alim, lpb, _ = snfs_params(job.scaled)
-    text = nfs._snfs_job_text(job, rlim, alim, lpb)
+    sieve = snfs_sieve_params(job.scaled, job.side)
+    text = nfs._snfs_job_text(job, sieve)
     back = snfs_job_from_file(text)
     assert back.n == job.n and back.coeffs == job.coeffs
     assert back.y0 == job.y0 and back.y1 == job.y1
@@ -462,3 +462,59 @@ alambda: 2.5
     assert j2.difficulty == 70.10 and j2.scaled == 70.60
     assert j2.side == "a"
     assert snfs_job_from_file("n: 123\n") is None     # no polynomial
+
+
+def test_snfs_job_text_per_side_lp():
+    """The special-q side carries the 3LP mfb; the job file passes every
+    per-side value through to cuda-sieve verbatim."""
+    from yagfu.params import snfs_sieve_params
+
+    job = _snfs_job(N71, side="r", scaled=160.0)
+    sieve = snfs_sieve_params(job.scaled, job.side)
+    text = nfs._snfs_job_text(job, sieve)
+    (rlim, alim, lpbr, lpba, mfbr, mfba, rlbd, albd, _logI) = sieve
+    assert f"lpbr: {lpbr}" in text and f"lpba: {lpba}" in text
+    assert f"mfbr: {mfbr}" in text and f"mfba: {mfba}" in text
+    assert mfbr == 95 and mfba == 63          # sq side r carries the 3LP
+    assert f"rlambda: {rlbd}" in text
+
+
+def test_poly_has_root_mod_n():
+    """The 15^253-1 halved-Phi11 form has its root mod the number it
+    divides; flipping one coefficient (or targeting the parent number
+    15^253-1 itself) breaks it — factordb's suggestion can carry such
+    polys for quotient terms, and they must be dropped before sieving."""
+    t = 15 ** 23
+    n_good = sum(t ** k for k in range(11))     # Phi_11(15^23)
+    good = SnfsJob(n=n_good, coeffs=[1, 3, -3, -4, 1, 1],
+                   y0=t * t + 1, y1=-t, skew=1.0,
+                   difficulty=135.3, scaled=135.3, side="r")
+    assert nfs.poly_has_root_mod_n(good)
+    bad = SnfsJob(n=15 ** 253 - 1, coeffs=[1, 3, -3, -4, 1, 1],
+                  y0=t * t + 1, y1=-t, skew=1.0,
+                  difficulty=135.3, scaled=135.3, side="r")
+    assert not nfs.poly_has_root_mod_n(bad)
+    tampered = SnfsJob(n=n_good, coeffs=[1, 3, -3, -4, 1, 2],
+                       y0=t * t + 1, y1=-t, skew=1.0,
+                       difficulty=135.3, scaled=135.3, side="r")
+    assert not nfs.poly_has_root_mod_n(tampered)
+
+
+def test_parse_snfs_suggestion_filters_and_keeps_alternates():
+    """Polys without a root mod n are dropped; the survivors ride along
+    as alternates in factordb's order."""
+    t = 15 ** 23
+    n_good = sum(t ** k for k in range(11))
+    good = {"c": ["1", "3", "-3", "-4", "1", "1"],
+            "y0": str(t * t + 1), "y1": str(-t), "skew": "1.0",
+            "difficulty": "135.3", "scaled": "135.3", "side": "r",
+            "form": "halved Phi11"}
+    bad = {"c": ["2", "3", "-3", "-4", "1", "1"],
+           "y0": good["y0"], "y1": good["y1"],
+           "skew": "1.0", "difficulty": "135.3", "scaled": "135.3",
+           "side": "r", "form": "does not divide the quotient"}
+    raw = {"n": str(n_good), "polys": [bad, good]}
+    job = nfs.parse_snfs_suggestion(raw, n_good)
+    assert job is not None
+    assert job.form == "halved Phi11"          # the bad poly was dropped
+    assert job.alternates == []

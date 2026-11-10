@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 
 #: binaries bundled by scripts/build_wheel.sh
-BUNDLED = ("ecm", "gpuecm2", "cuda-mpqs", "cuda-sieve", "fbgen", "fbgen_gpu", "msieve")
+BUNDLED = ("ecm", "gpuecm2", "cuda-mpqs", "cuda-sieve", "fbgen", "fbgen_gpu", "msieve", "score-poly")
 
 
 class BinNotFound(FileNotFoundError):

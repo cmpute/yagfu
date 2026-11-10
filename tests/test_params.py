@@ -10,6 +10,7 @@ from yagfu.params import (
     sieve_time_estimate,
     snfs_gnfs_equiv,
     snfs_params,
+    snfs_sieve_params,
 )
 
 
@@ -142,3 +143,40 @@ def test_snfs_gnfs_equiv():
     # difficulty 169.75 "costs about as much as GNFS on a 125-digit number"
     assert snfs_gnfs_equiv(169.75) == 125.06
     assert snfs_gnfs_equiv(269.75) == 181.06
+
+
+def test_snfs_sieve_params_calibrated_point():
+    # Kyle Askine's 15^253-1 review (Nov 2026) was of the factordb
+    # suggestion at SCALED difficulty 274.74: "600M/400M at least" and
+    # "95/63 for mfb" with the special-q on the rational side.  The anchor
+    # sits on factordb's scale, not the halved form's true norm difficulty.
+    (rlim, alim, lpbr, lpba, mfbr, mfba, rlbd, albd, logI) = \
+        snfs_sieve_params(275.0, "r")
+    assert rlim == 600_000_000 and alim == 400_000_000
+    assert lpbr == 32 and mfbr == 95          # 3LP on the special-q side
+    assert lpba == 32 and mfba == 63          # 2LP on the other side
+    assert rlbd > albd                        # CADO lambda rule follows mfb
+    assert logI == 14
+    # the real 15^253-1 suggestion interpolates just under the anchor
+    near = snfs_sieve_params(274.74, "r")
+    assert 590_000_000 <= near[0] <= 600_000_000
+    # mirroring the sides flips the mfb split, keeps the limits
+    flipped = snfs_sieve_params(275.0, "a")
+    assert flipped[:2] == (rlim, alim)
+    assert (flipped[3], flipped[5]) == (32, 95)
+    assert (flipped[2], flipped[4]) == (32, 63)
+
+
+def test_snfs_sieve_params_2lp_below_threshold():
+    # below SNFS_3LP_MIN_DIFFICULTY both sides stay 2LP
+    for side in ("a", "r"):
+        p = snfs_sieve_params(110.0, side)
+        assert p[4] == 2 * p[2] and p[5] == 2 * p[3]
+
+
+def test_snfs_sieve_params_monotone_limits():
+    prev = snfs_sieve_params(100.0, "r")
+    for d in (120, 135, 160, 200, 260, 300):
+        cur = snfs_sieve_params(float(d), "r")
+        assert cur[0] >= prev[0] and cur[1] >= prev[1]
+        prev = cur
