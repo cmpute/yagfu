@@ -366,6 +366,42 @@ def test_run_cmd_progress_timeout(tmp_path):
     assert rc == -9
 
 
+def test_run_cmd_progress_idle_timeout_kills_a_quiet_child(tmp_path):
+    """A stage whose wall time is set by its input is bounded by liveness
+    only: `timeout=None` leaves no absolute cap, and a child that printed
+    once and then went silent is killed by the idle watchdog (the Lanczos
+    case)."""
+    rc, _ = run_cmd_progress(
+        ["bash", "-c", "echo started; sleep 30"], tmp_path,
+        tmp_path / "l.log", timeout=None, every_s=0.1, idle_timeout=0.6)
+    assert rc == -9
+
+
+def test_run_cmd_progress_idle_timeout_keeps_a_chatty_child(tmp_path):
+    """Fresh output resets the idle clock: a child that keeps printing for
+    longer than idle_timeout runs to completion."""
+    rc, _ = run_cmd_progress(
+        ["bash", "-c",
+         "for i in $(seq 1 12); do echo tick $i; sleep 0.15; done"],
+        tmp_path, tmp_path / "l.log", timeout=60, every_s=0.1,
+        idle_timeout=0.6)
+    assert rc == 0
+
+
+def test_run_cmd_progress_idle_activity_path_keeps_child(tmp_path):
+    """A checkpoint file counts as activity even when stdout is quiet:
+    msieve's Lanczos can go a while between progress lines while it keeps
+    rewriting msieve.dat.chk."""
+    chk = tmp_path / "msieve.dat.chk"
+    chk.write_bytes(b"x")
+    rc, _ = run_cmd_progress(
+        ["bash", "-c",
+         f"for i in $(seq 1 10); do touch {chk}; sleep 0.15; done"],
+        tmp_path, tmp_path / "l.log", timeout=60, every_s=0.1,
+        idle_timeout=0.6, activity_paths=(chk,))
+    assert rc == 0
+
+
 def test_feed_lines_splits_carriage_returns(tmp_path):
     """msieve paces progress updates with bare \\r; each must arrive as its
     own line, and a trailing \\r-terminated segment must not be lost."""

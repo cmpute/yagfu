@@ -97,14 +97,25 @@ def _feed_lines(log_path: Path, pos: int, pending: str, on_lines):
 
 def run_cmd_progress(cmd, cwd, log_path, timeout=3600, env_extra=None,
                      every_s=30.0, on_lines=None, input_bytes=None,
-                     stop=None):
+                     stop=None, idle_timeout=None, activity_paths=()):
     """Run a subprocess like run_cmd, but poll it instead of blocking: every
     `every_s` the log lines appended so far are handed to on_lines(list[str]),
     so long stages can surface their own progress.
 
     `stop` () -> bool is polled too: when it fires the child is killed and
     (KILLED_RC, wall) returns — an early-yield request, not a failure.
-    Returns (rc, wall); rc is -9 when `timeout` expires.
+    Returns (rc, wall); rc is -9 when `timeout` expires or the child is
+    idle-killed.  `timeout=None` disables the absolute cap: a stage whose
+    duration is a property of its input is bounded by liveness only.
+
+    `idle_timeout`: kill the child when neither `log_path` nor any file in
+    `activity_paths` has been written for that many seconds.  This is the
+    liveness bound for stages whose wall time is a property of the input
+    rather than a constant (msieve's Lanczos prints a progress line every
+    few thousand dimensions and rewrites msieve.dat.chk every ~1.5M, so
+    silence means a stalled device, not a long job).  An idle kill returns
+    -9 like the absolute timeout; a caller that can resume from a
+    checkpoint treats -9 as "interrupted", which is exactly right for both.
     KeyboardInterrupt kills the child and propagates, like run_cmd.
     """
     env = dict(os.environ)
@@ -123,6 +134,7 @@ def run_cmd_progress(cmd, cwd, log_path, timeout=3600, env_extra=None,
             except OSError:
                 pass  # child died before reading its input
         pos, pending = 0, ""
+        last_active = time.time()
         try:
             while p.poll() is None:
                 if on_lines:
@@ -134,7 +146,24 @@ def run_cmd_progress(cmd, cwd, log_path, timeout=3600, env_extra=None,
                 if stop is not None and stop():
                     _term_kill_ladder(p)
                     return KILLED_RC, time.monotonic() - t0
-                if time.monotonic() - t0 > timeout:
+                if idle_timeout is not None:
+                    # mtime rather than the byte offset: msieve paces its
+                    # progress with bare carriage returns and the Lanczos
+                    # checkpoint is a separate file, so a quiet stdout with a
+                    # fresh .chk is progress, not a stall
+                    newest = 0.0
+                    for path in (log_path, *activity_paths):
+                        try:
+                            newest = max(newest, os.path.getmtime(path))
+                        except OSError:
+                            pass
+                    if newest > last_active:
+                        last_active = newest
+                    if time.time() - last_active > idle_timeout:
+                        p.kill()
+                        p.wait()
+                        return -9, time.monotonic() - t0
+                if timeout is not None and time.monotonic() - t0 > timeout:
                     p.kill()
                     p.wait()
                     return -9, time.monotonic() - t0
