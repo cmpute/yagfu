@@ -122,11 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "(raw x (1 + frac)); every rung is capped at this "
                          "even when the estimator aims lower (default 1.0 = "
                          "double each filter round)")
-    ap.add_argument("--target-safety", type=float, default=1.15,
+    ap.add_argument("--target-safety", type=float, default=1.05,
                     help="NFS margin over the requirement extrapolated from "
                          "the measured excess curve; the extrapolation "
                          "already lands on the high side, this covers the "
-                         "residual (default 1.15)")
+                         "residual (default 1.05)")
     ap.add_argument("--wave-max", type=int, default=16_000_000,
                     help="NFS max relations per sieve wave: the verdict "
                          "reaction granularity, ~2 min of 4-GPU sieving "

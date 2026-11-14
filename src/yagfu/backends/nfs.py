@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import threading
 import time
@@ -50,8 +51,10 @@ from ..fmt import fmt_count, fmt_dur
 from ..params import (
     NFS_MIN_DIGITS,
     NFS_MSIEVE_POLY_MIN_DIGITS,
+    SNFS_2LP_UNMEASURED_ABOVE,
     nfs_params,
     poly_budget,
+    snfs_lp_structure,
     snfs_sieve_params,
 )
 from . import BinNotFound, find_bin
@@ -92,8 +95,23 @@ WAVE_TARGET_S = int(4.5 * 3600)
 #: logI/J, when the state's relations/q still describes the old geometry.
 GEOM_YIELD_EXP = 0.6
 NC_TIMEOUT_S = 2 * 3600
-LA_TIMEOUT_S = 12 * 3600
-SQRT_TIMEOUT_S = 2 * 3600
+#: The Lanczos wall time is a property of the matrix (dimensions x weight)
+#: and the hardware, not a constant: the 15,253- c214 run in ws-15c253
+#: (43.06M dims, 78.5 nnz/col) needed ~28h, and the old 12h cap killed a
+#: perfectly healthy run at 42%.  There is deliberately no absolute cap:
+#: the stage is bounded by *liveness* — the Lanczos prints a progress line
+#: every few thousand dimensions and rewrites msieve.dat.chk every ~1.5M
+#: dimensions (hourly at that size), so LA_STALL_S of silence means a
+#: stalled device, not a long job.  A killed attempt resumes from the
+#: checkpoint with -ncr instead of failing the job.
+LA_STALL_S = 2 * 3600
+LA_MAX_ATTEMPTS = 3
+#: Same liveness reasoning for the square root: one dependency (multiply
+#: every relation, then the q-adic Newton iteration) took ~28 min on the
+#: c214 and msieve may try up to 64, so a fixed 2h cap could not even
+#: finish the c221 run (2h20m for 5 dependencies).  The phases pace
+#: progress lines; SQRT_STALL_S still catches a real hang.
+SQRT_STALL_S = 2 * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +484,56 @@ def has_sieved_relations(wd: Path) -> bool:
     except (OSError, ValueError):
         return False
     return bool(s.get("appended") or s.get("have_raw") or s.get("filters"))
+
+
+def _la_resumable(wd: Path) -> bool:
+    """True when msieve.dat.chk is a Lanczos checkpoint for msieve.dat.mat.
+
+    Content, not mtimes: the checkpoint header carries the vector length
+    (max_n, the matrix's column count) and the packed-matrix header carries
+    max_ncols, so a matching pair is a checkpoint written for this matrix.
+    msieve itself refuses a mismatch ("unexpected vector size"), so this only
+    decides whether to *try* -ncr; it never has to be exact about identity.
+    """
+    mat = wd / "msieve.dat.mat"
+    chk = wd / "msieve.dat.chk"
+    try:
+        with open(chk, "rb") as f:
+            hdr = f.read(16)
+        with open(mat, "rb") as f:
+            mhdr = f.read(12)
+    except OSError:
+        return False
+    if len(hdr) < 16 or len(mhdr) < 12:
+        return False
+    max_n = struct.unpack("<IIII", hdr)[0]
+    max_ncols = struct.unpack("<III", mhdr)[2]
+    return max_n > 0 and max_n == max_ncols
+
+
+def _post_processing_resume(wd: Path) -> bool:
+    """True when the workdir's last -nc1 already said "enough".
+
+    A converged filter writes msieve.dat.cyc; a shortfall writes no cycles
+    (the run keeps sieving, which touches msieve.dat).  So cycles newer than
+    the relation file mean the cycles are current and there is nothing left
+    to sieve or filter.  Re-filtering instead would rewrite them with the
+    batched merge, whose matrix is not guaranteed to be the one an existing
+    Lanczos checkpoint was built against (the checkpoint carries no matrix
+    fingerprint), discarding hours of linear algebra.
+    """
+    dat = wd / "msieve.dat"
+    cyc = wd / "msieve.dat.cyc"
+    try:
+        if not cyc.exists() or not dat.exists():
+            return False
+        if dat.stat().st_mtime >= cyc.stat().st_mtime:
+            return False
+    except OSError:
+        return False
+    # a wave file still on disk was sieved but never appended: let the
+    # normal resume path queue and append it first
+    return not any(wd.glob("w*.rels")) and not any(wd.glob("band*.rels"))
 
 
 def _run_band_parallel(cmd_base, cwd: Path, n_procs: int, tag: str,
@@ -1081,6 +1149,94 @@ def _poly_running_e_from_log(wd: Path) -> float | None:
     return best
 
 
+# ---------------------------------------------------------------------------
+# normscan: cuda-sieve's bench/normscan surveys a q-band's exact-norm width
+# and prints per-side quantiles.  The special-q side's MEDIAN is what the 3LP
+# promotion criterion consumes when the tool is available; the static-box
+# proxy in params.snfs_lp_structure stands in when it is not.
+# ---------------------------------------------------------------------------
+
+#: wall cap on one normscan survey (measured 0.2-5 s at the default 100k
+#: samples; the cap only has to catch a wedged host)
+NORMSCAN_TIMEOUT_S = 300
+
+
+def _parse_normscan_quantiles(text: str) -> dict[str, float] | None:
+    """normscan's per-side quantile line -> the two medians, or None.
+    Format from bench/normscan.c: 'per side quantiles: side1 med X p99 Y
+    p999 Z ; side0 med ...'"""
+    m = re.search(r"per side quantiles: side1 med ([\d.]+) p99 [\d.]+ "
+                  r"p999 [\d.]+ ; side0 med ([\d.]+)", text)
+    if not m:
+        return None
+    try:
+        return {"side1_med": float(m.group(1)),
+                "side0_med": float(m.group(2))}
+    except ValueError:              # regex digits always parse; belt+braces
+        return None
+
+
+def _measure_sq_norm_bits(job: SnfsJob, logI: int, alim: int,
+                          ctx: RunContext, wd: Path) -> float | None:
+    """normscan's measured median exact-norm bits for the special-q side,
+    over the job's INITIAL special-q band, or None when the tool is
+    unavailable or fails (the caller falls back to the proxy).  The survey
+    runs at the geometry the sieve will actually use (logI, J default) and
+    on a poly-only job file -- poly_load deliberately ignores unknown
+    fields, but the LP lines are not decided yet when this runs."""
+    try:
+        normscan = find_bin("normscan", ctx.bin_dir)
+    except BinNotFound:
+        return None
+    q_first = alim // 2             # run_nfs's own first special-q
+    wd.mkdir(parents=True, exist_ok=True)   # the disk pre-flight runs early
+    poly_path = wd / "normscan.job"
+    deg = len(job.coeffs) - 1
+    lines = [f"n: {job.n}", f"skew: {job.skew:.4f}"]
+    lines += [f"c{k}: {job.coeffs[k]}" for k in range(deg, -1, -1)]
+    lines += [f"Y0: {job.y0}", f"Y1: {job.y1}"]
+    poly_path.write_text("\n".join(lines) + "\n")
+    cmd = [str(normscan), "--poly", poly_path.name,
+           "--sq-side", "0" if job.side == "r" else "1",
+           "--logI", str(int(logI)), "--qmin", str(q_first),
+           "--qmax", str(6 * q_first)]
+    try:
+        proc = subprocess.run(cmd, cwd=wd, capture_output=True, text=True,
+                              timeout=NORMSCAN_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # exit 2/3 (overflow / thin margin) still print quantiles -- a band whose
+    # norms overflow the build width is precisely a promote -- so only a
+    # missing binary, an unrunnable survey (1), or bad usage (64) falls back
+    if proc.returncode not in (0, 2, 3):
+        return None
+    q = _parse_normscan_quantiles(proc.stdout)
+    if q is None:
+        return None
+    return q["side1_med" if job.side == "a" else "side0_med"]
+
+
+def snfs_measured_profile(job: SnfsJob, ctx: RunContext,
+                          wd: Path) -> tuple[tuple, SnfsLp]:
+    """The sieve profile and LP structure for a supplied SNFS polynomial,
+    with the 3LP promotion decided on normscan's measured median when the
+    tool is available and on the static-box proxy when it is not.  Shared
+    by run_nfs (the decision) and the engine's disk estimate, so the
+    estimate and the run's verdict cannot disagree."""
+    sieve = snfs_sieve_params(job.scaled, job.side, job.coeffs,
+                             job.y0, job.y1, ctx.sieve_logI)
+    sq_bits = _measure_sq_norm_bits(job, sieve[8], sieve[1], ctx, wd)
+    if sq_bits is not None:
+        ctx.log(f"nfs: normscan measured sq-side median norm "
+                f"{sq_bits:.1f} bits over the initial q band")
+        sieve = snfs_sieve_params(job.scaled, job.side, job.coeffs,
+                                  job.y0, job.y1, ctx.sieve_logI,
+                                  sq_norm_bits=sq_bits)
+    lp = snfs_lp_structure(job.scaled, job.side, job.coeffs, job.y0,
+                           job.y1, ctx.sieve_logI, sq_norm_bits=sq_bits)
+    return sieve, lp
+
+
 def run_nfs(n: int, ctx: RunContext, wd: Path,
             snfs: SnfsJob | None = None) -> NfsResult:
     """Factor n with GNFS inside wd (polyselect runs here when nothing
@@ -1104,10 +1260,24 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
         # pick the best poly first: the profile below keys on the
         # winner's scaled difficulty
         snfs = _rank_snfs_candidates(snfs, ctx, wd)
-        sieve = snfs_sieve_params(snfs.scaled, snfs.side)
+        sieve, lp = snfs_measured_profile(snfs, ctx, wd)
         (rlim, alim, lpbr, lpba, mfbr, mfba, rlbd, albd,
          logI) = sieve
         lpb = lpbr               # representative lpb for NfsResult.params
+        if lp.three_lp_sq:
+            ctx.log(f"nfs: sq-side norm ({lp.norm_source}) {lp.norm_bits:.1f}"
+                    f" bits, typical cofactor ~{lp.cofactor_bits:.0f} bits > "
+                    f"2*{lp.sq_lpb}+{lp.promote_slack:g}: special-q side "
+                    f"promoted to 3LP")
+        elif snfs.scaled >= SNFS_2LP_UNMEASURED_ABOVE:
+            # legal but unmeasured: every deciding point at d>=245 ran 3LP.
+            # The escape hatch is real — run_nfs reuses the workdir's job
+            # file verbatim on resume, so editing its sq-side mfb to 3LP
+            # and restarting bumps the run.
+            ctx.log(f"nfs: WARNING: 2LP at d{snfs.scaled:g} is unmeasured "
+                    f"(every job that decided at d>=245 ran 3LP, 320-434M "
+                    f"raw); if the excess ladder starves, set the workdir "
+                    f"job's sq-side mfb to 3LP and restart")
     else:
         rlim, alim, lpb, logI = nfs_params(digits)
     if ctx.sieve_logI is not None:
@@ -1376,8 +1546,18 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
         th.start()
         return {"seq": seq, "thread": th, "box": box, "q": (S.q_next, qhi)}
 
+    # A workdir a previous run left at post-processing resumes there: its
+    # last -nc1 said "enough" and wrote msieve.dat.cyc, and nothing has been
+    # appended since, so there is nothing left to sieve or filter.  Skipping
+    # the loop also keeps the cycle set (and therefore the packed matrix)
+    # untouched, which is what lets an existing Lanczos checkpoint continue.
+    post_only = _post_processing_resume(wd)
+    if post_only:
+        ctx.log("nfs: filter output is current (msieve.dat.cyc newer than "
+                "msieve.dat); resuming at post-processing")
+
     try:
-        while True:
+        while not post_only:
             ctx.check_deadline()
 
             # reap a finished wave into the queue
@@ -1553,11 +1733,37 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
                 pass
 
     # ---- stage 4: matrix build + Lanczos + sqrt ---------------------------
+    #
+    # The Lanczos wall time is set by the matrix and the hardware, so the
+    # stage is bounded by liveness, not by a fixed duration (LA_STALL_S):
+    # a killed attempt resumes from msieve.dat.chk with -ncr rather than
+    # failing the job.  -ncr reads the packed matrix, so a resume also
+    # skips the matbuild pass; a fresh start still builds it, which leaves
+    # msieve.dat.mat behind for any later resume.
+    chk = wd / "msieve.dat.chk"
+    mat = wd / "msieve.dat.mat"
+    cyc = wd / "msieve.dat.cyc"
+
+    def _mat_current() -> bool:
+        """The packed matrix is at least as new as the cycles it comes from,
+        so it is the one the current cycle set produces.  A matbuild after a
+        fresh -nc1 (or after an operator replaced the relations) is needed;
+        otherwise it would only burn its 10-20 minutes rebuilding the same
+        bytes."""
+        try:
+            return (mat.stat().st_size > 0
+                    and mat.stat().st_mtime >= cyc.stat().st_mtime)
+        except OSError:
+            return False
+
     t = time.monotonic()
-    run_cmd([msieve, "-s", "msieve.dat", "-l", "nc2-mat.log",
-             "-nc2", "only_matbuild=1", "-t", nproc, "-v"],
-            wd, wd / "nc2-mat.stdout", timeout=NC_TIMEOUT_S)
-    res.stages["matbuild_s"] = time.monotonic() - t
+    if _mat_current():
+        res.stages["matbuild_s"] = 0.0
+    else:
+        run_cmd([msieve, "-s", "msieve.dat", "-l", "nc2-mat.log",
+                 "-nc2", "only_matbuild=1", "-t", nproc, "-v"],
+                wd, wd / "nc2-mat.stdout", timeout=NC_TIMEOUT_S)
+        res.stages["matbuild_s"] = time.monotonic() - t
     t = time.monotonic()
     # msieve prints its own "linear algebra completed ... (X%, ETA ...)"
     # updates (carriage-return paced) while it runs; forward the first one
@@ -1580,28 +1786,47 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
                 ctx.log(f"nfs: {l.strip()}")
                 last_la_decile[0] = decile
 
-    rc, _ = run_cmd_progress(
-        [msieve, "-s", "msieve.dat", "-l", "nc2-la.log",
-         "-nc2", "-t", nproc, "-v"], wd, wd / "nc2-la.stdout",
-        timeout=LA_TIMEOUT_S, every_s=30,
-        env_extra=ctx.pin_env(),
-        on_lines=_la_lines)
+    attempt = 0
+    while True:
+        attempt += 1
+        resume = _la_resumable(wd)
+        tag = "" if attempt == 1 else f"-r{attempt}"
+        ctx.log("nfs: linear algebra "
+                + ("resuming from the checkpoint" if resume else "starting")
+                + ("" if attempt == 1
+                   else f" (attempt {attempt} of {LA_MAX_ATTEMPTS})"))
+        rc, _ = run_cmd_progress(
+            [msieve, "-s", "msieve.dat", "-l", f"nc2-la{tag}.log",
+             "-ncr" if resume else "-nc2", "-t", nproc, "-v"],
+            wd, wd / f"nc2-la{tag}.stdout",
+            timeout=None, every_s=30,
+            idle_timeout=LA_STALL_S, activity_paths=(chk,),
+            env_extra=ctx.pin_env(),
+            on_lines=_la_lines)
+        if rc == 0:
+            break
+        why = ("stalled (no progress line or checkpoint for "
+               f"{LA_STALL_S // 3600}h)" if rc == -9 else f"rc={rc}")
+        if attempt < LA_MAX_ATTEMPTS and _la_resumable(wd):
+            ctx.log(f"nfs: linear algebra died ({why}); resuming from the "
+                    f"last checkpoint")
+            continue
+        res.stages["linalg_s"] = time.monotonic() - t
+        res.error = f"linear algebra failed ({why})"
+        ctx.log(f"nfs: {res.error}")
+        return res
     res.stages["linalg_s"] = time.monotonic() - t
+    t = time.monotonic()
+    rc, _ = run_cmd_progress(
+        [msieve, "-s", "msieve.dat", "-l", "nc3.log",
+         "-nc3", "-t", nproc, "-v"], wd, wd / "nc3.stdout",
+        timeout=None, every_s=30, idle_timeout=SQRT_STALL_S)
     if rc == -9:
-        res.error = "linear algebra timed out"
+        res.error = "sqrt stalled"
         ctx.log(f"nfs: {res.error}")
         return res
     if rc != 0:
-        res.error = f"linear algebra failed (rc={rc})"
-        ctx.log(f"nfs: {res.error}")
-        return res
-    t = time.monotonic()
-    try:
-        rc, _ = run_cmd([msieve, "-s", "msieve.dat", "-l", "nc3.log",
-                         "-nc3", "-t", nproc, "-v"], wd, wd / "nc3.stdout",
-                        timeout=SQRT_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        res.error = "sqrt timed out"
+        res.error = f"sqrt failed (rc={rc})"
         ctx.log(f"nfs: {res.error}")
         return res
     res.stages["sqrt_s"] = time.monotonic() - t

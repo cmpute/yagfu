@@ -163,7 +163,7 @@ def test_waves_track_refreshed_rung(harness, tmp_path):
         "filtering wants 1000000 more relations\n"
         "%%\n"
         # r2 (63 raw): 58 unique, excess 0 / 5: slope 0.3 turned the
-        # curve; extrapolation lands at 93, under the ladder's 126
+        # curve; extrapolation lands at 85, under the ladder's 126
         "found 5 duplicates and 58 unique relations\n"
         "keeping 58 ideals with weight <= 200, target excess is 5\n"
         "filtering wants 1000000 more relations\n"
@@ -184,9 +184,9 @@ def test_waves_track_refreshed_rung(harness, tmp_path):
     bands = _bands(seq)
     for lo, hi, _ in bands:
         assert hi - lo > 20_000            # no stub waves anywhere
-    # the estimate rung (93) is live and under the ladder's 126
+    # the estimate rung (85) is live and under the ladder's 126
     rung = [s for s in open(tmp_path / "t.log") if "(estimate)" in s]
-    assert any("next filter at 93" in s for s in rung)
+    assert any("next filter at 85" in s for s in rung)
     # r3 fired the moment the drain crossed the estimate rung (appended
     # 132), and its stop verdict killed the speculative wave in flight:
     # total sieving stays at 132 where the pure ladder would have run to
@@ -465,18 +465,89 @@ alambda: 2.5
 
 
 def test_snfs_job_text_per_side_lp():
-    """The special-q side carries the 3LP mfb; the job file passes every
-    per-side value through to cuda-sieve verbatim."""
+    """The LP profile flows through snfs_sieve_params with the polynomial
+    armed (as run_nfs calls it) and the job file passes every per-side
+    value through to cuda-sieve verbatim.  This d160 side-r job's |Y0| is
+    tiny, so the norm criterion keeps both sides 2LP (58/58); the 3LP
+    promotion itself is covered in test_params."""
     from yagfu.params import snfs_sieve_params
 
     job = _snfs_job(N71, side="r", scaled=160.0)
-    sieve = snfs_sieve_params(job.scaled, job.side)
+    sieve = snfs_sieve_params(job.scaled, job.side, job.coeffs,
+                              job.y0, job.y1)
     text = nfs._snfs_job_text(job, sieve)
     (rlim, alim, lpbr, lpba, mfbr, mfba, rlbd, albd, _logI) = sieve
     assert f"lpbr: {lpbr}" in text and f"lpba: {lpba}" in text
     assert f"mfbr: {mfbr}" in text and f"mfba: {mfba}" in text
-    assert mfbr == 95 and mfba == 63          # sq side r carries the 3LP
+    assert mfbr == 57 and mfba == 57          # 2LP: mfb = 2*lpb - 1, no promote
     assert f"rlambda: {rlbd}" in text
+
+
+def test_parse_normscan_quantiles():
+    """The measured-norm path keys on normscan's per-side quantile line;
+    parse it and nothing else."""
+    from yagfu.backends.nfs import _parse_normscan_quantiles
+
+    text = ("  band 34380000..206280000, sq side 1, logI 14, J 8192\n"
+            "  per side: max side1 (deg 6) 190.06  max side0 (deg 1) 145.28"
+            "  -- side 0 larger on 0 of 100000\n"
+            "  per side quantiles: side1 med 165.7 p99 180.3 p999 190.1 ; "
+            "side0 med 141.2 p99 143.5 p999 145.3\n")
+    assert _parse_normscan_quantiles(text) == {"side1_med": 165.7,
+                                               "side0_med": 141.2}
+    assert _parse_normscan_quantiles("no survey output here") is None
+
+
+NORMSCAN_FAKE = """#!/bin/sh
+# fixed survey: a rational-side median that forces promotion at d205
+echo "  per side quantiles: side1 med 115.0 p99 124.7 p999 131.1 ; side0 med 300.0 p99 302.0 p999 304.0"
+exit 0
+"""
+
+
+def test_snfs_normscan_measured_promotion(harness, tmp_path):
+    """A normscan binary in bin_dir replaces the static-box proxy for the
+    3LP promotion decision: the stub's measured side-0 median forces the
+    promotion at the ladder's own lpb, and the poly-only job it surveyed
+    stays in the workdir.  The harness's other snfs tests run WITHOUT the
+    stub and so cover the proxy fallback."""
+    ctx, calls, verdicts = harness
+    stub = ctx.bin_dir / "normscan"
+    stub.write_text(NORMSCAN_FAKE)
+    stub.chmod(0o755)
+    verdicts.write_text("found 6000 cycles, need 5\n")
+    wd = tmp_path / "wd"
+    res = run_nfs(N71, ctx, wd,
+                  snfs=_snfs_job(N71, side="r", scaled=205.38))
+    assert res.error is None or "no factor" in (res.error or "")
+    txt = (wd / f"c{len(str(N71))}.job").read_text()
+    assert "lpbr: 30" in txt and "mfbr: 89" in txt     # 3LP at ladder lpb 30
+    assert "lpba: 29" in txt and "mfba: 57" in txt     # other side stays 2LP
+    log = open(tmp_path / "t.log").read()
+    assert "normscan measured sq-side median norm 300.0 bits" in log
+    assert "(normscan)" in log and "promoted to 3LP" in log
+    assert (wd / "normscan.job").exists()              # the surveyed poly
+
+
+def test_snfs_2lp_unmeasured_warning(harness, tmp_path):
+    """At d>=245 a 2LP verdict is legal but has no deciding measurement:
+    run_nfs warns so a starving excess ladder is read as 'bump the job to
+    3LP and re-sieve', not as a parameter bug."""
+    ctx, calls, verdicts = harness
+    stub = ctx.bin_dir / "normscan"
+    stub.write_text(NORMSCAN_FAKE)      # side1 med 115 -> no promote at d254
+    stub.chmod(0o755)
+    verdicts.write_text("found 6000 cycles, need 5\n")
+    wd = tmp_path / "wd"
+    res = run_nfs(N71, ctx, wd,
+                  snfs=_snfs_job(N71, side="a", scaled=254.04))
+    assert res.error is None or "no factor" in (res.error or "")
+    txt = (wd / f"c{len(str(N71))}.job").read_text()
+    assert "lpbr: 32" in txt and "mfbr: 63" in txt     # 2LP at the 32-bit step
+    assert "mfba: 63" in txt
+    log = open(tmp_path / "t.log").read()
+    assert "WARNING: 2LP at d254.04 is unmeasured" in log
+    assert "promoted to 3LP" not in log
 
 
 def test_poly_has_root_mod_n():

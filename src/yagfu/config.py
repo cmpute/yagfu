@@ -116,8 +116,10 @@ class RunContext:
                                      # most one topup step past the last
                                      # filter's data; caps every rung (GPU
                                      # sieving is cheap, -nc1 passes are not)
-    target_safety: float = 1.15      # margin over the requirement extrapolated
+    target_safety: float = 1.05      # margin over the requirement extrapolated
                                      # from the measured excess-vs-unique curve
+                                     # (the extrapolation already lands on the
+                                     # high side; 1.15 oversieved)
     nfs_disk_margin: float = 0.8     # abort the NFS path after ECM when the
                                      # workdir's free space is below this
                                      # fraction of the pre-flight estimate

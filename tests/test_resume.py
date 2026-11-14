@@ -89,3 +89,40 @@ def test_has_sieved_relations(tmp_path):
     (tmp_path / "nfs-state.json").unlink()
     (tmp_path / "msieve.dat").write_text("relation line\n")
     assert has_sieved_relations(tmp_path)              # relations on disk
+
+
+def test_post_processing_resume(tmp_path):
+    """A converged filter leaves .cyc newer than the relation file; that is
+    the signal that the workdir is at post-processing, not sieving."""
+    import os
+    from yagfu.backends.nfs import _post_processing_resume
+    dat = tmp_path / "msieve.dat"
+    cyc = tmp_path / "msieve.dat.cyc"
+    assert not _post_processing_resume(tmp_path)       # nothing there
+    dat.write_text("rel\n")
+    assert not _post_processing_resume(tmp_path)       # no cycles yet
+    cyc.write_text("cycles\n")
+    os.utime(dat, (1, 1))                              # .dat older than .cyc
+    assert _post_processing_resume(tmp_path)
+    os.utime(cyc, (1, 1))                              # .cyc older than .dat
+    assert not _post_processing_resume(tmp_path)       # appended since
+    os.utime(dat, (1, 1))
+    (tmp_path / "w0042.0.rels").write_text("rel\n")    # sieved, not appended
+    assert not _post_processing_resume(tmp_path)
+
+
+def test_la_resumable_matches_checkpoint_to_matrix(tmp_path):
+    """The Lanczos checkpoint is usable when its vector length equals the
+    packed matrix's column count (both little-endian uint32 headers)."""
+    import struct
+    from yagfu.backends.nfs import _la_resumable
+    chk = tmp_path / "msieve.dat.chk"
+    mat = tmp_path / "msieve.dat.mat"
+    assert not _la_resumable(tmp_path)                 # neither file
+    chk.write_bytes(struct.pack("<IIII", 1000, 420, 7, 128))
+    mat.write_bytes(struct.pack("<III", 999, 68, 1000))
+    assert _la_resumable(tmp_path)
+    mat.write_bytes(struct.pack("<III", 999, 68, 1001))   # different matrix
+    assert not _la_resumable(tmp_path)
+    chk.write_bytes(b"\x01")                           # truncated header
+    assert not _la_resumable(tmp_path)

@@ -48,7 +48,8 @@ from .ecmledger import (
 from .fmt import fmt_count, fmt_dur
 import shutil
 
-from .params import MPQS_MIN_DIGITS, nfs_disk_estimate, snfs_gnfs_equiv
+from .params import (MPQS_MIN_DIGITS, nfs_disk_estimate, snfs_gnfs_equiv,
+                     snfs_relations_estimate)
 from .primes import SPRP_2761_LIMIT, is_probable_prime
 
 if TYPE_CHECKING:
@@ -394,6 +395,18 @@ class Engine:
             j += 1
         return m
 
+    def _snfs_raw_rels(self, snfs: "SnfsJob", wd: Path) -> int:
+        """Profile-aware SNFS relation estimate: the LP structure the sieve
+        will run — including the normscan-driven 3LP promotion — picks the
+        table, so a d205 job promoted to 3LP plans for ~330M while the same
+        difficulty at 2LP plans for ~60M (measured: ws-15c522 vs
+        ws-15c261).  Shares snfs_measured_profile with run_nfs so the
+        estimate and the run's verdict cannot disagree; the lazy import
+        keeps engine importable without the backends package initialized."""
+        from .backends.nfs import snfs_measured_profile
+        _sieve, lp = snfs_measured_profile(snfs, self.ctx, wd)
+        return snfs_relations_estimate(snfs.scaled, lp.three_lp_sq)
+
     def _nfs_disk_report(self, snfs: "SnfsJob | None", m: int, wd: Path,
                          pre_flight: bool = False) -> None:
         """Log the NFS working-set estimate for this job and the workdir's
@@ -405,10 +418,12 @@ class Engine:
         if snfs is not None:
             equiv = snfs_gnfs_equiv(snfs.scaled)
             kind = f"SNFS d{snfs.scaled:g} (GNFS-equiv c{equiv:.0f})"
+            raw = self._snfs_raw_rels(snfs, wd)
         else:
             equiv = float(_digits(m))
             kind = f"c{equiv:.0f}"
-        est = nfs_disk_estimate(round(equiv))
+            raw = None
+        est = nfs_disk_estimate(round(equiv), raw_rels=raw)
         free = shutil.disk_usage(wd).free / 1e9
         margin = self.ctx.nfs_disk_margin
         if pre_flight:
@@ -445,9 +460,12 @@ class Engine:
         if snfs is not None or digits >= ctx.xover \
                 or ctx.force_method == "nfs":
             self._nfs_disk_report(snfs, m, wd)
-            equiv = (snfs_gnfs_equiv(snfs.scaled) if snfs is not None
-                     else float(digits))
-            est = nfs_disk_estimate(round(equiv))
+            if snfs is not None:
+                equiv = snfs_gnfs_equiv(snfs.scaled)
+                est = nfs_disk_estimate(
+                    round(equiv), raw_rels=self._snfs_raw_rels(snfs, wd))
+            else:
+                est = nfs_disk_estimate(digits)
             free = shutil.disk_usage(wd).free / 1e9
             if free < ctx.nfs_disk_margin * est["total_gb"]:
                 raise FactorError(

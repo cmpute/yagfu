@@ -8,6 +8,9 @@ excess curve.
 
 from __future__ import annotations
 
+import math
+from typing import NamedTuple
+
 # --------------------------------------------------------------------------
 # cuda-mpqs (SIQS): single-large-prime variant bound.
 #
@@ -131,30 +134,38 @@ def snfs_params(difficulty: float) -> tuple[int, int, int, int]:
 #
 # The classic symmetric 2LP tables above price sieving like a CPU lasieve:
 # per-special-q cost is the scarce resource, so the FB stays small and
-# mfb = 2*lpb.  cuda-sieve's per-q cost is near-flat, so the wall time is
+# mfb = k*lpb - 1 (the CADO/Kyle convention: 95 = 3*32 - 1,
+# 63 = 2*32 - 1).  cuda-sieve's per-q cost is near-flat, so the wall time is
 # (relations needed) / (yield per q) and yield per q is what the large
-# primes buy.  Two consequences (Kyle Askine's review of the 15^253-1
-# suggestion, Nov 2026: "2LP is bad for this poly, and the factordb lims
-# are really low ... especially on your GPU I'd be fine with like 600M/400M
-# at least (and bigger still might just be strictly better), and would
-# definitely go 95/63 for mfb"):
+# primes buy.  Kyle Askine's review of the 15^253-1 suggestion (Nov 2026:
+# "2LP is bad for this poly, and the factordb lims are really low ...
+# especially on your GPU I'd be fine with like 600M/400M at least (and
+# bigger still might just be strictly better), and would definitely go
+# 95/63 for mfb") calibrated the d275 point; ws-15c253 decided there at
+# 361M raw relations with 600M/400M, lpb 32, mfb 95/63.
 #
-#   * the factor-base limits grow an order of magnitude or more;
-#   * the special-q side carries a 3LP mfb (95 = 3*32 - 1) while the other
-#     side stays 2LP (63 = 2*32 - 1).  cuda-sieve's own rule ("the q and
-#     the 3LP mfb go there with it") puts both on the side factordb's
-#     `side` names.  For halved-cyclotomic SNFS forms the other side's
-#     norms are minuscule and a symmetric 2*lpb mfb kills essentially
-#     every candidate: the 15^253-1 halved-Phi11 form has ~2^100 rational
-#     norms that 2LP at lpb 26 (yagfu's old table) can never cover.
+# The LP structure below is graded, because the relation NEED is a property
+# of the profile, not of the difficulty alone: at the same scaled d205 and
+# the same degree-6 cyclotomic family, the 2LP point (ws-15c261, lpb 28/28,
+# FB 25.5M) decided at 45.1M raw while the 3LP point (ws-15c522, lpb 32/32,
+# mfb 95/63, FB 101M/69M) decided at 329.5M — 7x the relations and ~8x the
+# sieve wall for the same number size.  So:
 #
-# Only the 600M/400M @ scaled-275 point is operator-calibrated — Kyle
-# Askine's review was of the 15^253-1 suggestion at factordb scaled
-# difficulty 274.74, so the anchor sits on factordb's own scale (the
-# scale run_nfs keys on), NOT on the halved form's true norm difficulty
-# (~half of it).  The rest of the ladder extrapolates at ~x1.6/+20d and
-# is an estimate, not a measurement; the top is capped where the device
-# factor base (pi(rlim) ideals) would outgrow a 24 GB card.
+#   * a 2LP baseline ladder grades lpb with the scaled difficulty;
+#   * the special-q side is PROMOTED to 3LP (mfb = 3*lpb - 1) only when
+#     its norms demand it (snfs_lp_structure's norm criterion) — for the
+#     halved-cyclotomic family that is the rational-side jobs, whose
+#     |Y0|*B norms grow with the base, while the +-1-coefficient algebraic
+#     side stays at the q-lattice scale (~2^166 measured median at d205)
+#     regardless of difficulty;
+#   * the criterion decides at EVERY difficulty, including the d245-275
+#     band where all four deciding points (320-434M raw) ran 3LP under the
+#     old blanket rule: a 2LP verdict there is legal but unmeasured, and
+#     run_nfs warns about it (SNFS_2LP_UNMEASURED_ABOVE) so a starving
+#     excess ladder is read as "bump to 3LP and re-sieve", not as a bug.
+#
+# rlim/alim still come from SNFS_SIEVE_ANCHORS (the per-side FB philosophy
+# above); only the LP bounds are graded here.
 # --------------------------------------------------------------------------
 
 SNFS_SIEVE_ANCHORS: tuple[tuple[int, tuple[int, int, int]], ...] = (
@@ -174,34 +185,159 @@ SNFS_SIEVE_ANCHORS: tuple[tuple[int, tuple[int, int, int]], ...] = (
     (350, (2_400_000_000, 1_600_000_000, 14)),
 )
 
-#: scaled difficulty at or above which the special-q side goes 3LP
-SNFS_3LP_MIN_DIFFICULTY = 125.0
+#: 2LP baseline: (scaled, sq_lpb, other_lpb) step rows; mfb = 2*lpb - 1.
+#: Step bands, not interpolation — LP bounds are bit sizes and are stepped
+#: in practice.  The single measured 2LP point is ws-15c261 (d205.48,
+#: degree-6 cyclotomic, lpb 28/28 symmetric, deciding 45.1M raw): the rows
+#: sit at or one step above it, never below.
+SNFS_LPB_LADDER: tuple[tuple[int, int, int], ...] = (
+    (0,   29, 29),
+    (205, 30, 29),
+    (225, 31, 30),
+    (245, 32, 32),
+)
+
+#: scaled difficulty at or above which a 2LP verdict is legal but has no
+#: deciding measurement: every job that decided at d>=245 so far (four of
+#: them, 320-434M raw) ran 3LP under the old blanket rule.  The criterion
+#: still applies there; run_nfs warns when a job lands on 2LP so a starving
+#: excess ladder is read as "bump to 3LP and re-sieve", not as a parameter
+#: bug.
+SNFS_2LP_UNMEASURED_ABOVE = 245.0
+
+#: promote the special-q side to 3LP (mfb = 3*lpb - 1) when the typical
+#: special-q cofactor exceeds the 2LP room (2*lpb) by this many bits.  Two
+#: norm sources feed the criterion, each with its own slack:
+#:
+#: PROXY (static box bound, no normscan): the box misses the q-lattice's
+#: sqrt(q) growth, so its gap to reality is large and side-dependent
+#: (side a d205: proxy 79.6 vs measured 165.7 bits; side r: 219 vs 236) —
+#: the 20 bits only work because both calibration families sit far from
+#: its threshold.  Fallback when normscan is unavailable.
+#:
+#: MEASURED (cuda-sieve bench/normscan, per-side median over the job's
+#: initial special-q band): the exact corner bound the siever's TD itself
+#: sees.  Calibrated on the two known families -- ws-15c261's (side a,
+#: d205: measured cofactor 139.2 bits must stay 2LP; c261 decided 45.1M
+#: raw at 2LP lpb 28) and ws-15c265's (side r, d249: measured cofactor
+#: 209.5 bits must promote; the family ran and decided 3LP) -- which put
+#: the 2*lpb + slack separator at 170 for d205's lpb 30, with 31/39 bits
+#: of margin.  NOTE: this slack is the FB-absorption fudge at norm scales
+#: the proxy never sees; it is NOT interchangeable with the proxy's 20.
+SNFS_3LP_PROMOTE_SLACK = 20.0
+SNFS_3LP_PROMOTE_SLACK_MEASURED = 110.0
+
 
 #: lambdas follow CADO's automatic rule 0.3 + mfb/lpb
 def _snfs_lambda(mfb: int, lpb: int) -> float:
     return round(0.3 + mfb / lpb, 2)
 
 
-def snfs_sieve_params(scaled: float, side: str) -> tuple:
+def _snfs_sq_norm_bits(coeffs: list[int], y0: int, y1: int, side: str,
+                       logI: int) -> float:
+    """First-order typical special-q-side norm bits over cuda-sieve's
+    rectangle (|a|, b <= 2^(logI-1); cuda-sieve sieves an unskewed box —
+    J defaults to 2^(logI-1) regardless of the job's skew).
+
+    Degree-1 side: |Y1*a + Y0*b| is dominated by |Y0|*B and roughly
+    symmetric over the box, so half the bound stands in for the median.
+    Degree-d side: the full box bound sum|c_i|*(2^(logI-1))^d — a
+    deliberate overestimate, because the criterion built on this may only
+    PROMOTE, never demote.  bench/normscan measures the exact per-side
+    distribution; this proxy only has to separate the calibration
+    families, which sit ~80 bits apart."""
+    b_half = float(1 << (logI - 1))
+    if side == "r":
+        bound = (abs(y1) + abs(y0)) * b_half
+    else:
+        deg = len(coeffs) - 1
+        bound = sum(abs(c) for c in coeffs) * b_half ** deg
+    return math.log2(max(bound / 2.0, 1.0))
+
+
+class SnfsLp(NamedTuple):
+    """The LP structure snfs_sieve_params hands to the job file, plus the
+    norm measurement behind its 3LP decision (for the run log) and the
+    three_lp_sq flag the relation estimate keys on."""
+    sq_lpb: int
+    sq_mfb: int
+    other_lpb: int
+    other_mfb: int
+    three_lp_sq: bool
+    norm_bits: float | None
+    cofactor_bits: float | None
+    norm_source: str | None = None    # "normscan" | "proxy" | None
+    promote_slack: float | None = None
+
+
+def snfs_lp_structure(scaled: float, side: str, coeffs: list[int] | None = None,
+                      y0: int | None = None, y1: int | None = None,
+                      logI: int | None = None,
+                      sq_norm_bits: float | None = None) -> SnfsLp:
+    """LP bounds for an SNFS job of this scaled difficulty with factordb's
+    special-q `side` ("a" | "r"): the 2LP ladder's LPB step for the
+    difficulty and — when the polynomial is supplied — the norm criterion
+    that promotes the special-q side to 3LP, at every difficulty.
+    `sq_norm_bits` is a normscan-measured median for the special-q side
+    (see backends.nfs._measure_sq_norm_bits); without it the static-box
+    proxy stands in, with its own — different — slack.  At or above
+    SNFS_2LP_UNMEASURED_ABOVE a 2LP verdict is legal but unmeasured;
+    run_nfs warns about it."""
+    _, alim, _ = _interp(SNFS_SIEVE_ANCHORS, scaled)
+    row = SNFS_LPB_LADDER[0]
+    for r in SNFS_LPB_LADDER:
+        if scaled >= r[0]:
+            row = r
+    sq_lpb, other_lpb = row[1], row[2]
+    norm_bits = cofactor_bits = None
+    norm_source = None
+    promote_slack = None
+    three_lp = False
+    if coeffs is not None and y0 is not None:
+        if sq_norm_bits is not None:
+            norm_bits = float(sq_norm_bits)
+            norm_source = "normscan"
+            promote_slack = SNFS_3LP_PROMOTE_SLACK_MEASURED
+        else:
+            norm_bits = _snfs_sq_norm_bits(coeffs, y0, y1, side,
+                                           logI if logI is not None
+                                           else _interp(SNFS_SIEVE_ANCHORS,
+                                                        scaled)[2])
+            norm_source = "proxy"
+            promote_slack = SNFS_3LP_PROMOTE_SLACK
+        # the special-q band starts at alim/2 and its cap relaxes upward;
+        # alim is the geometric middle to within a bit (the measured median
+        # spans [alim/2, 3*alim], whose middle is 1.22*alim — 0.3 bits)
+        cofactor_bits = norm_bits - math.log2(max(float(alim), 2.0))
+        three_lp = cofactor_bits > 2 * sq_lpb + promote_slack
+    sq_mfb = 3 * sq_lpb - 1 if three_lp else 2 * sq_lpb - 1
+    return SnfsLp(sq_lpb, sq_mfb, other_lpb, 2 * other_lpb - 1,
+                  three_lp, norm_bits, cofactor_bits,
+                  norm_source, promote_slack)
+
+
+def snfs_sieve_params(scaled: float, side: str,
+                      coeffs: list[int] | None = None,
+                      y0: int | None = None, y1: int | None = None,
+                      logI: int | None = None,
+                      sq_norm_bits: float | None = None) -> tuple:
     """Per-side sieve profile (rlim, alim, lpbr, lpba, mfbr, mfba,
     rlambda, alambda, logI) for an SNFS job of this scaled difficulty with
-    factordb's special-q `side` ("a" or "r")."""
-    rlim, alim, logI = _interp(SNFS_SIEVE_ANCHORS, scaled)
-    if scaled >= SNFS_3LP_MIN_DIFFICULTY:
-        # 3LP on the special-q side, 2LP on the other (cuda-sieve's rule)
-        sq_lpb, sq_mfb = 32, 95
-        other_lpb, other_mfb = 32, 63
-    else:
-        sq_lpb, sq_mfb = 29, 58
-        other_lpb, other_mfb = 29, 58
+    factordb's special-q `side` ("a" or "r").  Pass the polynomial's
+    coeffs/Y0 to arm the 3LP norm promotion and `sq_norm_bits` to drive it
+    with a normscan measurement; `logI` overrides the table's rectangle for
+    the norm proxy (cuda-sieve --sieve-logI)."""
+    rlim, alim, table_logI = _interp(SNFS_SIEVE_ANCHORS, scaled)
+    lp = snfs_lp_structure(scaled, side, coeffs, y0, y1, logI, sq_norm_bits)
     if side == "r":
-        lpbr, mfbr = sq_lpb, sq_mfb
-        lpba, mfba = other_lpb, other_mfb
+        lpbr, mfbr = lp.sq_lpb, lp.sq_mfb
+        lpba, mfba = lp.other_lpb, lp.other_mfb
     else:
-        lpba, mfba = sq_lpb, sq_mfb
-        lpbr, mfbr = other_lpb, other_mfb
+        lpba, mfba = lp.sq_lpb, lp.sq_mfb
+        lpbr, mfbr = lp.other_lpb, lp.other_mfb
     return (rlim, alim, lpbr, lpba, mfbr, mfba,
-            _snfs_lambda(mfbr, lpbr), _snfs_lambda(mfba, lpba), logI)
+            _snfs_lambda(mfbr, lpbr), _snfs_lambda(mfba, lpba),
+            logI if logI is not None else table_logI)
 
 
 # --------------------------------------------------------------------------
@@ -251,7 +387,6 @@ NFS_BYTES_PER_REL_ANCHORS: tuple[tuple[int, int], ...] = (
 def _interp_log(anchors: tuple[tuple[int, float], ...],
                 x: float) -> float:
     """piecewise-linear in log10(value), i.e. exponential between anchors"""
-    import math
     if x <= anchors[0][0]:
         return anchors[0][1]
     if x >= anchors[-1][0]:
@@ -268,19 +403,65 @@ def nfs_relations_estimate(digits: int) -> int:
     return int(_interp_log(NFS_RAW_REL_ANCHORS, digits))
 
 
+# --------------------------------------------------------------------------
+# SNFS raw relations: what a deciding run actually collects, keyed on the
+# scaled difficulty AND the LP profile the sieve runs (snfs_lp_structure's
+# three_lp_sq), because the profile is what sets the need: at the same
+# scaled d205 the 3LP point (ws-15c522, lpb 32/32 mfb 95/63) decided at
+# 329.5M while the 2LP point (ws-15c261, lpb 28/28) decided at 45.1M —
+# the GNFS-equivalent lookup cannot see a 7x spread inside one difficulty.
+# The 3LP anchors are measured deciding counts (upper bounds of the true
+# need; the disk estimate must cover what actually lands on disk), nearly
+# flat across d205-275 because the excess crossover follows the LP/factor-
+# base structure rather than the difficulty.  The 2LP table has a single
+# measured point; its other rows are flagged extrapolations.  Both tables
+# feed only the disk pre-flight — the sieve loop's need is measured by the
+# excess ladder, whose extrapolated rungs landed within 0.3% of the
+# deciding count on every job that reached one.  Re-anchor per profile
+# when a new (scaled, LP structure) deciding count lands.
+# --------------------------------------------------------------------------
+
+SNFS_RAW_REL_3LP_ANCHORS: tuple[tuple[int, float], ...] = (
+    (205, 330e6),    # ws-15c522 (true need 164-330M)
+    (219, 330e6),    # ws-15c558 (decided 320.0M)
+    (255, 440e6),    # ws-15c642 (decided 433.9M, true 314-434M)
+    (275, 400e6),    # ws-15c253 (decided 361.2M, true 180-361M; padded)
+    (300, 500e6),    # extrapolated
+)
+
+SNFS_RAW_REL_2LP_ANCHORS: tuple[tuple[int, float], ...] = (
+    (125, 10e6),     # unmeasured
+    (185, 30e6),     # unmeasured
+    (205, 60e6),     # floor: c261 decided 45.1M at lpb 28 / FB 25.5M; the
+                     # ladder's 30/29 over the bigger per-side FBs is heavier
+    (245, 150e6),    # unmeasured: run_nfs warns when a d>=245 job lands here
+    (300, 300e6),    # unmeasured
+)
+
+
+def snfs_relations_estimate(scaled: float, three_lp_sq: bool = False) -> int:
+    """raw relations a deciding SNFS run of this scaled difficulty collects,
+    for the LP profile snfs_lp_structure picks"""
+    if three_lp_sq:
+        return int(_interp_log(SNFS_RAW_REL_3LP_ANCHORS, scaled))
+    return int(_interp_log(SNFS_RAW_REL_2LP_ANCHORS, scaled))
+
+
 def nfs_bytes_per_rel(digits: int) -> int:
     return int(_interp_log([(d, float(b)) for d, b in
                             NFS_BYTES_PER_REL_ANCHORS], digits))
 
 
-def nfs_disk_estimate(digits: int) -> dict:
+def nfs_disk_estimate(digits: int, raw_rels: int | None = None) -> dict:
     """working-set estimate (GB) for an NFS job of this size.
 
     Components as fractions of the raw relation file: the dup cache writes
     ~16 B/relation (coordinates) + ~2.5 B (bitmaps); the LP intermediate
     peaked at 0.27x the dat on c137 (0.35 planned); matrix/cycles/dep
-    ~0.15x; plus a couple of GB of sieve-wave transient."""
-    rels = nfs_relations_estimate(digits)
+    ~0.15x; plus a couple of GB of sieve-wave transient.  `raw_rels`
+    overrides the GNFS relation lookup — SNFS passes the profile-aware
+    snfs_relations_estimate here and keeps the bytes-per-relation model."""
+    rels = nfs_relations_estimate(digits) if raw_rels is None else raw_rels
     bpr = nfs_bytes_per_rel(digits)
     dat = rels * bpr / 1e9
     dup = rels * 18 / 1e9

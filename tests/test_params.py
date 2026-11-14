@@ -4,12 +4,17 @@ from yagfu.backends import find_bin
 from yagfu.backends.siqs import _narrow_bug_params
 from yagfu.params import (
     NFS_PARAMS_ANCHORS,
+    SNFS_2LP_UNMEASURED_ABOVE,
+    SNFS_3LP_PROMOTE_SLACK,
     mpqs_lp1_bound,
     nfs_params,
+    nfs_relations_estimate,
     poly_budget,
     sieve_time_estimate,
     snfs_gnfs_equiv,
+    snfs_lp_structure,
     snfs_params,
+    snfs_relations_estimate,
     snfs_sieve_params,
 )
 
@@ -149,29 +154,35 @@ def test_snfs_sieve_params_calibrated_point():
     # Kyle Askine's 15^253-1 review (Nov 2026) was of the factordb
     # suggestion at SCALED difficulty 274.74: "600M/400M at least" and
     # "95/63 for mfb" with the special-q on the rational side.  The anchor
-    # sits on factordb's scale, not the halved form's true norm difficulty.
+    # sits on factordb's scale; the criterion reproduces it from a measured
+    # rational-side median (that family surveys ~400 bits at d275).
     (rlim, alim, lpbr, lpba, mfbr, mfba, rlbd, albd, logI) = \
-        snfs_sieve_params(275.0, "r")
+        snfs_sieve_params(275.0, "r", [1, 0, 0, 0, 0, 0, 1], -(15 ** 46), 1,
+                          sq_norm_bits=400.0)
     assert rlim == 600_000_000 and alim == 400_000_000
     assert lpbr == 32 and mfbr == 95          # 3LP on the special-q side
     assert lpba == 32 and mfba == 63          # 2LP on the other side
     assert rlbd > albd                        # CADO lambda rule follows mfb
     assert logI == 14
     # the real 15^253-1 suggestion interpolates just under the anchor
-    near = snfs_sieve_params(274.74, "r")
+    near = snfs_sieve_params(274.74, "r", [1, 0, 0, 0, 0, 0, 1],
+                             -(15 ** 46), 1, sq_norm_bits=400.0)
     assert 590_000_000 <= near[0] <= 600_000_000
-    # mirroring the sides flips the mfb split, keeps the limits
-    flipped = snfs_sieve_params(275.0, "a")
+    # mirroring the sides flips the mfb split, keeps the limits; the
+    # +-1-coefficient algebraic side's measured median (~115 at this
+    # geometry) stays under the threshold, so side a runs 2LP at 32 bits
+    flipped = snfs_sieve_params(275.0, "a", [1, 0, 0, 0, 0, 0, 1],
+                                -(15 ** 46), 1, sq_norm_bits=115.0)
     assert flipped[:2] == (rlim, alim)
-    assert (flipped[3], flipped[5]) == (32, 95)
+    assert (flipped[3], flipped[5]) == (32, 63)
     assert (flipped[2], flipped[4]) == (32, 63)
 
 
 def test_snfs_sieve_params_2lp_below_threshold():
-    # below SNFS_3LP_MIN_DIFFICULTY both sides stay 2LP
+    # a d110 job without norm info stays 2LP at the classic step
     for side in ("a", "r"):
         p = snfs_sieve_params(110.0, side)
-        assert p[4] == 2 * p[2] and p[5] == 2 * p[3]
+        assert p[4] == 2 * p[2] - 1 and p[5] == 2 * p[3] - 1
 
 
 def test_snfs_sieve_params_monotone_limits():
@@ -180,3 +191,112 @@ def test_snfs_sieve_params_monotone_limits():
         cur = snfs_sieve_params(float(d), "r")
         assert cur[0] >= prev[0] and cur[1] >= prev[1]
         prev = cur
+
+
+# --------------------------------------------------------------------------
+# graded LP ladder + norm promotion (ws-15* calibration, Nov 2026)
+# --------------------------------------------------------------------------
+
+#: y^6 - y^3 + 1 with base m: the halved-cyclotomic degree-6 family the
+#: ws-15c522/558/642 jobs sieved; +-1 coefficients keep the algebraic
+#: norms box-limited (~2^80 at logI 14) whatever the difficulty
+_DEG6 = [1, 0, 0, -1, 0, 0, 1]
+
+
+def test_snfs_lp_ladder_2lp_algebraic_sq():
+    # ws-15c522 family, special-q on the algebraic side: cofactor ~2^52 is
+    # far under the 2LP room, so no promotion — and the ladder steps lpb
+    # with difficulty instead of pinning 32 from d125 (the A/B: c522's
+    # 3LP@32 needed 329.5M where c261's 2LP@28 decided at 45.1M)
+    lp = snfs_lp_structure(205.38, "a", _DEG6, -(15 ** 29), 1)
+    assert (lp.sq_lpb, lp.other_lpb) == (30, 29)
+    assert not lp.three_lp_sq
+    assert (lp.sq_mfb, lp.other_mfb) == (59, 57)   # 2LP: mfb = 2*lpb - 1
+    p = snfs_sieve_params(205.38, "a", _DEG6, -(15 ** 29), 1)
+    # side "a": the sq bounds land on the algebraic side
+    assert (p[2], p[3], p[4], p[5]) == (29, 30, 57, 59)
+    assert p[6] == 2.27 and p[7] == 2.27          # CADO lambda rule
+    lp = snfs_lp_structure(239.93, "a", _DEG6, -(15 ** 53), 1)
+    assert (lp.sq_lpb, lp.other_lpb) == (31, 30)
+    assert not lp.three_lp_sq
+
+
+def test_snfs_lp_promotion_rational_sq():
+    # same family, special-q on the rational side: |Y0|*B norms grow with
+    # the base and the typical cofactor clears 2*lpb + slack, promoting
+    # the sq side to 3LP at the ladder's own lpb
+    lp = snfs_lp_structure(205.38, "r", [1, 0, 0, 1, 0, 0, 1],
+                           -(15 ** 29), 1)
+    assert lp.three_lp_sq
+    assert lp.cofactor_bits > 2 * lp.sq_lpb + SNFS_3LP_PROMOTE_SLACK
+    assert (lp.sq_lpb, lp.sq_mfb) == (30, 89)      # 3LP: mfb = 3*lpb - 1
+    p = snfs_sieve_params(205.38, "r", [1, 0, 0, 1, 0, 0, 1],
+                          -(15 ** 29), 1)
+    assert (p[2], p[4]) == (30, 89)
+    # difficulty-consistent small bases stay 2LP: a d120 job's |Y0|*B norms
+    # leave the cofactor under the threshold
+    lp = snfs_lp_structure(120.0, "r", [1, 0, 0, 1, 0, 0, 1],
+                           -(10 ** 20), 1)
+    assert not lp.three_lp_sq
+
+
+def test_snfs_2lp_unmeasured_at_high_difficulty():
+    # the d>=245 forced-3LP band is gone: the criterion decides everywhere,
+    # and a 2LP verdict at d>=245 is legal but unmeasured
+    # (SNFS_2LP_UNMEASURED_ABOVE -- run_nfs warns; every deciding point at
+    # d>=245 ran 3LP under the old blanket rule)
+    assert SNFS_2LP_UNMEASURED_ABOVE == 245.0
+    # side a at d254 with a measured median typical of the +-1-coeff family
+    # (the q-lattice pushes the d205 median up by a few bits): 2LP at the
+    # ladder's 32-bit step
+    lp = snfs_lp_structure(254.04, "a", _DEG6, -(15 ** 29), 1,
+                           sq_norm_bits=172.0)
+    assert not lp.three_lp_sq
+    assert (lp.sq_lpb, lp.sq_mfb, lp.other_lpb, lp.other_mfb) == \
+        (32, 63, 32, 63)
+    # ... while a rational-side median of the c253 class still promotes
+    lp = snfs_lp_structure(254.04, "r", _DEG6, -(15 ** 29), 1,
+                           sq_norm_bits=400.0)
+    assert lp.three_lp_sq and (lp.sq_lpb, lp.sq_mfb) == (32, 95)
+    # without a polynomial the criterion cannot fire: 2LP at the ladder's
+    # LPB step (the warned population when it lands at d>=245)
+    lp = snfs_lp_structure(254.04, "r")
+    assert not lp.three_lp_sq and (lp.sq_lpb, lp.sq_mfb) == (32, 63)
+
+
+def test_snfs_lp_normscan_measured_promotion():
+    # normscan-measured input drives the promotion with its own slack
+    # (SNFS_3LP_PROMOTE_SLACK_MEASURED = 110): the c261 family's measured
+    # side-a median (165.7 bits at d205) must stay 2LP -- c261 decided
+    # 45.1M raw there at 2LP lpb 28 -- while a measured rational-side
+    # median of 236 (the ws-15c265 level) clears the higher threshold
+    lp = snfs_lp_structure(205.38, "a", _DEG6, -(15 ** 29), 1,
+                           sq_norm_bits=165.7)
+    assert lp.norm_source == "normscan" and lp.promote_slack == 110.0
+    assert not lp.three_lp_sq and lp.sq_mfb == 59
+    lp = snfs_lp_structure(205.38, "r", [1, 0, 0, 1, 0, 0, 1],
+                           -(15 ** 29), 1, sq_norm_bits=236.0)
+    assert lp.three_lp_sq and (lp.sq_lpb, lp.sq_mfb) == (30, 89)
+    # the REAL Phi6 measurement (side-0 median 141.2) DECLINES where the
+    # proxy would promote: the proxy's static box sits 87 bits below the
+    # q-lattice reality on this side and over-promotes the family
+    lp = snfs_lp_structure(205.38, "r", [1, 0, 0, 1, 0, 0, 1],
+                           -(15 ** 29), 1, sq_norm_bits=141.2)
+    assert not lp.three_lp_sq and lp.sq_mfb == 59
+
+
+def test_snfs_relations_estimate_by_profile():
+    # the measured 3LP deciding counts anchor their table directly
+    assert snfs_relations_estimate(205.38, True) == 330_000_000
+    assert 329_000_000 <= snfs_relations_estimate(219.03, True) <= 331_000_000
+    est = snfs_relations_estimate(274.74, True)
+    assert 395_000_000 <= est <= 410_000_000
+    # the 2LP table floors at c261's deciding 45.1M, padded for the
+    # ladder's heavier 30/29 profile
+    assert 59_000_000 <= snfs_relations_estimate(205.38, False) <= 62_000_000
+    assert snfs_relations_estimate(100.0, False) == 10_000_000
+    # the 7x profile spread at one difficulty is the point
+    assert (snfs_relations_estimate(205.38, True)
+            / snfs_relations_estimate(205.38, False) > 4)
+    # the GNFS table is untouched (c152 decided at 235.8M)
+    assert 220_000_000 <= nfs_relations_estimate(152) <= 240_000_000
