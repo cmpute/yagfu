@@ -300,43 +300,40 @@ def parse_snfs_suggestion(raw: object, n: int,
     return best
 
 
-def _rank_snfs_candidates(job: SnfsJob, ctx, wd: Path) -> SnfsJob:
-    """Re-rank the suggestion's candidates by normalized Murphy E.
+def _snfs_poly_text(cand: SnfsJob) -> str:
+    deg = len(cand.coeffs) - 1
+    lines = [f"n: {cand.n}"]
+    for i in range(deg, -1, -1):
+        lines.append(f"c{i}: {cand.coeffs[i]}")
+    lines += [f"Y1: {cand.y1}", f"Y0: {cand.y0}"]
+    return "\n".join(lines) + "\n"
 
-    factordb orders its polys by scaled difficulty, which treats every
-    degree alike; the phi.kyleaskine.com convention (Murphy E scaled by
-    1.6^(6 - degree), the msieve polyselect normalization) is the better
-    predictor of relations per special-q.  Each candidate is scored by the
-    bundled score-poly helper (msieve's analyze_poly_murphy with a
-    golden-section E-optimal skew — the same scorer the phi site runs as
-    WASM); its optimal skew replaces factordb's.  Degrees above msieve's
-    MAX_POLY_DEGREE (8) cannot be scored and keep factordb's order.  Any
-    failure falls back to the factordb order, so sieving never blocks on
-    the helper."""
 
-    def _poly_text(cand: SnfsJob) -> str:
-        deg = len(cand.coeffs) - 1
-        lines = [f"n: {cand.n}"]
-        for i in range(deg, -1, -1):
-            lines.append(f"c{i}: {cand.coeffs[i]}")
-        lines += [f"Y1: {cand.y1}", f"Y0: {cand.y0}"]
-        return "\n".join(lines) + "\n"
+def _score_snfs_candidates(cands: list[SnfsJob], ctx,
+                           wd: Path) -> list[tuple[SnfsJob, float, float]]:
+    """score-poly each candidate: [(poly, normalized Murphy E, skew)],
+    best first.
 
-    if not job.alternates:
-        return job
+    The normalized E (Murphy E scaled by 1.6^(6 - degree), the
+    phi.kyleaskine.com / msieve polyselect convention) is what makes
+    polys of different degrees comparable; the scorer's golden-section
+    E-optimal skew replaces the candidate's own.  Candidates above
+    msieve's MAX_POLY_DEGREE (8) and failed scorings are dropped — the
+    callers see exactly what re-ranking would act on.  Empty when the
+    helper is missing or every scoring failed: the sieve stage then
+    keeps factordb's order and the bench reports the factordb score."""
     try:
         scorer = find_bin("score-poly", ctx.bin_dir)
     except BinNotFound:
-        ctx.log("nfs: snfs re-ranking skipped (no score-poly helper); "
-                "keeping factordb's scaled-difficulty order")
-        return job
+        ctx.log("nfs: snfs scoring skipped (no score-poly helper)")
+        return []
     scored: list[tuple[SnfsJob, float, float | None]] = []
-    for cand in [job, *job.alternates]:
+    for cand in cands:
         deg = len(cand.coeffs) - 1
         if deg > 8:      # msieve's MAX_POLY_DEGREE
             continue
         path = wd / f"snfs-cand-d{deg}-{id(cand) % 10000}.poly"
-        path.write_text(_poly_text(cand))
+        path.write_text(_snfs_poly_text(cand))
         try:
             out = subprocess.run([scorer, str(path)], capture_output=True,
                                  text=True, timeout=600, check=True).stdout
@@ -353,9 +350,23 @@ def _rank_snfs_candidates(job: SnfsJob, ctx, wd: Path) -> SnfsJob:
                     f"({exc}); excluded from re-ranking")
     for old in wd.glob("snfs-cand-*.poly"):
         old.unlink(missing_ok=True)
+    scored.sort(key=lambda t: -t[1])
+    return scored
+
+
+def _rank_snfs_candidates(job: SnfsJob, ctx, wd: Path) -> SnfsJob:
+    """Re-rank the suggestion's candidates by normalized Murphy E.
+
+    factordb orders its polys by scaled difficulty, which treats every
+    degree alike; the normalized Murphy E (see _score_snfs_candidates)
+    is the better predictor of relations per special-q.  Any failure
+    falls back to the factordb order, so sieving never blocks on the
+    helper."""
+    if not job.alternates:
+        return job
+    scored = _score_snfs_candidates([job, *job.alternates], ctx, wd)
     if not scored:
         return job
-    scored.sort(key=lambda t: -t[1])
     winner, _norm_e, skew = scored[0]
     if winner is not job:
         # keep the parse-time identity (fid, form, ...) of the winner but
@@ -752,6 +763,68 @@ def _poly_ranges(n: int, k: int) -> list[tuple[int, int] | None]:
     return out
 
 
+def _term_kill(p: subprocess.Popen) -> None:
+    """Terminate a polyselect process; escalate to kill after 10 s."""
+    if p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+
+
+def _polyselect_shard(n: int, ctx: RunContext, base: Path,
+                      engine: str = "gpu_cubsort"
+                      ) -> tuple[list[tuple[Path, subprocess.Popen]], dict]:
+    """Start the msieve -np search for n under `base`: one process per card
+    over disjoint slices of msieve's default leading-coefficient range,
+    whole and unpinned on a lone card.  Returns the (dir, process) list and
+    an info dict (sharded / threads / coeff_top for the caller's logging).
+
+    msieve only ever searches multiples of an ad-sieve multiplier and
+    rounds each begin up to one, so the slices partition the searched set
+    exactly, with zero cross-card traffic.  A sharded process gets a fresh
+    private subdir — msieve reads msieve.fb *before* searching, and a
+    leftover file for the same N would skip the search.  Every dir holds
+    that process's np.log (stdout) and msieve.log, and — once it exits —
+    its best-so-far msieve.fb."""
+    msieve = find_bin("msieve", ctx.bin_dir)
+    k = len(ctx.devices) if engine == "gpu_cubsort" else 1
+    rng = _poly_ranges(n, k)
+    info = {"sharded": len(rng) > 1,
+            "coeff_top": _poly_coeff_max(n),
+            # GPU engines cap their producer pool at 4 anyway; -t also sizes
+            # the stage-2/3 CPU pool, so sharded processes divide the cores
+            "threads": (str(ctx.threads) if len(rng) == 1 else
+                        str(max(2, ctx.threads // len(rng))))}
+    procs: list[tuple[Path, subprocess.Popen]] = []
+    for i, (dev, r) in enumerate(zip(ctx.devices[:len(rng)], rng)):
+        d = base if r is None else base / f"poly-{i}"
+        if r is not None:
+            shutil.rmtree(d, ignore_errors=True)
+            d.mkdir(parents=True)
+        # one nfs_args token, space-separated: a comma anywhere would
+        # trip msieve's legacy "X,Y" coefficient-range parse
+        args = f"stage1_engine={engine}"
+        if r is not None:
+            args += f" min_coeff={r[0]} max_coeff={r[1]}"
+        cmd = [msieve, "-np", args, "-t", info["threads"], "-v", str(n)]
+        f = open(d / "np.log", "wb")
+        try:
+            # msieve -np has no device flag; each process sees exactly
+            # its card as ordinal 0 via CUDA_VISIBLE_DEVICES
+            p = subprocess.Popen([str(c) for c in cmd],
+                                 cwd=str(d),
+                                 stdout=f, stderr=subprocess.STDOUT,
+                                 env={**os.environ,
+                                      **ctx.pin_env(dev)})
+        finally:
+            f.close()
+        procs.append((d, p))
+    return procs, info
+
+
 class PolyselectJob:
     """msieve -np polynomial search that stops when the polynomial is
     good, not when a timer fires.
@@ -830,45 +903,11 @@ class PolyselectJob:
         self._watch()
 
     def _shard(self, msieve) -> None:
-        """One msieve -np per card: the default coefficient range split
-        k ways, whole and unpinned-from-args on a lone card.  A sharded
-        process gets a fresh private subdir — msieve reads msieve.fb
-        *before* searching, and a leftover file for the same N would
-        skip the search."""
-        k = len(self.ctx.devices) if self.engine == "gpu_cubsort" else 1
-        rng = _poly_ranges(self.n, k)
-        self._procs = []
-        self._cards = list(zip(self.ctx.devices[:len(rng)], rng))
-        self.sharded = len(rng) > 1
-        self._coeff_top = _poly_coeff_max(self.n)
-        # GPU engines cap their producer pool at 4 anyway; -t also sizes
-        # the stage-2/3 CPU pool, so sharded processes divide the cores
-        self._threads = (str(self.ctx.threads) if len(rng) == 1 else
-                         str(max(2, self.ctx.threads // len(rng))))
-        for i, (dev, r) in enumerate(self._cards):
-            d = self.wd if r is None else self.wd / f"poly-{i}"
-            if r is not None:
-                shutil.rmtree(d, ignore_errors=True)
-                d.mkdir(parents=True)
-            # one nfs_args token, space-separated: a comma anywhere would
-            # trip msieve's legacy "X,Y" coefficient-range parse
-            args = f"stage1_engine={self.engine}"
-            if r is not None:
-                args += f" min_coeff={r[0]} max_coeff={r[1]}"
-            cmd = [msieve, "-np", args, "-t", self._threads, "-v",
-                   str(self.n)]
-            f = open(d / "np.log", "wb")
-            try:
-                # msieve -np has no device flag; each process sees exactly
-                # its card as ordinal 0 via CUDA_VISIBLE_DEVICES
-                p = subprocess.Popen([str(c) for c in cmd],
-                                     cwd=str(d),
-                                     stdout=f, stderr=subprocess.STDOUT,
-                                     env={**os.environ,
-                                          **self.ctx.pin_env(dev)})
-            finally:
-                f.close()
-            self._procs.append((d, p))
+        self._procs, info = _polyselect_shard(self.n, self.ctx, self.wd,
+                                              self.engine)
+        self.sharded = info["sharded"]
+        self._coeff_top = info["coeff_top"]
+        self._threads = info["threads"]
 
     def engine_retry(self) -> bool:
         """A GPU search where NO card produced a polynomial gets one retry
@@ -985,15 +1024,6 @@ class PolyselectJob:
             if p.poll() is None:
                 p.send_signal(signal.SIGINT)
 
-    def _term_kill(self, p) -> None:
-        if p.poll() is None:
-            p.terminate()
-            try:
-                p.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait()
-
     def wait(self, timeout: float | None = None) -> "PolyselectJob":
         """Block until the search ends (bar met, range exhausted, wall
         cap — the watcher SIGINTs and msieve saves best-so-far), merge
@@ -1018,7 +1048,7 @@ class PolyselectJob:
             try:
                 p.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                self._term_kill(p)
+                _term_kill(p)
 
     def _merge(self) -> None:
         """Promote the best-scoring shard result to the workdir root: the
@@ -1063,7 +1093,7 @@ class PolyselectJob:
         polynomial behind)."""
         for _, p in self._procs:
             if p.poll() is None:
-                self._term_kill(p)
+                _term_kill(p)
         if self.sharded:
             self._merge()
         if all([p.poll() is not None for _, p in self._procs]) \
@@ -1147,6 +1177,102 @@ def _poly_running_e_from_log(wd: Path) -> float | None:
             e = max(float(m) for m in ms)
             best = e if best is None else max(best, e)
     return best
+
+
+# ---------------------------------------------------------------------------
+# --bench-nfs: score the best SNFS polynomial against a timed GNFS
+# polyselect and recommend a method, without sieving anything.  The SNFS
+# side is _score_snfs_candidates (the production re-ranking scorer); the
+# GNFS side is a plain wall-capped msieve -np — no quality gate, no
+# engine retry — so its E is exactly what the limit bought.
+# ---------------------------------------------------------------------------
+
+def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,
+                          limit_s: float) -> dict | None:
+    """A timed GNFS polyselect for --bench-nfs: msieve -np over the default
+    leading-coefficient range (sharded per card), SIGINT at limit_s, then
+    read the best-so-far score out of the shard logs.  Unlike
+    PolyselectJob there is no quality gate and no CPU-engine retry — the
+    limit is the only stop, so the returned E is precisely what the time
+    bought.
+
+    Returns {"e", "bar", "degree", "fb", "wall_s"}: the best combined E
+    across the shards (None when nothing ran), msieve's own expectation
+    for a completed search, the winning poly's degree, the merged
+    msieve.fb text, and the wall time — or None when polyselect could not
+    even start."""
+    try:
+        find_bin("msieve", ctx.bin_dir)
+    except BinNotFound:
+        return None
+    wd.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
+    procs, info = _polyselect_shard(n, ctx, wd)
+    if info["sharded"]:
+        ctx.log(f"bench: gnfs polyselect sharded across {len(procs)} GPUs, "
+                f"{fmt_dur(limit_s)} limit")
+    else:
+        ctx.log(f"bench: gnfs polyselect ({fmt_dur(limit_s)} limit)")
+    deadline = t0 + limit_s
+    try:
+        while time.monotonic() < deadline:
+            if all(p.poll() is not None for _, p in procs):
+                break               # whole range searched before the limit
+            try:
+                ctx.check_deadline()
+            except TimeoutError:
+                break               # the run-level cap stops us too
+            time.sleep(min(POLY_POLL_S,
+                           max(0.2, deadline - time.monotonic())))
+        if any(p.poll() is None for _, p in procs):
+            for _, p in procs:
+                if p.poll() is None:
+                    p.send_signal(signal.SIGINT)
+        for _, p in procs:
+            try:
+                p.wait(timeout=NP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                _term_kill(p)
+    except BaseException:
+        for _, p in procs:
+            _term_kill(p)
+        raise
+    wall_s = time.monotonic() - t0
+    # best E per shard: the fork streams every new overall best, and the
+    # SIGINT'd processes finish with their final "combined = X" while
+    # saving the best-so-far polynomial
+    best_e: float | None = None
+    best_dir: Path | None = None
+    for d, _ in procs:
+        cands = [x for x in (_poly_running_e_from_log(d),
+                             _poly_e_from_log(d)) if x is not None]
+        if cands and (best_e is None or max(cands) > best_e):
+            best_e, best_dir = max(cands), d
+    bar = None
+    for d, _ in procs:
+        bar = _poly_e_bar_from_log(d)
+        if bar is not None:
+            break
+    fb = None
+    degree = None
+    if best_dir is not None and (best_dir / "msieve.fb").exists():
+        fb = read_log(best_dir / "msieve.fb")
+        if best_dir != wd:
+            shutil.copyfile(best_dir / "msieve.fb", wd / "msieve.fb")
+        kv = _parse_msieve_fb(fb)
+        degs = [int(k[1:]) for k in kv
+                if k.startswith("A") and k[1:].isdigit()]
+        degree = max(degs) if degs else None
+    if best_e is not None:
+        ctx.log(f"bench: gnfs polyselect best E {best_e:.3e}"
+                + (f" (msieve expects {bar:.3e} from a full search)"
+                   if bar is not None else "")
+                + f" after {fmt_dur(wall_s)}")
+    else:
+        ctx.log(f"bench: gnfs polyselect produced no polynomial in "
+                f"{fmt_dur(wall_s)}")
+    return {"e": best_e, "bar": bar, "degree": degree, "fb": fb,
+            "wall_s": wall_s}
 
 
 # ---------------------------------------------------------------------------

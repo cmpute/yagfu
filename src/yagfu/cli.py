@@ -20,7 +20,12 @@ import time
 from pathlib import Path
 
 from . import __version__
-from .backends.nfs import parse_snfs_suggestion, snfs_job_from_file
+from .backends.nfs import (
+    _score_snfs_candidates,
+    bench_gnfs_polyselect,
+    parse_snfs_suggestion,
+    snfs_job_from_file,
+)
 from .config import RunContext, cleanup_workdir, resolve_devices
 from .params import snfs_gnfs_equiv
 from .engine import Engine, FactorResult, FoundFactor
@@ -44,7 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "(TD -> rho -> GPU ECM -> SIQS/NFS)",
         epilog="examples:\n"
                "  yagfu 170141183460469231731687303715884105727\n"
-               "  yagfu -f composites.txt -db\n",
+               "  yagfu -f composites.txt -db\n"
+               "  yagfu --bench-nfs id:1100000008650831857\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("number", nargs="?",
@@ -111,6 +117,18 @@ def build_parser() -> argparse.ArgumentParser:
                          "stops at the quality target (see --poly-frac), "
                          "or when the best E stalls near it, or when the "
                          "whole coefficient range is searched")
+    ap.add_argument("--bench-nfs", metavar="N|id:FID", default=None,
+                    help="score the best SNFS polynomial against a timed "
+                         "GNFS polyselect on this number and exit — no "
+                         "factoring runs.  SNFS polys come from the "
+                         "factordb suggestion (re-ranked by normalized "
+                         "Murphy E, exactly like -snfs); GNFS runs "
+                         "msieve -np for --bench-nfs-time seconds.  "
+                         "Prints both E values and which method to use")
+    ap.add_argument("--bench-nfs-time", type=float, default=60.0,
+                    metavar="S", dest="bench_nfs_time",
+                    help="GNFS polyselect wall limit for --bench-nfs "
+                         "(default 60)")
     ap.add_argument("--poly-frac", type=float, default=0.65,
                     help="polyselect quality gate as a fraction of the E "
                          "msieve says to expect (default 0.65: msieve's bar "
@@ -413,32 +431,165 @@ def _verify_devices(devices: tuple[str, ...]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# --bench-nfs: SNFS vs GNFS by Murphy E, no factoring
+# ---------------------------------------------------------------------------
 
-def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.quiet and args.json:
-        pass  # json lines still go to stdout; -q only mutes the detail line
-    if args.snfs_job and args.factor_db:
-        sys.exit("error: pass either --snfs-job or -db, not both")
-    if args.snfs and not args.factor_db and not args.snfs_job:
-        sys.exit("error: -snfs needs -db (the SNFS suggestion comes from "
-                 "factordb) or --snfs-job")
-    numbers = load_numbers(args)
+def bench_nfs(args, ctx: RunContext, client: FactorDbClient) -> int:
+    """Score the best SNFS polynomial against a timed GNFS polyselect and
+    recommend a method, then exit.  Nothing is factored: the SNFS side is
+    the -snfs poly selection (factordb suggestion re-ranked by normalized
+    Murphy E via score-poly), the GNFS side is msieve -np under a plain
+    wall limit (--bench-nfs-time).
 
-    snfs_direct = None
-    if args.snfs_job:
+    Both Es are reported in the phi.kyleaskine.com normalization (Murphy E
+    * 1.6^(6 - degree)), which is what makes polys of different degrees —
+    here typically an SNFS degree 4-6 against msieve's GNFS degree pick —
+    comparable; the recommendation goes by it."""
+    spec = args.bench_nfs.strip()
+    fid = None
+    n: int | None = None
+    if spec.startswith("id:"):
+        fid = spec[3:].strip()
+        if not fid.isdigit():
+            print(f"error: bad factordb id: {spec!r}", file=sys.stderr)
+            return 2
+    else:
         try:
-            snfs_direct = snfs_job_from_file(
-                Path(args.snfs_job).read_text())
-        except OSError as e:
-            sys.exit(f"error: cannot read {args.snfs_job}: {e}")
-        if snfs_direct is None:
-            sys.exit(f"error: {args.snfs_job}: no SNFS polynomial found "
-                     "(need an n:/polynomial job file)")
-        if len(numbers) != 1 or numbers[0] != snfs_direct.n:
-            sys.exit(f"error: {args.snfs_job} is a job for "
-                     f"{snfs_direct.n}; pass exactly that number")
+            n = int(spec)
+        except ValueError:
+            print(f"error: not a decimal integer or id:N: {spec!r}",
+                  file=sys.stderr)
+            return 2
+    if args.bench_nfs_time <= 0:
+        print("error: --bench-nfs-time must be positive", file=sys.stderr)
+        return 2
 
+    rec: dict | None = None
+    if fid is not None:
+        rec = client.get_number_by_id(fid, snfs=True)
+        if rec is None or not rec.get("decimal"):
+            print(f"id:{fid}: factordb record unavailable", flush=True)
+            return 1
+        n = int(rec["decimal"])
+    else:
+        # best effort: a plain number benches as GNFS unless factordb
+        # carries an SNFS suggestion for it
+        rec = client.get_number(n, snfs=True)
+
+    digits = len(str(n))
+    status = (rec or {}).get("status")
+    print(f"bench-nfs: c{digits}" + (f" (id:{fid})" if fid else "")
+          + (f", factordb status {status}" if status else ""), flush=True)
+    if status in ("P", "PR"):
+        print("  the record is already prime; nothing to bench", flush=True)
+        return 1
+
+    if args.workdir:
+        wd = Path(args.workdir).expanduser() / "bench-nfs"
+    else:
+        wd = Path(tempfile.mkdtemp(prefix="yagfu-bench-nfs-"))
+    wd.mkdir(parents=True, exist_ok=True)
+    try:
+        return _bench_nfs_report(args, ctx, client, n, fid, rec, wd)
+    finally:
+        if args.keep:
+            ctx.log(f"bench: kept {wd}")
+        else:
+            shutil.rmtree(wd, ignore_errors=True)
+
+
+def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
+                      n: int, fid: str | None, rec: dict | None,
+                      wd: Path) -> int:
+    limit = args.bench_nfs_time
+
+    # ---- SNFS side: the -snfs selection path, scored ----
+    snfs = parse_snfs_suggestion((rec or {}).get("snfs"), n, fid=fid) \
+        if rec else None
+    snfs_e = snfs_deg = None
+    snfs_method = None
+    if snfs is None:
+        print("  snfs: no factordb suggestion for this number", flush=True)
+    else:
+        e0 = f", factordb E {snfs.e:g}" if snfs.e else ""
+        print(f"  snfs: suggestion {snfs.form or '(polynomial)'}: "
+              f"difficulty {snfs.difficulty:g}, scaled {snfs.scaled:g} "
+              f"(~ gnfs c{snfs_gnfs_equiv(snfs.scaled):g}{e0})", flush=True)
+        scored = _score_snfs_candidates([snfs, *snfs.alternates], ctx, wd)
+        for cand, ne, _sk in scored:
+            deg = len(cand.coeffs) - 1
+            print(f"    degree-{deg} candidate: normalized Murphy E "
+                  f"{ne:.3e}", flush=True)
+        if scored:
+            best, snfs_e, _sk = scored[0]
+            snfs_deg = len(best.coeffs) - 1
+            snfs_method = "score-poly"
+        elif snfs.e:
+            # no helper: factordb's own score is in the same units as
+            # score-poly's raw Murphy E — normalize it the same way
+            snfs_deg = len(snfs.coeffs) - 1
+            snfs_e = float(snfs.e) * 1.6 ** (6 - snfs_deg)
+            snfs_method = "factordb e"
+            print("    (no score-poly helper; factordb's E, same "
+                  "normalization)", flush=True)
+        else:
+            print("    no score-poly helper and no factordb E",
+                  flush=True)
+
+    # ---- GNFS side: a plain timed polyselect ----
+    b = bench_gnfs_polyselect(n, ctx, wd / "gnfs", limit)
+    gnfs_e = gnfs_deg = None
+    gnfs_raw = b["e"] if b else None
+    gnfs_bar = b["bar"] if b else None
+    if b and gnfs_raw is not None and b["degree"]:
+        gnfs_deg = b["degree"]
+        gnfs_e = gnfs_raw * 1.6 ** (6 - gnfs_deg)
+    print(f"  gnfs: msieve -np polyselect, {limit:g}s limit"
+          + (f", degree {gnfs_deg}" if gnfs_deg else "")
+          + (f": E {gnfs_raw:.3e}" if gnfs_raw is not None
+             else ": no polynomial in the limit"), flush=True)
+    if gnfs_bar is not None:
+        if gnfs_raw is not None:
+            print(f"    msieve expects E from {gnfs_bar:.3e} for a full "
+                  f"search; this run reached {gnfs_raw / gnfs_bar:.0%} "
+                  f"of it", flush=True)
+        else:
+            print(f"    msieve expects E from {gnfs_bar:.3e} for a full "
+                  f"search; nothing reached", flush=True)
+
+    # ---- verdict ----
+    print(f"  best SNFS Murphy E: "
+          + (f"{snfs_e:.3e} (normalized, degree {snfs_deg}, "
+             f"{snfs_method})" if snfs_e is not None else "unavailable"),
+          flush=True)
+    print(f"  best GNFS Murphy E: "
+          + (f"{gnfs_e:.3e} (normalized, degree {gnfs_deg}, "
+             f"msieve -np)" if gnfs_e is not None else "unavailable"),
+          flush=True)
+    if snfs_e is None and gnfs_e is None:
+        print("  no usable E on either side; cannot recommend", flush=True)
+        return 1
+    if gnfs_e is None:
+        pick, why = "SNFS", "GNFS polyselect produced no polynomial"
+    elif snfs_e is None:
+        pick, why = "GNFS", "no SNFS polynomial available"
+    else:
+        hi, lo = max(snfs_e, gnfs_e), min(snfs_e, gnfs_e)
+        pick = "SNFS" if snfs_e >= gnfs_e else "GNFS"
+        why = f"normalized Murphy E ratio {hi / lo:.2f}x"
+        if hi / lo < 1.15:
+            why += " — too close to call, either sieves fine"
+    print(f"  recommendation: {pick} ({why})", flush=True)
+    if gnfs_raw is not None and gnfs_bar is not None and gnfs_raw < gnfs_bar:
+        print(f"  note: a {limit:g}s GNFS polyselect undershoots a full "
+              f"search; the GNFS side improves with --bench-nfs-time",
+              flush=True)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+
+def _make_ctx(args) -> RunContext:
     raw_devices = tuple(d.strip() for d in args.device.split(",") if d.strip())
     if not raw_devices:
         sys.exit("error: --device needs at least one ordinal")
@@ -474,7 +625,50 @@ def main(argv=None) -> int:
     if args.poly_budget is not None:
         kwargs["poly_budget_s"] = args.poly_budget
     kwargs["poly_frac"] = args.poly_frac
-    ctx = RunContext(**kwargs)
+    return RunContext(**kwargs)
+
+
+def _bench_nfs_entry(args) -> int:
+    """--bench-nfs dispatch: scores polys and exits, no factoring."""
+    ctx = _make_ctx(args)
+    client = FactorDbClient(
+        token=read_token(args.db_token), dry_run=args.db_dry_run,
+        log=(lambda msg: ctx.log(msg)) if not args.quiet else None)
+    try:
+        return bench_nfs(args, ctx, client)
+    except KeyboardInterrupt:
+        print("yagfu: interrupted by user", file=sys.stderr, flush=True)
+        return 130
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.quiet and args.json:
+        pass  # json lines still go to stdout; -q only mutes the detail line
+    if args.snfs_job and args.factor_db:
+        sys.exit("error: pass either --snfs-job or -db, not both")
+    if args.snfs and not args.factor_db and not args.snfs_job:
+        sys.exit("error: -snfs needs -db (the SNFS suggestion comes from "
+                 "factordb) or --snfs-job")
+    if args.bench_nfs:
+        return _bench_nfs_entry(args)
+    numbers = load_numbers(args)
+
+    snfs_direct = None
+    if args.snfs_job:
+        try:
+            snfs_direct = snfs_job_from_file(
+                Path(args.snfs_job).read_text())
+        except OSError as e:
+            sys.exit(f"error: cannot read {args.snfs_job}: {e}")
+        if snfs_direct is None:
+            sys.exit(f"error: {args.snfs_job}: no SNFS polynomial found "
+                     "(need an n:/polynomial job file)")
+        if len(numbers) != 1 or numbers[0] != snfs_direct.n:
+            sys.exit(f"error: {args.snfs_job} is a job for "
+                     f"{snfs_direct.n}; pass exactly that number")
+
+    ctx = _make_ctx(args)
     engine = Engine(ctx)
 
     fdb_client = None

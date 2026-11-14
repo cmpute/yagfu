@@ -1,6 +1,7 @@
 import pytest
 
-from yagfu.cli import _db_factor_list, build_parser, factor_with_db, load_numbers
+from yagfu.cli import (_db_factor_list, bench_nfs, build_parser,
+                       factor_with_db, load_numbers)
 from yagfu.config import RunContext
 from yagfu.engine import FactorResult, FoundFactor
 
@@ -229,3 +230,137 @@ def test_db_snfs_off_by_default():
                                            rec=fdb.rec)
     assert eng.asked == [(n, None)]
     assert "snfs" not in fdb_info
+
+
+# ------------------------------------------------------------- --bench-nfs
+
+class BenchClient:
+    """Canned get_number/get_number_by_id for bench_nfs."""
+
+    def __init__(self, rec):
+        self.rec = rec
+
+    def get_number(self, n, snfs=False):
+        return self.rec
+
+    def get_number_by_id(self, fid, snfs=False):
+        return self.rec
+
+
+# x^6 + 2 at m = 10^5 divides n: the suggestion poly has a root mod n;
+# x^5 + 1 does not (m^5 + 1 != n) and parse_snfs_suggestion drops it
+BENCH_N = 10 ** 30 + 2
+BENCH_REC = {
+    "fid": "1100000008650831857",
+    "status": "C",
+    "decimal": str(BENCH_N),
+    "snfs": {
+        "n": str(BENCH_N),
+        "polys": [
+            {"c": [2, 0, 0, 0, 0, 0, 1], "y0": -10 ** 5, "y1": 1,
+             "difficulty": 30.0, "scaled": 30.0, "skew": 1.0,
+             "side": "a", "e": 3.0e-11, "form": "10^30+2"},
+            {"c": [1, 0, 0, 0, 0, 1], "y0": -10 ** 5, "y1": 1,
+             "difficulty": 25.0, "scaled": 25.0, "skew": 1.0,
+             "side": "a"},
+        ],
+    },
+}
+
+
+def _bench_args(tmp_path):
+    return build_parser().parse_args(
+        ["--bench-nfs", "id:1100000008650831857", "--bench-nfs-time", "1",
+         "--workdir", str(tmp_path / "wd")])
+
+
+def test_bench_nfs_recommends_snfs(tmp_path, capsys):
+    """score-poly and the timed GNFS polyselect run (stubbed binaries in
+    bin_dir); the deg-6 SNFS candidate's normalized E wins and the bogus
+    no-root candidate never reaches the scorer."""
+    bindir = tmp_path / "bins"
+    bindir.mkdir()
+    (bindir / "score-poly").write_text(
+        '#!/bin/sh\n'
+        'echo "skew 12.5, murphyE 3.0e-11, size 1.0e-15, alpha 0.5, '
+        'rroots 2"\n')
+    (bindir / "msieve").write_text(
+        '#!/bin/sh\n'
+        'trap \'printf "combined = 2.5e-12\\n"\n'
+        '      printf "N %s\\nSKEW 3.0\\nR0 -100000\\nR1 1\\nA0 1\\nA4 5\\n" '
+        '> msieve.fb\n'
+        '      exit 0\' INT\n'
+        'echo "expecting poly E from 9.0e-11 to > 1.2e-10"\n'
+        'echo "polyselect best E = 2.0e-12"\n'
+        'sleep 30 &\n'
+        'wait\n')
+    for p in (bindir / "score-poly", bindir / "msieve"):
+        p.chmod(0o755)
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    args = _bench_args(tmp_path)
+    rc = bench_nfs(args, ctx, BenchClient(BENCH_REC))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"bench-nfs: c{len(str(BENCH_N))} (id:1100000008650831857)" in out
+    # only the root-holding degree-6 candidate is scored
+    assert "degree-6 candidate: normalized Murphy E 3.000e-11" in out
+    assert "degree-5" not in out
+    # GNFS side: degree 4 from the stub fb, normalized by 1.6^(6-4)
+    assert "best SNFS Murphy E: 3.000e-11 (normalized, degree 6, " \
+           "score-poly)" in out
+    assert "best GNFS Murphy E: 6.400e-12 (normalized, degree 4, " \
+           "msieve -np)" in out
+    assert "recommendation: SNFS (normalized Murphy E ratio" in out
+    assert "--bench-nfs-time" in out            # the undershoot note
+
+
+def test_bench_nfs_gnfs_when_no_snfs(tmp_path, capsys):
+    """No factordb suggestion: the timed GNFS polyselect alone decides."""
+    bindir = tmp_path / "bins"
+    bindir.mkdir()
+    (bindir / "msieve").write_text(
+        '#!/bin/sh\n'
+        'trap \'printf "combined = 2.5e-12\\n"\n'
+        '      printf "N %s\\nSKEW 3.0\\nR0 -100000\\nR1 1\\nA0 1\\nA4 4\\n" '
+        '> msieve.fb\n'
+        '      exit 0\' INT\n'
+        'echo "polyselect best E = 2.0e-12"\n'
+        'sleep 30 &\n'
+        'wait\n')
+    (bindir / "msieve").chmod(0o755)
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    args = build_parser().parse_args(
+        ["--bench-nfs", str(BENCH_N), "--bench-nfs-time", "1",
+         "--workdir", str(tmp_path / "wd")])
+    rc = bench_nfs(args, ctx, BenchClient({"fid": None, "status": "C",
+                                           "decimal": str(BENCH_N),
+                                           "snfs": None}))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "snfs: no factordb suggestion" in out
+    assert "recommendation: GNFS (no SNFS polynomial available)" in out
+
+
+def test_bench_nfs_prime_record(tmp_path, capsys):
+    ctx = RunContext(device="0", devices=("0",), log_file=tmp_path / "b.log",
+                     quiet=True)
+    args = _bench_args(tmp_path)
+    rc = bench_nfs(args, ctx,
+                   BenchClient({"fid": "1", "status": "P",
+                                "decimal": "7919", "snfs": None}))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "already prime" in out
+
+
+def test_bench_nfs_bad_input(tmp_path):
+    ctx = RunContext(device="0", devices=("0",), log_file=tmp_path / "b.log",
+                     quiet=True)
+    args = build_parser().parse_args(["--bench-nfs", "id:12x3"])
+    assert bench_nfs(args, ctx, BenchClient(None)) == 2
+    args = build_parser().parse_args(["--bench-nfs", "xyz"])
+    assert bench_nfs(args, ctx, BenchClient(None)) == 2

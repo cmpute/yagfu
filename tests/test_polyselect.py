@@ -485,3 +485,95 @@ def test_some_shards_have_poly_no_retry(tmp_path, monkeypatch, capsys):
     assert job.engine_retry() is False
     assert spawns == []
     assert "keeping the others" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------- --bench-nfs
+
+def _stub_bin(dir_, name, body):
+    p = dir_ / name
+    p.write_text(body)
+    p.chmod(0o755)
+    return p
+
+
+def test_score_snfs_candidates_orders_normalizes_and_cleans(tmp_path):
+    """The shared scorer normalizes by 1.6^(6-degree) (the deg-5 raw E
+    outranks the deg-6 raw E yet loses normalized), replaces the skew with
+    the scorer's E-optimal one, and removes its scratch poly files.  A
+    single candidate is scored too — the bench path."""
+    # score-poly stub: a higher RAW murphyE for the degree-5 candidate
+    # (it keys on the c6: line's presence)
+    _stub_bin(tmp_path, "score-poly", """\
+#!/bin/sh
+if grep -q "^c6:" "$1"; then
+  echo "skew 12.5, murphyE 3.0e-11, size 1.0e-15, alpha 0.5, rroots 2"
+else
+  echo "skew 9.0, murphyE 4.8e-11, size 1.0e-15, alpha 0.5, rroots 2"
+fi
+""")
+    ctx = RunContext(device="0", devices=("0",), bin_dir=str(tmp_path),
+                     log_file=tmp_path / "t.log", quiet=True)
+    c6 = nfs.SnfsJob(n=10 ** 30 + 2, coeffs=[2, 0, 0, 0, 0, 0, 1],
+                     y0=-10 ** 5, y1=1, skew=1.0, difficulty=30.0,
+                     scaled=30.0)
+    c5 = nfs.SnfsJob(n=10 ** 30 + 2, coeffs=[1, 2, 0, 0, 0, 1],
+                     y0=-10 ** 5, y1=1, skew=2.0, difficulty=30.0,
+                     scaled=30.0)
+    assert len(c5.coeffs) == 6                # degree 5
+    scored = nfs._score_snfs_candidates([c6, c5], ctx, tmp_path)
+    # 3.0e-11 * 1.6^0 < 4.8e-11 * 1.6^1 = 7.68e-11: the deg-5 candidate
+    # wins on the normalized scale despite the lower raw E
+    assert [len(c.coeffs) - 1 for c, _, _ in scored] == [5, 6]
+    assert scored[0][1] == pytest.approx(4.8e-11 * 1.6)
+    assert scored[1][1] == pytest.approx(3.0e-11)
+    assert scored[0][2] == 9.0 and scored[1][2] == 12.5   # E-optimal skew
+    assert list(tmp_path.glob("snfs-cand-*.poly")) == []
+    # a single candidate (no alternates) is scored as well
+    solo = nfs._score_snfs_candidates([c6], ctx, tmp_path)
+    assert solo and solo[0][0] is c6
+
+
+MSIEVE_BENCH_STUB = """\
+#!/bin/sh
+trap 'printf "combined = 2.5e-12\\n"
+      printf "N 123\\nSKEW 3.0\\nR0 -100000\\nR1 1\\nA0 1\\nA4 5\\n" \\
+          > msieve.fb
+      exit 0' INT
+echo "expecting poly E from 9.0e-11 to > 1.2e-10"
+echo "polyselect best E = 2.0e-12"
+sleep 30 &
+wait
+"""
+
+
+def test_bench_gnfs_polyselect_limit_salvages_best(tmp_path):
+    """The timed search SIGINTs msieve at the limit and reads the salvaged
+    best-so-far E (the streamed best E loses to the final combined), the
+    printed bar, and the poly file — merged to the workdir root."""
+    _stub_bin(tmp_path, "msieve", MSIEVE_BENCH_STUB)
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(tmp_path), log_file=tmp_path / "t.log",
+                     quiet=True)
+    gnfs = tmp_path / "gnfs"
+    res = nfs.bench_gnfs_polyselect(10 ** 30 + 2, ctx, gnfs, 1.0)
+    assert res is not None
+    assert res["e"] == pytest.approx(2.5e-12)
+    assert res["bar"] == pytest.approx(9.0e-11)
+    assert res["degree"] == 4
+    assert res["fb"].startswith("N 123")
+    assert (gnfs / "msieve.fb").exists()          # merged to the root
+    assert 0.9 <= res["wall_s"] < 10              # the limit, not the sleep
+    err = (tmp_path / "t.log").read_text()
+    assert "gnfs polyselect" in err and "best E 2.500e-12" in err
+
+
+def test_bench_gnfs_polyselect_no_msieve(tmp_path, monkeypatch):
+    # find_bin would fall back to a PATH msieve on a real rig; the test
+    # wants the genuinely-unavailable branch
+    monkeypatch.setattr(
+        nfs, "find_bin",
+        lambda name, bd: (_ for _ in ()).throw(nfs.BinNotFound(name)))
+    ctx = RunContext(device="0", devices=("0",), bin_dir=str(tmp_path),
+                     log_file=tmp_path / "t.log", quiet=True)
+    assert nfs.bench_gnfs_polyselect(10 ** 30 + 2, ctx, tmp_path, 1.0) \
+        is None
