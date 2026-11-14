@@ -204,12 +204,14 @@ build_msieve() {
   install_bin "$ROOT/msieve-cuda/msieve" msieve
 
   # score-poly: Murphy-E scorer for SNFS poly candidates (CPU only; the
-  # static lib carries CUDA objects, hence the same link line as msieve)
+  # static lib carries CUDA objects, hence the same link line as msieve).
+  # $drv must precede -lcuda for the same reason as the msieve link above:
+  # the system libcuda.so is the old 550 driver and lacks the _v4 symbols.
   gcc -O2 -o "$BIN/score-poly" "$ROOT/tools/score_poly.c" \
     -I"$ROOT/msieve-cuda/ms_include" -I"$ROOT/msieve-cuda/include" \
     -I"$ROOT/msieve-cuda" -I"$ROOT/msieve-cuda/gnfs" \
     "$ROOT/msieve-cuda/libmsieve.a" \
-    -lgmp -lm -lpthread -lstdc++ -lgomp -lz -lcuda \
+    $drv -lgmp -lm -lpthread -lstdc++ -lgomp -lz -lcuda \
     -L"$CUDA_ROOT/lib64" -lcudart
 }
 
