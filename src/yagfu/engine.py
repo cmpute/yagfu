@@ -298,6 +298,14 @@ class Engine:
         raw digit count and not the difficulty itself.  A c135 record
         with an SNFS-170 suggestion is a ~c125-equivalent job and gets a
         t38-class pretest, not t52.
+
+        --ecm-t-level LO-HI replaces all of that with an explicit range:
+        the ledger is credited to LO without curves (stages below it run
+        nothing) and the climb to HI runs each stage only in its overlap's
+        share — the walk is the same min(curves_for_target, budget_left)
+        loop, which on a seeded ledger produces exactly that, landing on
+        HI exactly (earlier stages' cross-level credit counts, so the
+        final stage may need slightly less than its raw share).
         """
         ctx = self.ctx
         # the effective size: GNFS-equivalent of the difficulty when
@@ -308,6 +316,22 @@ class Engine:
         if ctx.ecm_only:
             ctx.log(f"ecm: c{_digits(m)}, ecm-only: every level to full "
                     f"budget, then endless t65")
+        elif ctx.ecm_t_level is not None:
+            # explicit t-level range: each stage runs only the share of its
+            # diagonal budget the range covers (38.0-44.0 -> 2/5 of the t40
+            # stage, 4/5 of the t45 stage); --plan and the SNFS difficulty
+            # pricing do not apply
+            lo, target = ctx.ecm_t_level
+            ctx.log(f"ecm: c{_digits(m)}"
+                    + (f" (snfs {snfs.scaled:g} ~ gnfs c{sz:g})"
+                       if snfs is not None
+                       else "")
+                    + f", t-level {lo:g}-{target:g} (--ecm-t-level)"
+                    + f", ledger at t{ledger.depth():.2f}")
+            if ledger.depth() < lo:
+                ledger.seed_to_depth(lo)
+                ctx.log(f"ecm: credited to t{ledger.depth():.2f} without "
+                        f"curves (--ecm-t-level start)")
         else:
             target = min(target_depth(sz, ctx.plan), 65.0)
             ctx.log(f"ecm: c{_digits(m)}"
@@ -325,7 +349,8 @@ class Engine:
                 j = top                        # park at t65 forever
             elif not ctx.ecm_only and j > 0 and (
                     ledger.depth() >= target
-                    or (sz <= 45 and target < 15.0)):
+                    or (ctx.ecm_t_level is None
+                        and sz <= 45 and target < 15.0)):
                 break  # target reached, or YAFU's trivial-pretest skip
             if ctx.ecm_only:
                 want = ledger.level_budget_left(j)

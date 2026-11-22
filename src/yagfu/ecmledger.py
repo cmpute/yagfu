@@ -122,3 +122,33 @@ class EcmLedger:
 
     def level_budget_left(self, level_j: int) -> int:
         return max(0, int(CURVES[level_j][level_j]) - self.done_curves[level_j])
+
+    def seed_to_depth(self, d: float) -> None:
+        """Raise the ledger to depth `d` without running curves: the
+        --ecm-t-level start credit.  The ECM ladder then climbs from there,
+        so each stage only runs the share of its diagonal budget that the
+        requested range covers.
+
+        Only ever raises — real work is never taken back.  The two
+        bookkeepings move together (work[] drives depth(), done_curves[]
+        drives the per-level budget left), and a stage is only raised when
+        its work is below the credit profile.  Depths below t15 are not
+        representable (depth() reads 0 until the first level completes), so
+        they are left to the always-run first batch.  The stage carrying d
+        is credited as round(frac * M[k][k]) curves, so finishing that
+        diagonal lands exactly on 1.0 and the ladder's remainder arithmetic
+        is exact."""
+        if d < T_LEVELS[0]:
+            return
+        k = min(1 + int((d - T_LEVELS[0]) // 5), NUM_LEVELS)
+        for i in range(k):
+            if self.work[i] < 1.0:
+                self.work[i] = 1.0
+                self.done_curves[i] = max(self.done_curves[i],
+                                          int(CURVES[i][i]))
+        if k < NUM_LEVELS:
+            done = round((d - T_LEVELS[k - 1]) / 5.0 * CURVES[k][k])
+            frac = done / CURVES[k][k]
+            if self.work[k] < frac:
+                self.work[k] = frac
+                self.done_curves[k] = max(self.done_curves[k], done)

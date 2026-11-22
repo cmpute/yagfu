@@ -175,3 +175,27 @@ def test_ladder_split_routes_nfs_cofactor_to_nfs(monkeypatch, tmp_path):
     assert calls["poly"] == []
     assert calls["nfs"] == [QN1 * QN2]
     assert calls["siqs"] == []
+
+
+def test_ecm_t_level_wiring(monkeypatch, tmp_path):
+    """--ecm-t-level 38.0-44.0 drives the ladder through the seeded
+    ledger: only the t40/t45 overlap shares run (B1=3e6 then B1=11e6),
+    nothing below t38, and the cofactor hands to the sieve afterwards."""
+    calls = []
+
+    def fake_ecm(n, b1, total, ctx, wd, tag):
+        calls.append((b1, total))
+        return EcmRunResult(curves_done=total, wall_s=0.001 * total)
+
+    def fake_siqs(m, ctx, wd):
+        return SiqsResult(factors=[QS1, QS2], ok=True, rc=0, wall_s=0.1)
+
+    monkeypatch.setattr(engine_mod, "pollard_rho", lambda m: ([], m))
+    monkeypatch.setattr(engine_mod, "run_ecm_curves", fake_ecm)
+    monkeypatch.setattr(engine_mod, "run_siqs", fake_siqs)
+
+    eng = Engine(RunContext(device="0", devices=("0",),
+                            ecm_t_level=(38.0, 44.0)))
+    res = eng.factor(QS1 * QS2, tmp_path)
+    assert res.complete, res.error
+    assert calls == [(3_000_000, 1101), (11_000_000, 3928)]

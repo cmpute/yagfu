@@ -104,6 +104,14 @@ def build_parser() -> argparse.ArgumentParser:
                           help="skip the ECM stage entirely: TD -> rho -> "
                                "SIQS/NFS (handy for reruns when the ECM "
                                "pretest is known to be useless)")
+    ap.add_argument("--ecm-t-level", metavar="LO-HI", default=None,
+                    help="run the ECM pretest over exactly this t-level "
+                         "range, e.g. 38.0-44.0: the ledger is credited to "
+                         "t38 without curves (below it nothing runs) and "
+                         "the ladder climbs to t44, landing exactly on it "
+                         "(each stage runs only its overlap's share, "
+                         "earlier stages' cross-level credit counted); "
+                         "overrides --plan")
     ap.add_argument("--force", choices=("siqs", "nfs"), default=None,
                     help=argparse.SUPPRESS)  # debug: skip the selector
     ap.add_argument("--ecm-stage2-maxmem", type=int, default=None, metavar="MB",
@@ -598,6 +606,20 @@ def _make_ctx(args) -> RunContext:
     except ValueError as e:
         sys.exit(f"error: {e}")
     _verify_devices(devices)
+    ecm_t_level = None
+    if args.ecm_t_level is not None:
+        if args.ecm_only or args.no_ecm:
+            ap.error("--ecm-t-level does not combine with --ecm-only/--no-ecm")
+        mt = re.fullmatch(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)",
+                          args.ecm_t_level.strip())
+        if mt is None:
+            ap.error("--ecm-t-level wants LO-HI in digits, e.g. 38.0-44.0")
+        lo, hi = float(mt.group(1)), float(mt.group(2))
+        if hi > 65.0:
+            ap.error("--ecm-t-level: the ECM ladder tops out at t65")
+        if lo > hi:
+            ap.error("--ecm-t-level: LO must not exceed HI")
+        ecm_t_level = (lo, hi)
     kwargs = dict(
         bin_dir=Path(args.bin_dir) if args.bin_dir else None,
         device=devices[0],
@@ -612,6 +634,7 @@ def _make_ctx(args) -> RunContext:
         force_method=args.force,
         ecm_only=args.ecm_only,
         no_ecm=args.no_ecm,
+        ecm_t_level=ecm_t_level,
         topup_frac=args.topup_frac,
         target_safety=args.target_safety,
         wave_max=args.wave_max,
