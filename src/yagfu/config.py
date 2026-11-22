@@ -97,7 +97,7 @@ class RunContext:
     threads: int = field(default_factory=lambda: max(1, _nproc() - 2))
     sieve_procs: int = 1                 # cuda-sieve processes per band
     plan: str = "normal"                 # light | normal | deep
-    xover: int = 105                     # SIQS -> NFS crossover (digits)
+    xover: int = 100                     # SIQS -> NFS crossover (digits)
     verbose: int = 0                     # -v count: extra detail level
     quiet: bool = False                  # -q: silence all progress logs
     keep_workdir: bool = False

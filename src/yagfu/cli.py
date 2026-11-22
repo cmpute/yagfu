@@ -70,8 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "routing")
     ap.add_argument("--plan", choices=("light", "normal", "deep"),
                     default="normal", help="ECM pretest depth (default normal)")
-    ap.add_argument("--xover", type=int, default=105,
-                    help="SIQS -> NFS crossover in digits (default 105)")
+    ap.add_argument("--xover", type=int, default=100,
+                    help="SIQS -> NFS crossover in digits (default 100)")
     ap.add_argument("--device", default="0",
                     help='CUDA device, a comma-separated list, or "all" '
                          "for every card visible in this shell: ECM stage "

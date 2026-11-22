@@ -15,8 +15,8 @@ input composite
    ├─ Pollard rho (Brent)      x²+3, x²+2, x²+1 in order; rhomax=1000 batch-GCDs
    ├─ GPU ECM                  gmp-ecm -gpu (stage 1)  →  gpuecm2 (stage 2)
    │                           B1 ladder 2e3…85e7, YAFU work ledger, default B2
-   └─ final selector           < 105 digits: cuda-mpqs (SIQS)
-                               ≥ 105 digits: msieve polyselect + cuda-sieve
+   └─ final selector           < 100 digits: cuda-mpqs (SIQS)
+                               ≥ 100 digits: msieve polyselect + cuda-sieve
                                              sieving + msieve filter/LA/sqrt
                                (each is the other's fallback)
 ```
@@ -53,9 +53,10 @@ at least one B1=2000 batch always runs even when yafu would jump straight to the
 sieve (`target < 15 && digits ≤ 45`) — cheap insurance given the shallower prework.
 
 **Independent final selector.** Below the crossover digit count the job goes to
-cuda-mpqs, at or above it to the GNFS pipeline; the default crossover is 105,
-extrapolated from measured total-wall times on an RTX 4090 (mpqs wins through
-c100: 117 s vs 167 s). NFS sieve parameters (rlim/alim/lpb/logI) come from a
+cuda-mpqs, at or above it to the GNFS pipeline; the default crossover is 100
+(measured total-wall times on an RTX 4090 still favor mpqs at c100: 117 s vs
+167 s; YAFU puts the crossover at 95). NFS sieve parameters (rlim/alim/lpb/logI)
+come from a
 per-size anchor table (c70…c150, piecewise-linear); how many relations a job
 needs is not tabulated — the sieving loop derives it from measurements. The
 sieving loop is a reactive pipeline: small waves keep one
@@ -182,7 +183,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `--plan {light,normal,deep}` | `normal` | ECM target depth (2/9, 4/13, 1/3 of digits) |
 | `--ecm-only` | off | never run SIQS/NFS: climb every ECM level to its full budget, then sample t65 forever until the number factors or Ctrl+C |
 | `--no-ecm` | off | skip the ECM stage entirely: TD → rho → SIQS/NFS (rerun convenience when the pretest is known useless) |
-| `--xover N` | 105 | SIQS → NFS crossover in digits |
+| `--xover N` | 100 | SIQS → NFS crossover in digits |
 | `--device N[,N…]` | 0 | CUDA device(s); a list fans GPU ECM stage 1, polyselect and NFS sieving out across the cards (ECM counts/polyselect coefficient ranges/sieve chunks split per card), SIQS runs cuda-mpqs cluster mode from c80; ECM stage 2 and Lanczos use the first device |
 | `--threads N` | nproc−2 | CPU threads for msieve stages |
 | `--sieve-procs N` | 1 | concurrent cuda-sieve processes per q-band, per GPU |
