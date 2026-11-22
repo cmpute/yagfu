@@ -27,6 +27,7 @@ from .backends.nfs import (
     snfs_job_from_file,
 )
 from .config import RunContext, cleanup_workdir, resolve_devices
+from .ecmledger import target_depth
 from .params import snfs_gnfs_equiv
 from .engine import Engine, FactorResult, FoundFactor
 from .fdb import (
@@ -510,6 +511,7 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
                       n: int, fid: str | None, rec: dict | None,
                       wd: Path) -> int:
     limit = args.bench_nfs_time
+    digits = len(str(n))
 
     # ---- SNFS side: the -snfs selection path, scored ----
     snfs = parse_snfs_suggestion((rec or {}).get("snfs"), n, fid=fid) \
@@ -588,6 +590,27 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
         if hi / lo < 1.15:
             why += " — too close to call, either sieves fine"
     print(f"  recommendation: {pick} ({why})", flush=True)
+
+    # what the normal flow's ECM pretest would target for each route —
+    # the ladder prices SNFS by the suggestion's scaled difficulty (the
+    # gnfs-equivalent), GNFS by the digit count; Murphy E plays no role
+    # in it (the poly only exists after the pretest would have run)
+    plan = args.plan
+    if snfs is not None:
+        sz_s = snfs_gnfs_equiv(snfs.scaled)
+        snfs_t = min(target_depth(sz_s, plan), 65.0)
+        gnfs_t = min(target_depth(digits, plan), 65.0)
+        print(f"  ecm pretest target (plan={plan}): "
+              f"SNFS route t{snfs_t:.1f} (gnfs c{sz_s:g}), "
+              f"GNFS route t{gnfs_t:.1f}", flush=True)
+        rec_t = snfs_t if pick == "SNFS" else gnfs_t
+        print(f"  {pick} route: the pretest would run to t{rec_t:.1f}",
+              flush=True)
+    else:
+        t = min(target_depth(digits, plan), 65.0)
+        print(f"  ecm pretest target (plan={plan}): t{t:.1f} (c{digits})",
+              flush=True)
+
     if gnfs_raw is not None and gnfs_bar is not None and gnfs_raw < gnfs_bar:
         print(f"  note: a {limit:g}s GNFS polyselect undershoots a full "
               f"search; the GNFS side improves with --bench-nfs-time",

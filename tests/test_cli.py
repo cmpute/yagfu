@@ -313,6 +313,12 @@ def test_bench_nfs_recommends_snfs(tmp_path, capsys):
     assert "best GNFS Murphy E: 6.400e-12 (normalized, degree 4, " \
            "msieve -np)" in out
     assert "recommendation: SNFS (normalized Murphy E ratio" in out
+    # the normal flow's ECM pretest targets, per route: the suggestion's
+    # scaled difficulty (gnfs-equiv 0.56*30+30) for SNFS, the digit count
+    # for GNFS; plan=normal is 4/13 of either
+    assert "ecm pretest target (plan=normal): SNFS route t14.4 " \
+           "(gnfs c46.8), GNFS route t9.5" in out
+    assert "SNFS route: the pretest would run to t14.4" in out
     assert "--bench-nfs-time" in out            # the undershoot note
 
 
@@ -343,6 +349,9 @@ def test_bench_nfs_gnfs_when_no_snfs(tmp_path, capsys):
     assert rc == 0
     assert "snfs: no factordb suggestion" in out
     assert "recommendation: GNFS (no SNFS polynomial available)" in out
+    # no suggestion: only the GNFS route's target, priced by digits
+    assert f"ecm pretest target (plan=normal): " \
+           f"t{4 * len(str(BENCH_N)) / 13:.1f} (c{len(str(BENCH_N))})" in out
 
 
 def test_bench_nfs_prime_record(tmp_path, capsys):
