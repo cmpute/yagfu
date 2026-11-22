@@ -373,6 +373,51 @@ def test_filter_rung_estimator():
     assert _filter_rung([(1, 100, 90, -10, 5)], 0.0, 1.15) == (102, "ladder")
 
 
+def test_dep_hits_parsing():
+    """The sqrt dependencies that landed a factor: the last dependency
+    without a failure line is the one that ended the walk (a semiprime's
+    factor is never announced); announced factors record as they happen;
+    a silent mid-walk block is a skipped dependency, not a hit."""
+    from yagfu.backends.nfs import _dep_hits
+    # deps 1-2 fail, dep 3 lands and ends the phase (c137 nc3-fixed.log)
+    assert _dep_hits("\n".join([
+        "reading relations for dependency 1",
+        "GCD is 1, no factor found",
+        "reading relations for dependency 2",
+        "GCD is N, no factor found",
+        "reading relations for dependency 3",
+        "sqrtTime: 258",
+        "p61 factor: 123",
+    ])) == [3]
+    # first dependency lands (c137 nc3-nosp.log)
+    assert _dep_hits("\n".join([
+        "reading relations for dependency 1",
+        "sqrtTime: 12",
+    ])) == [1]
+    # announced factors record as they happen, then the last one lands
+    assert _dep_hits("\n".join([
+        "reading relations for dependency 1",
+        "found factor: 123",
+        "reading relations for dependency 2",
+        "GCD is 1, no factor found",
+        "reading relations for dependency 3",
+    ])) == [1, 3]
+    # a dependency with no relations is skipped mid-walk (not a hit)
+    assert _dep_hits("\n".join([
+        "reading relations for dependency 1",
+        "reading relations for dependency 2",
+        "GCD is 1, no factor found",
+        "reading relations for dependency 3",
+    ])) == [3]
+    # a non-congruent dependency fails like a GCD miss
+    assert _dep_hits("\n".join([
+        "reading relations for dependency 1",
+        "dependency does not form a congruence of squares!",
+        "reading relations for dependency 2",
+        "sqrtTime: 5",
+    ])) == [2]
+
+
 # ------------------------------------------------------------------- snfs
 
 def _snfs_job(n, side="a", scaled=70.6):

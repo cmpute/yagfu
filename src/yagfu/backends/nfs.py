@@ -1363,6 +1363,40 @@ def snfs_measured_profile(job: SnfsJob, ctx: RunContext,
     return sieve, lp
 
 
+def _dep_hits(log: str) -> list[int]:
+    """Which sqrt dependencies landed a factor: msieve walks the
+    dependencies Lanczos recovered ("reading relations for dependency N")
+    and after each either logs a failure ("GCD is 1/N, no factor found",
+    "does not form a congruence of squares") or lands a factor and stops
+    the walk.  A landed factor is announced with "found factor:" only when
+    the remaining cofactor is composite and big enough to be worth another
+    dependency (> 85 bits) — a semiprime's last dependency just ends the
+    phase, so the dependency that succeeded is the one whose block carries
+    no failure line.  Announced factors are recorded as they happen; a
+    silent block in the middle is a dependency with no relations, skipped
+    (not a hit), and a silent block at the end is only trusted when the
+    phase did land factors."""
+    hits: list[int] = []
+    cur = None
+    failed = True
+    for line in log.splitlines():
+        m = re.search(r"reading relations for dependency (\d+)", line)
+        if m:
+            cur = int(m.group(1))
+            failed = False
+            continue
+        if cur is None:
+            continue
+        if re.search(r"GCD is (?:1|N), no factor found"
+                     r"|does not form a congruence", line):
+            failed = True
+        elif "found factor:" in line:
+            hits.append(cur)
+    if cur is not None and not failed:
+        hits.append(cur)
+    return hits
+
+
 def run_nfs(n: int, ctx: RunContext, wd: Path,
             snfs: SnfsJob | None = None) -> NfsResult:
     """Factor n with GNFS inside wd (polyselect runs here when nothing
@@ -1896,9 +1930,17 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
     # (it anchors the run: dimension count + initial ETA) and then one per
     # completed 10% of the dimension count, instead of one per minute
     last_la_decile = [-1]
+    #: dependencies recovered at the end of the successful Lanczos run
+    #: ("recovered N nontrivial dependencies") — the candidates sqrt can
+    #: walk, reported on the completion line
+    la_deps = [None]
 
     def _la_lines(lines):
         for l in lines:
+            m = re.search(r"recovered (\d+) nontrivial dependencies", l)
+            if m:
+                la_deps[0] = int(m.group(1))
+                continue
             if "linear algebra" not in l:
                 continue
             if l.startswith("commencing"):
@@ -1964,6 +2006,12 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
     res.ok = bool(res.factors)
     res.raw_relations = S.appended
     res.bands = waves_appended
+    dep_hits = _dep_hits(log3) if res.ok else []
+    dep_note = ""
+    if la_deps[0] is not None and dep_hits:
+        dep_note += (", succeeded on " + ",".join(map(str, dep_hits))
+                     + f"/{la_deps[0]} dependencies")
     ctx.log(f"nfs: complete, {len(res.factors)} factor(s), "
-            f"{waves_appended} sieve wave(s), {S.appended:,} relations")
+            f"{waves_appended} sieve wave(s), {S.appended:,} relations"
+            + dep_note)
     return res
