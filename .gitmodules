@@ -16,8 +16,8 @@
 	branch = main
 [submodule "cuda-sieve"]
 	path = cuda-sieve
-	url = https://github.com/kyleaskine/cuda-sieve
-	branch = main
+	url = https://github.com/cmpute/cuda-sieve.git
+	branch = yagfu
 [submodule "msieve-cuda"]
 	path = msieve-cuda
 	url = https://github.com/cmpute/msieve-cuda/
