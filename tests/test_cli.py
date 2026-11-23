@@ -354,6 +354,80 @@ def test_bench_nfs_gnfs_when_no_snfs(tmp_path, capsys):
            f"t{4 * len(str(BENCH_N)) / 13:.1f} (c{len(str(BENCH_N))})" in out
 
 
+MSIEVE_SLOW = (
+    '#!/bin/sh\n'
+    # the first polynomial only after 0.5 s; stopped before, saves nothing
+    "trap '[ -f poly.found ] || exit 0\n"
+    '      printf "combined = 2.5e-12\\n"\n'
+    '      printf "N 123\\nSKEW 3.0\\nR0 -100000\\nR1 1\\nA0 1\\nA4 5\\n" '
+    '> msieve.fb\n'
+    "      exit 0' INT\n"
+    'echo "expecting poly E from 9.0e-11 to > 1.2e-10"\n'
+    '( sleep 0.5\n'
+    '  echo "polyselect best E = 2.0e-12"\n'
+    '  : > poly.found ) &\n'
+    'sleep 60 &\n'
+    'wait\n')
+
+
+def _bench_until_poly(tmp_path, capsys, msieve_body, until_poly):
+    bindir = tmp_path / "bins"
+    bindir.mkdir(parents=True)
+    p = bindir / "msieve"
+    p.write_text(msieve_body)
+    p.chmod(0o755)
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    argv = ["--bench-nfs", str(BENCH_N), "--bench-nfs-time", "0.3"]
+    if until_poly:
+        argv.append("--bench-nfs-until-poly")
+    args = build_parser().parse_args(argv + ["--workdir", str(tmp_path / "wd")])
+    rc = bench_nfs(args, ctx, BenchClient({"fid": None, "status": "C",
+                                           "decimal": str(BENCH_N),
+                                           "snfs": None}))
+    return rc, capsys.readouterr().out
+
+
+def test_bench_nfs_until_poly_reports_overrun(tmp_path, capsys):
+    """--bench-nfs-until-poly: a GNFS search with no polynomial when the
+    limit is up runs on until the first one appears; the report says by how
+    much the limit was overrun, and prices the undershoot note with the
+    time actually spent.  Without the flag the same search is cut at the
+    limit and reports no polynomial."""
+    rc, out = _bench_until_poly(tmp_path, capsys, MSIEVE_SLOW, until_poly=False)
+    assert rc == 1                              # nothing on either side
+    assert "gnfs: msieve -np polyselect, 0.3s limit: no polynomial in the limit" in out
+    assert "--bench-nfs-until-poly:" not in out
+
+    rc, out = _bench_until_poly(tmp_path / "again", capsys, MSIEVE_SLOW,
+                                until_poly=True)
+    assert rc == 0
+    assert "--bench-nfs-until-poly: no polynomial within the 0.3s limit, " \
+           "ran on for" in out and "s more until one appeared" in out
+    assert "best GNFS Murphy E: 6.400e-12 (normalized, degree 4, " \
+           "msieve -np)" in out
+    assert "GNFS polyselect undershoots a full search" in out
+    assert "a 0.3s GNFS polyselect" not in out      # priced by the real time
+
+
+def test_bench_nfs_until_poly_search_ends_without_one(tmp_path, capsys):
+    """A search msieve ends by itself without a polynomial: the flag cannot
+    wait past that, and the report says so."""
+    rc, out = _bench_until_poly(
+        tmp_path, capsys,
+        '#!/bin/sh\n'
+        'echo "expecting poly E from 9.0e-11 to > 1.2e-10"\n'
+        'sleep 0.5\n'
+        'exit 0\n',
+        until_poly=True)
+    assert rc == 1                                  # no E on either side
+    assert "--bench-nfs-until-poly: no polynomial within the 0.3s limit, " \
+           "ran on for" in out
+    assert "s more, then the search ended without one" in out
+    assert "no usable E on either side; cannot recommend" in out
+
+
 def test_bench_nfs_prime_record(tmp_path, capsys):
     ctx = RunContext(device="0", devices=("0",), log_file=tmp_path / "b.log",
                      quiet=True)

@@ -138,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
                     metavar="S", dest="bench_nfs_time",
                     help="GNFS polyselect wall limit for --bench-nfs "
                          "(default 60)")
+    ap.add_argument("--bench-nfs-until-poly", action="store_true", default=False,
+                    dest="bench_nfs_until_poly",
+                    help="with --bench-nfs: when the GNFS polyselect has no "
+                         "polynomial once --bench-nfs-time is up, let it run "
+                         "on until the first one appears instead of stopping "
+                         "with none (no upper bound; Ctrl+C stops it)")
     ap.add_argument("--poly-frac", type=float, default=0.65,
                     help="polyselect quality gate as a fraction of the E "
                          "msieve says to expect (default 0.65: msieve's bar "
@@ -448,7 +454,8 @@ def bench_nfs(args, ctx: RunContext, client: FactorDbClient) -> int:
     recommend a method, then exit.  Nothing is factored: the SNFS side is
     the -snfs poly selection (factordb suggestion re-ranked by normalized
     Murphy E via score-poly), the GNFS side is msieve -np under a plain
-    wall limit (--bench-nfs-time).
+    wall limit (--bench-nfs-time) — which --bench-nfs-until-poly lifts for
+    a search that has no polynomial yet when it expires.
 
     Both Es are reported in the phi.kyleaskine.com normalization (Murphy E
     * 1.6^(6 - degree)), which is what makes polys of different degrees —
@@ -547,7 +554,8 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
                   flush=True)
 
     # ---- GNFS side: a plain timed polyselect ----
-    b = bench_gnfs_polyselect(n, ctx, wd / "gnfs", limit)
+    b = bench_gnfs_polyselect(n, ctx, wd / "gnfs", limit,
+                              until_poly=args.bench_nfs_until_poly)
     gnfs_e = gnfs_deg = None
     gnfs_raw = b["e"] if b else None
     gnfs_bar = b["bar"] if b else None
@@ -558,6 +566,13 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
           + (f", degree {gnfs_deg}" if gnfs_deg else "")
           + (f": E {gnfs_raw:.3e}" if gnfs_raw is not None
              else ": no polynomial in the limit"), flush=True)
+    if b and b["waited_for_poly"]:
+        more = max(0.0, b["wall_s"] - limit)
+        tail = (f"ran on for {more:.0f}s more until one appeared"
+                if gnfs_raw is not None else
+                f"ran on for {more:.0f}s more, then the search ended without one")
+        print(f"    --bench-nfs-until-poly: no polynomial within the "
+              f"{limit:g}s limit, {tail}", flush=True)
     if gnfs_bar is not None:
         if gnfs_raw is not None:
             print(f"    msieve expects E from {gnfs_bar:.3e} for a full "
@@ -612,7 +627,8 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
               flush=True)
 
     if gnfs_raw is not None and gnfs_bar is not None and gnfs_raw < gnfs_bar:
-        print(f"  note: a {limit:g}s GNFS polyselect undershoots a full "
+        spent = f"{b['wall_s']:.0f}s" if b["waited_for_poly"] else f"{limit:g}s"
+        print(f"  note: a {spent} GNFS polyselect undershoots a full "
               f"search; the GNFS side improves with --bench-nfs-time",
               flush=True)
     return 0

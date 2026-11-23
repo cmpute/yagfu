@@ -567,6 +567,79 @@ def test_bench_gnfs_polyselect_limit_salvages_best(tmp_path):
     assert "gnfs polyselect" in err and "best E 2.500e-12" in err
 
 
+MSIEVE_SLOW_STUB = """\
+#!/bin/sh
+# the bar at once, the first polynomial only after 0.8 s; stopped before
+# that it saves nothing (no best-so-far to save, like the real msieve)
+trap '[ -f poly.found ] || exit 0
+      printf "combined = 2.5e-12\\n"
+      printf "N 123\\nSKEW 3.0\\nR0 -100000\\nR1 1\\nA0 1\\nA4 5\\n" \\
+          > msieve.fb
+      exit 0' INT
+echo "expecting poly E from 9.0e-11 to > 1.2e-10"
+( sleep 0.8
+  echo "polyselect best E = 2.0e-12"
+  : > poly.found ) &
+sleep 60 &
+wait
+"""
+
+MSIEVE_BARREN_STUB = """\
+#!/bin/sh
+# a search msieve ends by itself (its coefficient range done) without a
+# polynomial
+echo "expecting poly E from 9.0e-11 to > 1.2e-10"
+sleep 0.8
+exit 0
+"""
+
+
+def _slow_msieve_ctx(tmp_path):
+    _stub_bin(tmp_path, "msieve", MSIEVE_SLOW_STUB)
+    return RunContext(device="0", devices=("0",), threads=2,
+                      bin_dir=str(tmp_path), log_file=tmp_path / "t.log",
+                      quiet=True)
+
+
+def test_bench_gnfs_polyselect_limit_cuts_polyless_search(tmp_path):
+    """Without until_poly the limit is the only stop: a search that has no
+    polynomial yet is cut at the limit and reports none."""
+    res = nfs.bench_gnfs_polyselect(10 ** 30 + 2, _slow_msieve_ctx(tmp_path),
+                                    tmp_path / "gnfs", 0.3)
+    assert res["e"] is None and res["waited_for_poly"] is False
+    assert res["wall_s"] < 0.8
+
+
+def test_bench_gnfs_polyselect_until_poly_waits_for_first(tmp_path, monkeypatch):
+    """With until_poly that same search is left alone past the limit until
+    the first polynomial shows up in the shard log, then stopped — the same
+    process throughout, so nothing swept so far is repeated — and the
+    salvaged final E is reported."""
+    monkeypatch.setattr(nfs, "BENCH_UNTIL_POLY_POLL_S", 0.05)
+    ctx = _slow_msieve_ctx(tmp_path)
+    res = nfs.bench_gnfs_polyselect(10 ** 30 + 2, ctx, tmp_path / "gnfs", 0.3,
+                                    until_poly=True)
+    assert res["waited_for_poly"] is True
+    assert res["e"] == pytest.approx(2.5e-12)
+    assert res["degree"] == 4 and res["fb"].startswith("N 123")
+    assert 0.8 <= res["wall_s"] < 5               # past the limit, not the sleep
+    assert "running on until one appears" in (tmp_path / "t.log").read_text()
+
+
+def test_bench_gnfs_polyselect_until_poly_search_ends_alone(tmp_path, monkeypatch):
+    """until_poly does not wait past a search msieve ends by itself: with no
+    polynomial in the log once the process is gone, the result is none."""
+    monkeypatch.setattr(nfs, "BENCH_UNTIL_POLY_POLL_S", 0.05)
+    _stub_bin(tmp_path, "msieve", MSIEVE_BARREN_STUB)
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(tmp_path), log_file=tmp_path / "t.log",
+                     quiet=True)
+    res = nfs.bench_gnfs_polyselect(10 ** 30 + 2, ctx, tmp_path / "gnfs", 0.3,
+                                    until_poly=True)
+    assert res["e"] is None and res["waited_for_poly"] is True
+    assert 0.8 <= res["wall_s"] < 5
+
+
 def test_bench_gnfs_polyselect_no_msieve(tmp_path, monkeypatch):
     # find_bin would fall back to a PATH msieve on a real rig; the test
     # wants the genuinely-unavailable branch

@@ -1187,8 +1187,13 @@ def _poly_running_e_from_log(wd: Path) -> float | None:
 # engine retry — so its E is exactly what the limit bought.
 # ---------------------------------------------------------------------------
 
+#: how often a --bench-nfs-until-poly search past its limit checks the shard
+#: logs for the first polynomial
+BENCH_UNTIL_POLY_POLL_S = 1.0
+
+
 def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,
-                          limit_s: float) -> dict | None:
+                          limit_s: float, until_poly: bool = False) -> dict | None:
     """A timed GNFS polyselect for --bench-nfs: msieve -np over the default
     leading-coefficient range (sharded per card), SIGINT at limit_s, then
     read the best-so-far score out of the shard logs.  Unlike
@@ -1196,10 +1201,18 @@ def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,
     limit is the only stop, so the returned E is precisely what the time
     bought.
 
-    Returns {"e", "bar", "degree", "fb", "wall_s"}: the best combined E
-    across the shards (None when nothing ran), msieve's own expectation
-    for a completed search, the winning poly's degree, the merged
-    msieve.fb text, and the wall time — or None when polyselect could not
+    With until_poly (--bench-nfs-until-poly) the limit stops the search only
+    once a shard log holds a polynomial: a search that has none when the
+    limit is up runs on until the first appears.  It is not restarted for
+    that — msieve would sweep the same leading coefficients again — only
+    left alone; the search still ends by itself if msieve finishes its
+    coefficient range (or dies) without one.
+
+    Returns {"e", "bar", "degree", "fb", "wall_s", "waited_for_poly"}: the
+    best combined E across the shards (None when nothing ran), msieve's own
+    expectation for a completed search, the winning poly's degree, the
+    merged msieve.fb text, the wall time, whether the limit was overrun
+    waiting for the first polynomial — or None when polyselect could not
     even start."""
     try:
         find_bin("msieve", ctx.bin_dir)
@@ -1214,16 +1227,32 @@ def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,
     else:
         ctx.log(f"bench: gnfs polyselect ({fmt_dur(limit_s)} limit)")
     deadline = t0 + limit_s
+    waited = False
     try:
-        while time.monotonic() < deadline:
+        while True:
             if all(p.poll() is not None for _, p in procs):
-                break               # whole range searched before the limit
+                break               # whole range searched before we stopped it
+            if time.monotonic() >= deadline:
+                # out of time: stop, unless --bench-nfs-until-poly is set
+                # and no shard has a polynomial yet
+                has_poly = any(_poly_running_e_from_log(d) is not None
+                               or _poly_e_from_log(d) is not None
+                               for d, _p in procs)
+                if not until_poly or has_poly:
+                    break
+                if not waited:
+                    ctx.log(f"bench: no GNFS polynomial after {fmt_dur(limit_s)}, "
+                            f"running on until one appears")
+                    waited = True
             try:
                 ctx.check_deadline()
             except TimeoutError:
                 break               # the run-level cap stops us too
-            time.sleep(min(POLY_POLL_S,
-                           max(0.2, deadline - time.monotonic())))
+            if waited:
+                time.sleep(BENCH_UNTIL_POLY_POLL_S)
+            else:
+                time.sleep(min(POLY_POLL_S,
+                               max(0.2, deadline - time.monotonic())))
         if any(p.poll() is None for _, p in procs):
             for _, p in procs:
                 if p.poll() is None:
@@ -1272,7 +1301,7 @@ def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,
         ctx.log(f"bench: gnfs polyselect produced no polynomial in "
                 f"{fmt_dur(wall_s)}")
     return {"e": best_e, "bar": bar, "degree": degree, "fb": fb,
-            "wall_s": wall_s}
+            "wall_s": wall_s, "waited_for_poly": waited}
 
 
 # ---------------------------------------------------------------------------
