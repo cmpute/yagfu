@@ -182,7 +182,7 @@ yagfu -f batch.txt -db --json  batch mode, JSONL output
 | `-snfs, --snfs` | off | with `-db`: when factordb suggests an SNFS polynomial for the number, factor it with SNFS after the ECM pretest (see below) |
 | `--plan {light,normal,deep}` | `normal` | ECM target depth (2/9, 4/13, 1/3 of digits) |
 | `--ecm-t-level LO-HI` | off | run the ECM pretest over exactly this t-level range (e.g. `38.0-44.0`): the ledger is credited to t38 without curves and the ladder climbs to t44, landing exactly on it — each stage runs only its overlap's share (earlier stages' cross-level credit counted); overrides `--plan` |
-| `--ecm-only` | off | never run SIQS/NFS: climb every ECM level to its full budget, then sample t65 forever until the number factors or Ctrl+C |
+| `--ecm-only` | off | never run SIQS/NFS: climb every ECM level to its full budget, then sample t65 forever until the number factors or Ctrl+C; with `--ecm-t-level LO-HI`, climb only that range and stop on HI |
 | `--no-ecm` | off | skip the ECM stage entirely: TD → rho → SIQS/NFS (rerun convenience when the pretest is known useless) |
 | `--xover N` | 100 | SIQS → NFS crossover in digits |
 | `--device N[,N…]` | 0 | CUDA device(s); a list fans GPU ECM stage 1, polyselect and NFS sieving out across the cards (ECM counts/polyselect coefficient ranges/sieve chunks split per card), SIQS runs cuda-mpqs cluster mode from c80; ECM stage 2 and Lanczos use the first device |

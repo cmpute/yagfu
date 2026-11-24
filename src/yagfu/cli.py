@@ -109,7 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="never run SIQS/NFS: keep raising the ECM "
                                "level until the number factors or Ctrl+C "
                                "(the t65 level is sampled forever once "
-                               "reached)")
+                               "reached); with --ecm-t-level LO-HI the climb "
+                               "stops on HI instead")
     ecm_mode.add_argument("--no-ecm", action="store_true",
                           help="skip the ECM stage entirely: TD -> rho -> "
                                "SIQS/NFS (handy for reruns when the ECM "
@@ -789,17 +790,17 @@ def _make_ctx(args) -> RunContext:
     _verify_devices(devices)
     ecm_t_level = None
     if args.ecm_t_level is not None:
-        if args.ecm_only or args.no_ecm:
-            ap.error("--ecm-t-level does not combine with --ecm-only/--no-ecm")
+        if args.no_ecm:
+            sys.exit("error: --ecm-t-level does not combine with --no-ecm")
         mt = re.fullmatch(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)",
                           args.ecm_t_level.strip())
         if mt is None:
-            ap.error("--ecm-t-level wants LO-HI in digits, e.g. 38.0-44.0")
+            sys.exit("error: --ecm-t-level wants LO-HI in digits, e.g. 38.0-44.0")
         lo, hi = float(mt.group(1)), float(mt.group(2))
         if hi > 65.0:
-            ap.error("--ecm-t-level: the ECM ladder tops out at t65")
+            sys.exit("error: --ecm-t-level: the ECM ladder tops out at t65")
         if lo > hi:
-            ap.error("--ecm-t-level: LO must not exceed HI")
+            sys.exit("error: --ecm-t-level: LO must not exceed HI")
         ecm_t_level = (lo, hi)
     kwargs = dict(
         bin_dir=Path(args.bin_dir) if args.bin_dir else None,

@@ -3,7 +3,7 @@ import pytest
 import pytest
 
 from yagfu.backends import nfs
-from yagfu.cli import (_db_factor_list, bench_nfs, build_parser,
+from yagfu.cli import (_db_factor_list, _make_ctx, bench_nfs, build_parser,
                        factor_with_db, load_numbers)
 from yagfu.config import RunContext
 from yagfu.engine import FactorResult, FoundFactor
@@ -15,6 +15,33 @@ def test_ecm_only_flag():
     assert args.ecm_only is True
     args = ap.parse_args(["12345"])
     assert args.ecm_only is False
+
+
+def _make_ctx_without_gpu(monkeypatch, argv):
+    """_make_ctx as the CLI runs it, minus the GPU lookup."""
+    monkeypatch.setattr("yagfu.cli.resolve_devices", lambda specs: ("0",))
+    monkeypatch.setattr("yagfu.cli._verify_devices", lambda devices: None)
+    return _make_ctx(build_parser().parse_args(argv))
+
+
+def test_ecm_t_level_combines_with_ecm_only(monkeypatch):
+    ctx = _make_ctx_without_gpu(monkeypatch,
+                                ["--ecm-only", "--ecm-t-level", "25-30", "42"])
+    assert ctx.ecm_only is True
+    assert ctx.ecm_t_level == (25.0, 30.0)
+
+
+def test_ecm_t_level_bad_ranges_are_usage_errors(monkeypatch):
+    # these checks named `ap`, a local of main(), and raised NameError
+    for argv, message in [(["--no-ecm", "--ecm-t-level", "25-30", "42"],
+                           "does not combine with --no-ecm"),
+                          (["--ecm-t-level", "abc", "42"], "wants LO-HI"),
+                          (["--ecm-t-level", "40-70", "42"], "tops out at t65"),
+                          (["--ecm-t-level", "44-38", "42"],
+                           "LO must not exceed HI")]:
+        with pytest.raises(SystemExit) as e:
+            _make_ctx_without_gpu(monkeypatch, argv)
+        assert message in str(e.value), argv
 
 
 def test_ctx_defaults():

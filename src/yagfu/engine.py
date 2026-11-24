@@ -288,9 +288,10 @@ class Engine:
         cofactor instead of starting over (the plan target deliberately
         stays the original number's — a cofactor this deep into the ladder
         is unlikely to still hold small factors).  In ecm-only mode there
-        is no target: every level runs to its full budget and the top level
-        is then sampled forever until the number factors or the user
-        interrupts.
+        without a range has no target: every level runs to its full budget
+        and the top level is then sampled forever until the number factors or
+        the user interrupts; with --ecm-t-level the range is the target and
+        the climb stops on HI.
 
         With an SNFS suggestion the pretest is priced against what the
         sieving job actually costs: the yafu GNFS-equivalent of the
@@ -313,7 +314,10 @@ class Engine:
         sz = (snfs_gnfs_equiv(snfs.scaled) if snfs is not None
               else _digits(m))
         top = NUM_LEVELS - 1
-        if ctx.ecm_only:
+        # an explicit range bounds --ecm-only too: the climb ends on HI and
+        # _factor_rec then skips the sieves as in any ecm-only run
+        endless = ctx.ecm_only and ctx.ecm_t_level is None
+        if endless:
             ctx.log(f"ecm: c{_digits(m)}, ecm-only: every level to full "
                     f"budget, then endless t65")
         elif ctx.ecm_t_level is not None:
@@ -344,15 +348,15 @@ class Engine:
         inv = 0
         while True:
             if j >= NUM_LEVELS:
-                if not ctx.ecm_only:
+                if not endless:
                     break
                 j = top                        # park at t65 forever
-            elif not ctx.ecm_only and j > 0 and (
+            elif not endless and j > 0 and (
                     ledger.depth() >= target
                     or (ctx.ecm_t_level is None
                         and sz <= 45 and target < 15.0)):
                 break  # target reached, or YAFU's trivial-pretest skip
-            if ctx.ecm_only:
+            if endless:
                 want = ledger.level_budget_left(j)
                 if want <= 0 and j == top:
                     want = ECM_ONLY_TOPUP_CURVES  # budget spent: keep going
@@ -373,12 +377,12 @@ class Engine:
                 raise FactorError(f"ecm: {r.error}")
             ledger.add(j, r.curves_done)
             rate = r.wall_s / r.curves_done if r.curves_done else 0.0
-            planned = (int(CURVES[j][j]) if ctx.ecm_only
+            planned = (int(CURVES[j][j]) if endless
                        else ledger.curves_for_target(j, target))
             remaining = planned - ledger.done_curves[j]
-            if ctx.ecm_only and ledger.level_budget_left(j) <= 0 and j == top:
+            if endless and ledger.level_budget_left(j) <= 0 and j == top:
                 status = f"(t65 sampling, {ledger.done_curves[j]:,} curves)"
-            elif ctx.ecm_only:
+            elif endless:
                 status = f"(level t{T_LEVELS[j]})"
             else:
                 status = f"(target t{target:.2f})"

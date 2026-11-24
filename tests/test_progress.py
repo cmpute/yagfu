@@ -140,6 +140,36 @@ def test_ecm_ladder_survives_split_ecm_only(monkeypatch, tmp_path):
     assert calls[1][1] == P2 * P3
 
 
+def _no_sieves(monkeypatch):
+    monkeypatch.setattr(Engine, "_sieve_stage",
+                        lambda *a, **k: pytest.fail("sieve stage entered"))
+
+
+def test_ecm_t_level_bounds_ecm_only(monkeypatch, tmp_path):
+    """--ecm-only with a range is the range and nothing more: the ledger is
+    credited to LO, the ladder runs only what HI needs and stops there
+    instead of sampling t65 forever."""
+    calls = _fake_ecm(monkeypatch, found_on_call=set())
+    _no_sieves(monkeypatch)
+    eng = Engine(RunContext(ecm_only=True, ecm_t_level=(25.0, 30.0)))
+    res = eng.factor(P2 * P3, tmp_path)
+    assert not res.complete
+    assert res.error == "ecm-only: c57 not fully factored by ECM"
+    assert [b1 for b1, _ in calls] == [250_000]
+
+
+def test_ecm_t_level_bounds_ecm_only_after_split(monkeypatch, tmp_path):
+    """A split inside the range keeps the ledger: the cofactor resumes at
+    the depth reached and no further batch runs."""
+    calls = _fake_ecm(monkeypatch, found_on_call={1})
+    _no_sieves(monkeypatch)
+    eng = Engine(RunContext(ecm_only=True, ecm_t_level=(25.0, 30.0)))
+    res = eng.factor(P1 * P2 * P3, tmp_path)
+    assert not res.complete
+    assert res.error == "ecm-only: c57 not fully factored by ECM"
+    assert [b1 for b1, _ in calls] == [250_000]
+
+
 # ------------------------------------------------ stage-1 save-file handling
 
 #: mimics gmp-ecm's -save behavior: refuses to run when the file exists,
