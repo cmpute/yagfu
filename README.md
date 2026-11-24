@@ -320,6 +320,34 @@ attempted yet: `-snfs` follows factordb's recommendation when present.
 `--snfs-job FILE` (hidden debug flag) feeds a GGNFS-format SNFS job file
 directly — same pipeline, no factordb; the job's `n:` must equal the input.
 
+### Polynomials of your own (`--poly`, `--bench-nfs`)
+
+`yagfu N --poly FILE` sieves with the polynomial in the file instead of
+selecting one: a GGNFS poly block (`n:`, `skew:`, `c0:` … `cd:`, `Y1:`,
+`Y0:` and a `type: snfs` or `type: gnfs` line) or an `msieve.fb` (GNFS).
+The file's number is the one factored, so pass exactly that number. An
+SNFS block without `difficulty:` / `scaled difficulty:` comments gets
+both by yafu's rule (`snfs_scale_difficulty`): the form's digits at the
+root, plus one for every five orders by which the special-q side's norm
+is the larger — the special-q goes on the rational side only when its
+norm exceeds the algebraic one by more than five orders. This reproduces
+factordb's raw difficulty; its scaled difficulty only roughly (of 55
+suggested polys, 7 to two decimals).
+
+`yagfu --bench-nfs N|id:FID` scores the best SNFS polynomial against a
+GNFS polyselect timed by `--bench-nfs-time` (60 s) and recommends a
+route by normalized Murphy E. `--bench-nfs-form x^n-y^n` (or `x^n+y^n`)
+names the power form N divides: its SNFS forms — Phi Polynomial Lab's
+generic rounding, cyclotomic and Aurifeuillian forms (`snfsforms.py`,
+GPL) — are then enumerated locally and ranked with whatever factordb
+suggests, so numbers factordb has no suggestion for get an SNFS side too;
+a record whose term is a `C(a,b)`, an `R(b,n)` or itself a power form
+supplies the form. `--bench-nfs-poly FILE` writes the two winners to
+`FILE.snfs.job` and `FILE.gnfs.job` (readable back with `--poly`),
+`--bench-nfs-no-gnfs` skips the GNFS side, and
+`--bench-nfs-until-poly` lets a GNFS polyselect that has found nothing
+when its time is up run on until it has a polynomial.
+
 ## Performance
 
 RTX 4090, balanced semiprimes (`benchmarks/numbers.json`, fixed seed), single

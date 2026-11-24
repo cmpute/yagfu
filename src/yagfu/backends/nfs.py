@@ -57,6 +57,7 @@ from ..params import (
     snfs_lp_structure,
     snfs_sieve_params,
 )
+from ..snfsforms import enumerate_candidates
 from . import BinNotFound, find_bin
 from .runner import (
     count_lines,
@@ -383,14 +384,208 @@ def _rank_snfs_candidates(job: SnfsJob, ctx, wd: Path) -> SnfsJob:
     return winner
 
 
+# ---------------------------------------------------------------------------
+# SNFS difficulty.  A poly carries two sizes: the raw difficulty D, the
+# digits of the homogenized algebraic form at the root, and the scaled
+# difficulty — D plus a penalty when the two sides' norms are unbalanced —
+# which the SNFS parameter tables and the ECM pretest price, and which
+# picks the special-q side.  factordb reports both for its suggestions; a
+# poly yagfu finds itself (snfsforms) or imports without them gets them by
+# YAFU's rule (factor/nfs/snfs.c: approx_norms, snfs_scale_difficulty).
+# ---------------------------------------------------------------------------
+
+#: YAFU's default ggnfs table, (digits, siever) per row.  approx_norms sizes
+#: its reference sieve area with the siever of the row nearest the
+#: difficulty — 13, YAFU's own fallback, once the difficulty is off the
+#: table, which every SNFS poly above 185 is.
+YAFU_SIEVER_TABLE = (
+    (75, 11), (80, 11), (85, 11), (90, 11), (95, 12), (100, 12), (105, 12),
+    (110, 13), (115, 13), (120, 13), (125, 13), (130, 13), (135, 14),
+    (140, 14), (145, 14), (150, 14), (155, 14), (160, 14), (165, 14),
+    (170, 14), (175, 15), (180, 15), (185, 16),
+)
+
+
+def snfs_base_difficulty(coeffs: list[int], y0: int, y1: int) -> float:
+    """log10 |F(-Y0, Y1)| for the homogenized F(a, b) = b^d f(a/b): the
+    digits of the algebraic form at the root, the raw SNFS difficulty."""
+    deg = len(coeffs) - 1
+    h = sum(c * (-y0) ** i * y1 ** (deg - i) for i, c in enumerate(coeffs))
+    if h == 0:
+        raise ValueError("degenerate SNFS polynomial: its form vanishes at the root")
+    return math.log10(abs(h))
+
+
+def snfs_norm_siever(difficulty: float) -> int:
+    """The siever whose area YAFU's approx_norms judges the norms in: that
+    of the YAFU_SIEVER_TABLE row nearest the difficulty, 13 off the table."""
+    siever = 13
+    for (d0, s0), (d1, s1) in zip(YAFU_SIEVER_TABLE, YAFU_SIEVER_TABLE[1:]):
+        if d0 < difficulty <= d1:
+            siever = s0 if difficulty - d0 < d1 - difficulty else s1
+            break
+    return max(11, siever)
+
+
+def snfs_log_norms(coeffs: list[int], y0: int, y1: int, skew: float,
+                   siever: int) -> tuple[float, float]:
+    """(log10 |F|, log10 |G|) over YAFU's reference sieve rectangle for a
+    siever: area 2^(2*siever-1) * 10^(siever-7) shared out by the skew,
+    both norms taken at its corner.
+
+    Where YAFU would only fail, this steps off the corner: a form can
+    vanish on it — z^d - c at the skew c^(1/d), the rational side at the
+    slope of its own root — and with the corner in integers the value is
+    then not 0 but whatever the truncation left, orders below the norm.
+    A value that small against the form's magnitude at the corner (less
+    than the integer corner alone moves it) is read 1% inside instead."""
+    area = 2.0 ** (2 * siever - 1) * 10.0 ** (siever - 7)
+    a = int(math.sqrt(area * skew))
+    b = int(math.sqrt(area / skew))
+    deg = len(coeffs) - 1
+
+    def at(b: int) -> tuple[int, int, int, int]:
+        terms = [c * a ** i * b ** (deg - i) for i, c in enumerate(coeffs)]
+        f = sum(terms)
+        g = y1 * a + y0 * b
+        return f, g, sum(abs(t) for t in terms), abs(y1) * a + abs(y0) * b
+
+    f, g, mag_f, mag_g = at(b)
+    corner = max(a, b, 1)
+    if abs(f) * corner <= mag_f * deg or abs(g) * corner <= mag_g:
+        f, g, _mf, _mg = at(b + max(1, b // 100))
+    return math.log10(abs(f)), math.log10(abs(g))
+
+
+def snfs_scale_difficulty(job: SnfsJob, keep_side: bool = False) -> None:
+    """Give a job its difficulty, scaled difficulty and special-q side by
+    YAFU's snfs_scale_difficulty.
+
+    A raw difficulty that is missing (<= 0) becomes the form's digits at
+    the root.  With both norms estimated over the reference rectangle, the
+    special-q goes on the algebraic side unless the rational norm exceeds
+    it by more than five orders of magnitude; the scaled difficulty is the
+    raw one plus one for every five orders by which the special-q side is
+    the larger, so a balanced poly keeps its raw difficulty.  keep_side
+    leaves the special-q side as it is."""
+    if job.difficulty <= 0:
+        job.difficulty = snfs_base_difficulty(job.coeffs, job.y0, job.y1)
+    la, lr = snfs_log_norms(job.coeffs, job.y0, job.y1, job.skew,
+                            snfs_norm_siever(job.difficulty))
+    rational = lr - 5.0 > la
+    job.scaled = job.difficulty + (lr - la if rational else max(0.0, la - lr)) / 5.0
+    if not keep_side:
+        job.side = "r" if rational else "a"
+
+
+def _snfs_dedupe(groups: list[list[SnfsJob]]) -> list[SnfsJob]:
+    """Candidates from several sources in order, the earlier source keeping
+    a poly that a later one repeats (it carries the better difficulty)."""
+    seen: set[tuple] = set()
+    out: list[SnfsJob] = []
+    for group in groups:
+        for job in group:
+            key = (tuple(job.coeffs), job.y0, job.y1)
+            if key not in seen:
+                seen.add(key)
+                out.append(job)
+    return out
+
+
+def snfs_jobs_from_form(n: int, x: int, y: int, exponent: int,
+                        sign: int) -> list[SnfsJob]:
+    """Every SNFS polynomial snfsforms finds for n dividing
+    x^exponent +/- y^exponent (Phi Polynomial Lab's generic rounding,
+    cyclotomic and Aurifeuillian forms, degrees 4 to 8 — what score-poly
+    can score), as jobs with YAFU's difficulty, scaled difficulty and
+    special-q side.  The skew is 1 until score-poly's E-optimal one
+    replaces it — (c0/cd)^(1/d) would do, but a binomial's form vanishes
+    at the reference corner under it; the scaled difficulty follows the
+    skew, so re-run snfs_scale_difficulty after a re-skew."""
+    cands, _skipped = enumerate_candidates(x, y, exponent, sign, n,
+                                           degrees=(4, 5, 6, 7, 8))
+    form = (f"{x}^{exponent}{'+' if sign > 0 else '-'}"
+            + (f"{y}^{exponent}" if y != 1 else "1"))
+    jobs: list[SnfsJob] = []
+    for c in cands:
+        job = SnfsJob(n=n, coeffs=list(c.coefficients), y0=c.y0, y1=c.y1,
+                      skew=1.0, difficulty=0.0, scaled=0.0, form=form)
+        snfs_scale_difficulty(job)
+        jobs.append(job)
+    return jobs
+
+
+def snfs_poly_text(job: SnfsJob) -> str:
+    """A poly on its own, in the GGNFS job-file shape snfs_job_from_file
+    reads back: n, skew, the coefficients, Y1 and Y0, and the difficulties
+    and special-q side as comments."""
+    deg = len(job.coeffs) - 1
+    lines = [f"n: {job.n}", f"skew: {job.skew:.6g}"]
+    lines += [f"c{i}: {job.coeffs[i]}" for i in range(deg, -1, -1)]
+    lines += [f"Y1: {job.y1}", f"Y0: {job.y0}", "type: snfs",
+              f"size: {round(job.difficulty)}"]
+    if job.form:
+        lines.append(f"# {job.form}")
+    lines.append(f"# difficulty: {job.difficulty:g}, scaled difficulty: {job.scaled:g}")
+    lines.append("# special-q on the " + ("rational" if job.side == "r" else "algebraic") + " side")
+    return "\n".join(lines) + "\n"
+
+
+def gnfs_poly_text(n: int, fb: dict[str, str]) -> str:
+    """A GNFS polynomial held as msieve.fb key/values (N, SKEW, R0, R1,
+    A0..) as a GGNFS poly block: n, skew, c0..cd, Y1, Y0, type gnfs."""
+    deg = max(int(k[1:]) for k in fb if k[0] == "A" and k[1:].isdigit())
+    lines = [f"n: {fb['N']}", f"skew: {fb['SKEW']}"]
+    lines += [f"c{i}: {fb.get('A' + str(i), '0')}" for i in range(deg, -1, -1)]
+    lines += [f"Y1: {fb['R1']}", f"Y0: {fb['R0']}", "type: gnfs"]
+    if fb.get("N") != str(n):
+        raise ValueError("the polynomial is for another number")
+    return "\n".join(lines) + "\n"
+
+
+def gnfs_fb_from_text(text: str) -> dict[str, str] | None:
+    """A GNFS polynomial as msieve.fb key/values (N, SKEW, R0, R1, A0..)
+    from a GGNFS poly block or an msieve.fb; None without one."""
+    kv: dict[str, str] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and not line.startswith("#"):
+            kv[parts[0].rstrip(":")] = parts[1]
+    if "n" in kv and "Y0" in kv and "Y1" in kv:
+        deg = max((int(k[1:]) for k in kv if re.fullmatch(r"c\d+", k)), default=-1)
+        if deg < 1:
+            return None
+        fb = {"N": kv["n"], "SKEW": kv.get("skew", "1.0"),
+              "R0": kv["Y0"], "R1": kv["Y1"]}
+        fb.update({f"A{i}": kv[f"c{i}"] for i in range(deg + 1)
+                   if kv.get(f"c{i}", "0") != "0"})
+        return fb
+    if "N" in kv and "R0" in kv and "R1" in kv:
+        return kv
+    return None
+
+
+def gnfs_fb_text(fb: dict[str, str]) -> str:
+    """msieve.fb text for a GNFS polynomial in key/value form."""
+    deg = max(int(k[1:]) for k in fb if k[0] == "A" and k[1:].isdigit())
+    lines = [f"N {fb['N']}", f"SKEW {fb['SKEW']}", f"R0 {fb['R0']}", f"R1 {fb['R1']}"]
+    lines += [f"A{i} {fb[f'A{i}']}" for i in range(deg + 1) if fb.get(f"A{i}", "0") != "0"]
+    return "\n".join(lines) + "\n"
+
+
 def snfs_job_from_file(text: str, fid: object = None) -> SnfsJob | None:
     """Parse a GGNFS-format SNFS job file (the shape factordb's snfs.php
     serves: n/type/size/skew/cN/Y0/Y1/params, comments carrying the
-    difficulty and the special-q side).  None without an n:/polynomial."""
+    difficulty and the special-q side).  None without an n:/polynomial.
+
+    A file that carries no difficulties (a bare poly, e.g. snfs_poly_text's)
+    gets them from YAFU's rule, see snfs_scale_difficulty."""
     kv: dict[str, str] = {}
     deg = -1
     difficulty = scaled = None
+    form = None
     side = "a"
+    side_given = False
     for line in text.splitlines():
         s = line.strip()
         if s.startswith("#"):
@@ -401,7 +596,11 @@ def snfs_job_from_file(text: str, fid: object = None) -> SnfsJob | None:
             if m:
                 scaled = float(m.group(1))
             if "rational side" in s:
-                side = "r"
+                side, side_given = "r", True
+            elif "algebraic side" in s:
+                side, side_given = "a", True
+            elif form is None and "difficulty" not in s:
+                form = s[1:].strip()      # "# 14^285+1": the special form
             continue
         parts = s.split()
         if len(parts) != 2:
@@ -422,11 +621,15 @@ def snfs_job_from_file(text: str, fid: object = None) -> SnfsJob | None:
                                   else float(kv["size"]) if "size" in kv
                                   else 0.0),
                       scaled=scaled if scaled is not None else 0.0,
-                      side=side, fid=fid)
+                      side=side, form=form or None, fid=fid)
     except ValueError:
         return None
-    if job.scaled <= 0:
-        job.scaled = job.difficulty
+    if job.difficulty <= 0 or job.scaled <= 0:
+        # a bare poly: what the file leaves out comes from YAFU's rule
+        try:
+            snfs_scale_difficulty(job, keep_side=side_given)
+        except ValueError:
+            return None
     return job
 
 
@@ -1523,35 +1726,37 @@ def run_nfs(n: int, ctx: RunContext, wd: Path,
                 res.poly_e = e
             ctx.log("nfs: reusing polynomial from workdir"
                     + (f" (E={res.poly_e:g})" if res.poly_e else ""))
-    if not reused and snfs is None and digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
-        fb = None
-        if (wd / "msieve.fb").exists():
-            # polyselect finished (or was budget-capped) but the job file
-            # never got written — the fb is still usable
-            cand = _parse_msieve_fb(read_log(wd / "msieve.fb"))
-            if cand.get("N") == str(n):
-                fb = cand
-                res.poly_method = "msieve -np (resumed)"
-                e = _poly_e_from_log(wd)
-                if e is not None:
-                    res.poly_e = e
-                ctx.log("nfs: reusing msieve.fb from workdir"
-                        + (f" (E={res.poly_e:g})" if res.poly_e else ""))
-        if fb is None:
-            poly = PolyselectJob(n, ctx, wd)
-            poly.wait()
-            if poly.fb is None:
-                res.error = poly.error
-                ctx.log(f"nfs: {res.error}")
-                return res
-            fb = poly.fb
-            res.poly_e, res.poly_method = poly.poly_e, poly.poly_method
-            if res.poly_e is not None:
-                ctx.log(f"nfs: poly E={res.poly_e:g} "
-                        f"(msieve -np, {fmt_dur(poly.wall_s)})")
-            else:
-                ctx.log("nfs: msieve -np poly")
-    if not reused and snfs is None and digits < NFS_MSIEVE_POLY_MIN_DIGITS:
+    fb = None
+    if not reused and snfs is None and (wd / "msieve.fb").exists():
+        # a polynomial is on disk for this number: polyselect finished (or
+        # was budget-capped) but the job file never got written, or it was
+        # imported (--poly) — usable whatever the number's size
+        cand = _parse_msieve_fb(read_log(wd / "msieve.fb"))
+        if cand.get("N") == str(n):
+            fb = cand
+            res.poly_method = "msieve -np (resumed)"
+            e = _poly_e_from_log(wd)
+            if e is not None:
+                res.poly_e = e
+            ctx.log("nfs: reusing msieve.fb from workdir"
+                    + (f" (E={res.poly_e:g})" if res.poly_e else ""))
+    if not reused and snfs is None and fb is None \
+            and digits >= NFS_MSIEVE_POLY_MIN_DIGITS:
+        poly = PolyselectJob(n, ctx, wd)
+        poly.wait()
+        if poly.fb is None:
+            res.error = poly.error
+            ctx.log(f"nfs: {res.error}")
+            return res
+        fb = poly.fb
+        res.poly_e, res.poly_method = poly.poly_e, poly.poly_method
+        if res.poly_e is not None:
+            ctx.log(f"nfs: poly E={res.poly_e:g} "
+                    f"(msieve -np, {fmt_dur(poly.wall_s)})")
+        else:
+            ctx.log("nfs: msieve -np poly")
+    if not reused and snfs is None and fb is None \
+            and digits < NFS_MSIEVE_POLY_MIN_DIGITS:
         degree = 3 if digits < 80 else 4
         coeffs, mm = base_m_poly(n, degree)
         fb = {"N": str(n),

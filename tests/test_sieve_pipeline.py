@@ -634,3 +634,35 @@ def test_parse_snfs_suggestion_filters_and_keeps_alternates():
     assert job is not None
     assert job.form == "halved Phi11"          # the bad poly was dropped
     assert job.alternates == []
+
+
+def test_imported_msieve_fb_is_sieved_with_below_the_polyselect_gate(harness, tmp_path):
+    """A number under the msieve polyselect gate gets yagfu's base-m
+    polynomial — unless an msieve.fb of its own is already in the
+    workdir, as --poly leaves one: that polynomial is sieved with
+    instead, at any size.  Regression: the base-m fallback used to skip
+    the file, and the imported polynomial was silently ignored."""
+    ctx, calls, verdicts = harness
+    verdicts.write_text(
+        "found 10 cycles, need 5000\n"
+        "%%\n"
+        "found 6000 cycles, need 5000\n")
+    imported = {"N": str(N71), "SKEW": "187111.38", "R0": "-100000",
+                "R1": "1279011327827", "A0": "3", "A4": "7"}
+    wd = tmp_path / "plain"
+    assert run_nfs(N71, ctx, wd).poly_method.startswith("base-m")
+
+    wd = tmp_path / "imported"
+    wd.mkdir()
+    (wd / "msieve.fb").write_text(nfs.gnfs_fb_text(imported))
+    res = run_nfs(N71, ctx, wd)
+    assert res.poly_method == "msieve -np (resumed)"
+    job = (wd / "c71.job").read_text()
+    for line in ("c4: 7", "c3: 0", "c2: 0", "c1: 0", "c0: 3",
+                 "Y1: 1279011327827", "Y0: -100000", "skew: 187111.38"):
+        assert f"\n{line}\n" in "\n" + job, line
+
+    wd = tmp_path / "foreign"
+    wd.mkdir()
+    (wd / "msieve.fb").write_text(nfs.gnfs_fb_text({**imported, "N": str(N71 + 2)}))
+    assert run_nfs(N71, ctx, wd).poly_method.startswith("base-m")

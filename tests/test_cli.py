@@ -1,5 +1,8 @@
 import pytest
 
+import pytest
+
+from yagfu.backends import nfs
 from yagfu.cli import (_db_factor_list, bench_nfs, build_parser,
                        factor_with_db, load_numbers)
 from yagfu.config import RunContext
@@ -426,6 +429,124 @@ def test_bench_nfs_until_poly_search_ends_without_one(tmp_path, capsys):
            "ran on for" in out
     assert "s more, then the search ended without one" in out
     assert "no usable E on either side; cannot recommend" in out
+
+
+def _stub_score_poly(bindir, murphy="3.0e-11"):
+    """score-poly stub: the same E and skew (2) for every candidate."""
+    bindir.mkdir(parents=True, exist_ok=True)
+    p = bindir / "score-poly"
+    p.write_text('#!/bin/sh\n'
+                 'echo "skew 2.0, murphyE %s, size 1.0e-15, alpha 0.5, '
+                 'rroots 2"\n' % murphy)
+    p.chmod(0o755)
+    return bindir
+
+
+C331_REC = {"fid": "1100000000000000331", "status": "C", "decimal": "331",
+            "term": "C(30,2)", "snfs": None}    # 331 = Phi_30(2) | 2^15 + 1
+
+
+def test_bench_nfs_local_forms_without_a_suggestion(tmp_path, capsys):
+    """No factordb suggestion, but the record's term names C(30,2), a
+    factor of 2^15 + 1: the SNFS side is the forms enumerated locally for
+    that power sum, scored and ranked.  With no GNFS side asked for there
+    is no recommendation; the best poly is printed and written, and reads
+    back as the same poly."""
+    bindir = _stub_score_poly(tmp_path / "bins")
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    out_poly = tmp_path / "out" / "c331"
+    args = build_parser().parse_args(
+        ["--bench-nfs", "331", "--bench-nfs-time", "1", "--bench-nfs-no-gnfs",
+         "--bench-nfs-poly", str(out_poly), "--workdir", str(tmp_path / "wd")])
+    rc = bench_nfs(args, ctx, BenchClient(dict(C331_REC)))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "polynomials enumerated locally from 2^15+1" in out
+    assert "degree-4 candidate: normalized Murphy E " in out and "(local)" in out
+    assert "gnfs: skipped (--bench-nfs-no-gnfs)" in out
+    assert "recommendation:" not in out
+    assert "ecm pretest target (plan=normal): SNFS route t" in out
+    # every candidate scores the same raw E, so the lowest degree wins on
+    # the normalization and the first of them, the cyclotomic form, stays
+    assert "best SNFS polynomial: degree 4, difficulty " in out
+    assert ", from 2^15+1" in out
+    for line in ("n: 331", "skew: 2", "c4: 1", "c3: 1", "c2: -4", "c1: -4",
+                 "c0: 1", "Y1: -2", "Y0: 5", "type: snfs"):
+        assert f"    {line}\n" in out, line
+    job = nfs.snfs_job_from_file(
+        (out_poly.parent / "c331.snfs.job").read_text())
+    assert (job.n, job.coeffs, job.y0, job.y1) == (331, [1, -4, -4, 1, 1], 5, -2)
+    assert job.difficulty > 0 and job.scaled >= job.difficulty
+    assert job.side in ("a", "r") and job.form == "2^15+1"
+    assert not (out_poly.parent / "c331.gnfs.job").exists()
+
+
+def test_bench_nfs_form_option(tmp_path, capsys):
+    """--bench-nfs-form names the power form itself (a record without a
+    term), and has to be one the number divides."""
+    bindir = _stub_score_poly(tmp_path / "bins")
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    args = build_parser().parse_args(
+        ["--bench-nfs", "331", "--bench-nfs-form", "3^7-1",
+         "--workdir", str(tmp_path / "wd")])
+    assert bench_nfs(args, ctx, BenchClient(dict(C331_REC))) == 2
+    assert "does not divide 3^7-1" in capsys.readouterr().err
+    args = build_parser().parse_args(
+        ["--bench-nfs", "331", "--bench-nfs-form", "2^15+1",
+         "--bench-nfs-no-gnfs", "--workdir", str(tmp_path / "wd")])
+    assert bench_nfs(args, ctx, BenchClient(
+        {"fid": None, "status": "C", "decimal": "331", "snfs": None})) == 0
+    assert "polynomials enumerated locally from 2^15+1" in capsys.readouterr().out
+
+
+def test_poly_option_seeds_the_nfs_workdir(tmp_path, monkeypatch):
+    """--poly with a GNFS poly: main drops it in as the nfs workdir's
+    msieve.fb, which run_nfs reuses, and factors its number; with an SNFS
+    poly the job goes to the engine and nothing is seeded.  --poly is not
+    for another number, nor together with -db."""
+    import yagfu.cli as cli
+    calls = []
+
+    class FakeEngine:
+        def __init__(self, ctx):
+            pass
+
+        def factor(self, n, wd, snfs=None):
+            fb = wd / "nfs" / "msieve.fb"
+            calls.append((n, snfs, fb.read_text() if fb.exists() else None))
+            from yagfu.engine import FactorResult
+            return FactorResult(n=n)
+
+    quiet = lambda _args: RunContext(device="0", devices=("0",), quiet=True)  # noqa: E731
+    monkeypatch.setattr(cli, "_make_ctx", quiet)
+    monkeypatch.setattr(cli, "Engine", FakeEngine)
+    fb = {"N": "123", "SKEW": "3.0", "R0": "-100000", "R1": "1", "A0": "1",
+          "A4": "5"}
+    gnfs = tmp_path / "p.gnfs.job"
+    gnfs.write_text(nfs.gnfs_poly_text(123, fb))
+    cli.main(["123", "--poly", str(gnfs), "--workdir", str(tmp_path / "wd"), "-q"])
+    assert len(calls) == 1 and calls[0][0] == 123 and calls[0][1] is None
+    assert calls[0][2] == nfs.gnfs_fb_text(fb)
+
+    snfs = tmp_path / "p.snfs.job"
+    snfs.write_text(nfs.snfs_poly_text(nfs.SnfsJob(
+        n=331, coeffs=[1, -4, -4, 1, 1], y0=5, y1=-2, skew=2.0,
+        difficulty=0.0, scaled=0.0, form="2^15+1")))
+    calls.clear()
+    cli.main(["331", "--poly", str(snfs), "--workdir", str(tmp_path / "wd2"), "-q"])
+    assert len(calls) == 1 and calls[0][0] == 331
+    assert calls[0][1].coeffs == [1, -4, -4, 1, 1] and calls[0][2] is None
+
+    calls.clear()
+    with pytest.raises(SystemExit):
+        cli.main(["124", "--poly", str(gnfs), "--workdir", str(tmp_path / "wd3")])
+    with pytest.raises(SystemExit):
+        cli.main(["123", "--poly", str(gnfs), "-db", "--workdir", str(tmp_path / "wd4")])
+    assert calls == []
 
 
 def test_bench_nfs_prime_record(tmp_path, capsys):

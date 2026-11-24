@@ -21,11 +21,20 @@ from pathlib import Path
 
 from . import __version__
 from .backends.nfs import (
+    _parse_msieve_fb,
     _score_snfs_candidates,
+    _snfs_dedupe,
     bench_gnfs_polyselect,
+    gnfs_fb_from_text,
+    gnfs_fb_text,
+    gnfs_poly_text,
     parse_snfs_suggestion,
     snfs_job_from_file,
+    snfs_jobs_from_form,
+    snfs_poly_text,
+    snfs_scale_difficulty,
 )
+from .snfsforms import form_cyclotomic, parse_form
 from .config import RunContext, cleanup_workdir, resolve_devices
 from .ecmledger import target_depth
 from .params import snfs_gnfs_equiv
@@ -144,6 +153,29 @@ def build_parser() -> argparse.ArgumentParser:
                          "polynomial once --bench-nfs-time is up, let it run "
                          "on until the first one appears instead of stopping "
                          "with none (no upper bound; Ctrl+C stops it)")
+    ap.add_argument("--bench-nfs-form", metavar="x^n-y^n", default=None,
+                    dest="bench_nfs_form",
+                    help="with --bench-nfs: the power sum or difference the "
+                         "number divides, e.g. 13^263-1 or 14^308+1. Its SNFS "
+                         "polynomials are then enumerated locally too (Phi "
+                         "Polynomial Lab's generic rounding, cyclotomic and "
+                         "Aurifeuillian forms) and ranked with whatever "
+                         "factordb suggests")
+    ap.add_argument("--bench-nfs-no-gnfs", action="store_true", default=False,
+                    dest="bench_nfs_no_gnfs",
+                    help="with --bench-nfs: no GNFS polyselect, the SNFS "
+                         "side only")
+    ap.add_argument("--bench-nfs-poly", metavar="FILE", default=None,
+                    dest="bench_nfs_poly",
+                    help="with --bench-nfs: also write the best polynomials "
+                         "to FILE.snfs.job and FILE.gnfs.job, poly blocks "
+                         "that --poly reads back")
+    ap.add_argument("--poly", metavar="FILE", default=None,
+                    help="factor with the polynomial in this file instead of "
+                         "selecting one: n, skew, c0..cd, Y1 and Y0 with a "
+                         "type snfs or type gnfs line (a --bench-nfs-poly "
+                         "file), or an msieve.fb. The number is the file's; "
+                         "pass exactly that one and nothing else")
     ap.add_argument("--poly-frac", type=float, default=0.65,
                     help="polyselect quality gate as a fraction of the E "
                          "msieve says to expect (default 0.65: msieve's bar "
@@ -500,13 +532,34 @@ def bench_nfs(args, ctx: RunContext, client: FactorDbClient) -> int:
         print("  the record is already prime; nothing to bench", flush=True)
         return 1
 
+    # the power form the number divides: given, or read off a record whose
+    # term is a cyclotomic C(a,b) (possibly divided by its known factors)
+    form = None
+    form_src = None
+    if args.bench_nfs_form is not None:
+        try:
+            form = parse_form(args.bench_nfs_form)
+        except ValueError as e:
+            print(f"error: --bench-nfs-form: {e}", file=sys.stderr)
+            return 2
+        form_src = "--bench-nfs-form"
+    elif rec:
+        form, form_src = _form_from_record(rec), "the record's term"
+    if form is not None and \
+            (pow(form[0], form[2], n) + form[3] * pow(form[1], form[2], n)) % n:
+        if args.bench_nfs_form is not None:
+            print(f"error: --bench-nfs-form: the number does not divide "
+                  f"{args.bench_nfs_form}", file=sys.stderr)
+            return 2
+        form = None
+
     if args.workdir:
         wd = Path(args.workdir).expanduser() / "bench-nfs"
     else:
         wd = Path(tempfile.mkdtemp(prefix="yagfu-bench-nfs-"))
     wd.mkdir(parents=True, exist_ok=True)
     try:
-        return _bench_nfs_report(args, ctx, client, n, fid, rec, wd)
+        return _bench_nfs_report(args, ctx, client, n, fid, rec, wd, form)
     finally:
         if args.keep:
             ctx.log(f"bench: kept {wd}")
@@ -514,34 +567,78 @@ def bench_nfs(args, ctx: RunContext, client: FactorDbClient) -> int:
             shutil.rmtree(wd, ignore_errors=True)
 
 
+def _form_from_record(rec) -> tuple[int, int, int, int] | None:
+    """The power form a factordb record's term names.  C(a,b) is Phi_a(b),
+    which divides b^a - 1 for odd a and b^(a/2) + 1 for even a; R(b,n),
+    the repunit, divides b^n - 1; a term that is itself x^n +/- 1 is
+    taken as it is.  The term may be that of a cofactor, C(a,b)/..."""
+    term = str(rec.get("term") or "")
+    m = re.match(r"\s*C\((\d+)\s*,\s*(\d+)\)", term)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return form_cyclotomic(b, a) if a >= 1 and b >= 2 else None
+    m = re.match(r"\s*R\((\d+)\s*,\s*(\d+)\)", term)
+    if m:
+        b, n = int(m.group(1)), int(m.group(2))
+        return (b, 1, n, -1) if b >= 2 and n >= 1 else None
+    try:
+        return parse_form(term)
+    except ValueError:
+        return None
+
+
+def _form_text(form: tuple[int, int, int, int]) -> str:
+    x, y, exponent, sign = form
+    return (f"{x}^{exponent}{'+' if sign > 0 else '-'}"
+            + (f"{y}^{exponent}" if y != 1 else "1"))
+
+
 def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
                       n: int, fid: str | None, rec: dict | None,
-                      wd: Path) -> int:
+                      wd: Path, form: tuple[int, int, int, int] | None) -> int:
     limit = args.bench_nfs_time
     digits = len(str(n))
 
-    # ---- SNFS side: the -snfs selection path, scored ----
+    # ---- SNFS side: factordb's suggestion and the local forms, scored ----
     snfs = parse_snfs_suggestion((rec or {}).get("snfs"), n, fid=fid) \
         if rec else None
     snfs_e = snfs_deg = None
     snfs_method = None
-    if snfs is None:
+    best_snfs = snfs
+    local = snfs_jobs_from_form(n, *form) if form is not None else []
+    local_ids = {id(j) for j in local}
+    if snfs is None and not local:
         print("  snfs: no factordb suggestion for this number", flush=True)
     else:
-        e0 = f", factordb E {snfs.e:g}" if snfs.e else ""
-        print(f"  snfs: suggestion {snfs.form or '(polynomial)'}: "
-              f"difficulty {snfs.difficulty:g}, scaled {snfs.scaled:g} "
-              f"(~ gnfs c{snfs_gnfs_equiv(snfs.scaled):g}{e0})", flush=True)
-        scored = _score_snfs_candidates([snfs, *snfs.alternates], ctx, wd)
+        if snfs is not None:
+            e0 = f", factordb E {snfs.e:g}" if snfs.e else ""
+            print(f"  snfs: suggestion {snfs.form or '(polynomial)'}: "
+                  f"difficulty {snfs.difficulty:g}, scaled {snfs.scaled:g} "
+                  f"(~ gnfs c{snfs_gnfs_equiv(snfs.scaled):g}{e0})", flush=True)
+        if local:
+            print(f"  snfs: {len(local)} polynomials enumerated locally from "
+                  f"{_form_text(form)}", flush=True)
+        scored = _score_snfs_candidates(
+            _snfs_dedupe([[snfs, *snfs.alternates] if snfs else [], local]),
+            ctx, wd)
+        # the scorer's E-optimal skew moves the norms, so a local poly's
+        # scaled difficulty and special-q side are read again at that skew
+        for cand, _ne, skew in scored:
+            if id(cand) in local_ids:
+                cand.skew = skew
+                snfs_scale_difficulty(cand)
         for cand, ne, _sk in scored:
             deg = len(cand.coeffs) - 1
             print(f"    degree-{deg} candidate: normalized Murphy E "
-                  f"{ne:.3e}", flush=True)
+                  f"{ne:.3e}"
+                  + ("  (local)" if id(cand) in local_ids else ""), flush=True)
         if scored:
-            best, snfs_e, _sk = scored[0]
+            best, snfs_e, skew = scored[0]
+            best.skew = skew
             snfs_deg = len(best.coeffs) - 1
             snfs_method = "score-poly"
-        elif snfs.e:
+            best_snfs = best
+        elif snfs is not None and snfs.e:
             # no helper: factordb's own score is in the same units as
             # score-poly's raw Murphy E — normalize it the same way
             snfs_deg = len(snfs.coeffs) - 1
@@ -554,7 +651,8 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
                   flush=True)
 
     # ---- GNFS side: a plain timed polyselect ----
-    b = bench_gnfs_polyselect(n, ctx, wd / "gnfs", limit,
+    b = None if args.bench_nfs_no_gnfs else \
+        bench_gnfs_polyselect(n, ctx, wd / "gnfs", limit,
                               until_poly=args.bench_nfs_until_poly)
     gnfs_e = gnfs_deg = None
     gnfs_raw = b["e"] if b else None
@@ -562,10 +660,13 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
     if b and gnfs_raw is not None and b["degree"]:
         gnfs_deg = b["degree"]
         gnfs_e = gnfs_raw * 1.6 ** (6 - gnfs_deg)
-    print(f"  gnfs: msieve -np polyselect, {limit:g}s limit"
-          + (f", degree {gnfs_deg}" if gnfs_deg else "")
-          + (f": E {gnfs_raw:.3e}" if gnfs_raw is not None
-             else ": no polynomial in the limit"), flush=True)
+    if args.bench_nfs_no_gnfs:
+        print("  gnfs: skipped (--bench-nfs-no-gnfs)", flush=True)
+    else:
+        print(f"  gnfs: msieve -np polyselect, {limit:g}s limit"
+              + (f", degree {gnfs_deg}" if gnfs_deg else "")
+              + (f": E {gnfs_raw:.3e}" if gnfs_raw is not None
+                 else ": no polynomial in the limit"), flush=True)
     if b and b["waited_for_poly"]:
         more = max(0.0, b["wall_s"] - limit)
         tail = (f"ran on for {more:.0f}s more until one appeared"
@@ -594,7 +695,10 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
     if snfs_e is None and gnfs_e is None:
         print("  no usable E on either side; cannot recommend", flush=True)
         return 1
-    if gnfs_e is None:
+    pick = why = None
+    if args.bench_nfs_no_gnfs:
+        pass                # the SNFS side alone: nothing to recommend against
+    elif gnfs_e is None:
         pick, why = "SNFS", "GNFS polyselect produced no polynomial"
     elif snfs_e is None:
         pick, why = "GNFS", "no SNFS polynomial available"
@@ -604,27 +708,65 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
         why = f"normalized Murphy E ratio {hi / lo:.2f}x"
         if hi / lo < 1.15:
             why += " — too close to call, either sieves fine"
-    print(f"  recommendation: {pick} ({why})", flush=True)
+    if pick is not None:
+        print(f"  recommendation: {pick} ({why})", flush=True)
 
     # what the normal flow's ECM pretest would target for each route —
-    # the ladder prices SNFS by the suggestion's scaled difficulty (the
+    # the ladder prices SNFS by the poly's scaled difficulty (the
     # gnfs-equivalent), GNFS by the digit count; Murphy E plays no role
     # in it (the poly only exists after the pretest would have run)
     plan = args.plan
-    if snfs is not None:
-        sz_s = snfs_gnfs_equiv(snfs.scaled)
+    if best_snfs is not None:
+        sz_s = snfs_gnfs_equiv(best_snfs.scaled)
         snfs_t = min(target_depth(sz_s, plan), 65.0)
         gnfs_t = min(target_depth(digits, plan), 65.0)
         print(f"  ecm pretest target (plan={plan}): "
               f"SNFS route t{snfs_t:.1f} (gnfs c{sz_s:g}), "
               f"GNFS route t{gnfs_t:.1f}", flush=True)
-        rec_t = snfs_t if pick == "SNFS" else gnfs_t
-        print(f"  {pick} route: the pretest would run to t{rec_t:.1f}",
-              flush=True)
+        if pick is not None:
+            rec_t = snfs_t if pick == "SNFS" else gnfs_t
+            print(f"  {pick} route: the pretest would run to t{rec_t:.1f}",
+                  flush=True)
     else:
         t = min(target_depth(digits, plan), 65.0)
         print(f"  ecm pretest target (plan={plan}): t{t:.1f} (c{digits})",
               flush=True)
+
+    # ---- the polynomials themselves, as --poly reads them ----
+    snfs_text = gnfs_text = None
+    if best_snfs is not None:
+        side = "rational" if best_snfs.side == "r" else "algebraic"
+        print(f"  best SNFS polynomial: degree {len(best_snfs.coeffs) - 1}, "
+              f"difficulty {best_snfs.difficulty:g}, "
+              f"scaled {best_snfs.scaled:g}, special-q on the {side} side"
+              + (f", from {best_snfs.form}" if best_snfs.form else ""),
+              flush=True)
+        snfs_text = snfs_poly_text(best_snfs)
+        for line in snfs_text.splitlines():
+            if not line.startswith("# difficulty"):
+                print(f"    {line}", flush=True)
+    gnfs_fb = None
+    if b is not None and gnfs_raw is not None and b.get("fb"):
+        gnfs_fb = _parse_msieve_fb(b["fb"])
+        if gnfs_fb.get("N") != str(n):
+            gnfs_fb = None
+    if gnfs_fb is not None:
+        print(f"  best GNFS polynomial: degree {gnfs_deg}, E {gnfs_raw:.3e} "
+              f"(msieve -np)", flush=True)
+        gnfs_text = gnfs_poly_text(n, gnfs_fb)
+        for line in gnfs_text.splitlines():
+            print(f"    {line}", flush=True)
+    if args.bench_nfs_poly is not None:
+        base = Path(args.bench_nfs_poly).expanduser()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        written = []
+        for kind, text in (("snfs", snfs_text), ("gnfs", gnfs_text)):
+            if text is not None:
+                p = base.with_name(base.name + f".{kind}.job")
+                p.write_text(text, encoding="utf-8")
+                written.append(str(p))
+        print("  polynomials written: " + (", ".join(written) if written
+                                            else "none"), flush=True)
 
     if gnfs_raw is not None and gnfs_bar is not None and gnfs_raw < gnfs_bar:
         spent = f"{b['wall_s']:.0f}s" if b["waited_for_poly"] else f"{limit:g}s"
@@ -703,12 +845,50 @@ def _bench_nfs_entry(args) -> int:
         return 130
 
 
+def _poly_from_file(path: str) -> tuple[str, "SnfsJob | None", dict | None]:
+    """--poly FILE -> ("snfs", job, None) or ("gnfs", None, msieve.fb
+    key/values).  The file is a GGNFS poly block (n, skew, c0..cd, Y1, Y0)
+    that says its type — a --bench-nfs-poly file — or an msieve.fb, which
+    is GNFS.  What a bare SNFS block leaves out comes from YAFU's rule
+    (snfs_job_from_file)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"error: cannot read {path}: {e}")
+    kind = ("gnfs" if re.search(r"^\s*type:\s*gnfs\b", text, re.M) else
+            "snfs" if re.search(r"^\s*type:\s*snfs\b", text, re.M) else None)
+    if kind is None and re.search(r"^\s*N\s+\d+\s*$", text, re.M) and \
+            re.search(r"^\s*R1\s+-?\d+\s*$", text, re.M):
+        kind = "gnfs"            # an msieve.fb: N/SKEW/R0/R1/A lines
+    fb = gnfs_fb_from_text(text)
+    if kind == "snfs":
+        job = snfs_job_from_file(text)
+        if job is None:
+            sys.exit(f"error: {path}: no SNFS polynomial found "
+                     "(need n, c0.., Y0 and Y1 lines)")
+        return "snfs", job, None
+    if kind == "gnfs":
+        if fb is None:
+            sys.exit(f"error: {path}: no GNFS polynomial found "
+                     "(need n, c0.., Y0 and Y1 lines)")
+        return "gnfs", None, fb
+    sys.exit(f"error: {path}: say type snfs or type gnfs in the file, "
+             "or give an msieve.fb")
+
+
+def _seed_gnfs_poly(nfs_wd: Path, fb: dict[str, str]) -> None:
+    """Put a --poly GNFS polynomial where run_nfs looks for one: the
+    msieve.fb of its workdir, which it reuses instead of selecting."""
+    nfs_wd.mkdir(parents=True, exist_ok=True)
+    (nfs_wd / "msieve.fb").write_text(gnfs_fb_text(fb), encoding="utf-8")
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.quiet and args.json:
         pass  # json lines still go to stdout; -q only mutes the detail line
-    if args.snfs_job and args.factor_db:
-        sys.exit("error: pass either --snfs-job or -db, not both")
+    if sum(bool(x) for x in (args.snfs_job, args.factor_db, args.poly)) > 1:
+        sys.exit("error: pass only one of --poly, --snfs-job and -db")
     if args.snfs and not args.factor_db and not args.snfs_job:
         sys.exit("error: -snfs needs -db (the SNFS suggestion comes from "
                  "factordb) or --snfs-job")
@@ -730,7 +910,24 @@ def main(argv=None) -> int:
             sys.exit(f"error: {args.snfs_job} is a job for "
                      f"{snfs_direct.n}; pass exactly that number")
 
+    gnfs_direct = None          # msieve.fb key/values of a --poly GNFS poly
+    if args.poly is not None:
+        kind, job, fb = _poly_from_file(args.poly)
+        if kind == "snfs":
+            snfs_direct = job
+            poly_n = job.n
+        else:
+            gnfs_direct = fb
+            poly_n = int(fb["N"])
+        if len(numbers) != 1 or numbers[0] != poly_n:
+            sys.exit(f"error: {args.poly} is a polynomial for {poly_n}; "
+                     "pass exactly that number")
+
     ctx = _make_ctx(args)
+    if args.poly is not None:
+        # a polynomial handed in is there to be sieved with, whatever the
+        # SIQS crossover would do with a number this size
+        ctx.xover = min(ctx.xover, len(str(poly_n)))
     engine = Engine(ctx)
 
     fdb_client = None
@@ -785,6 +982,10 @@ def main(argv=None) -> int:
                               str(wd) if not _merged_complete(n, merged) else None,
                               args.quiet)
                 else:
+                    if gnfs_direct is not None:
+                        _seed_gnfs_poly(wd / "nfs", gnfs_direct)
+                        ctx.log("nfs: using the polynomial from "
+                                f"{args.poly} (--poly)")
                     res = engine.factor(n, wd, snfs=snfs_direct)
                     ok = emit(n, res, None, None, time.monotonic() - t0,
                               args.json,
