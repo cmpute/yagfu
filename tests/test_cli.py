@@ -431,6 +431,68 @@ def test_bench_nfs_until_poly_search_ends_without_one(tmp_path, capsys):
     assert "no usable E on either side; cannot recommend" in out
 
 
+def test_bench_nfs_gnfs_polyselect_runs_the_cpu_engine(tmp_path, capsys):
+    """The bench GNFS polyselect spawns msieve with the CPU stage-1 engine
+    (the fork's GPU one dies on inputs from ~252 digits up), and a search
+    that ends without saving an msieve.fb still yields its E — the degree
+    read back from the log it streamed."""
+    bindir = tmp_path / "bins"
+    bindir.mkdir()
+    (bindir / "msieve").write_text(
+        '#!/bin/sh\n'
+        'echo "$@" > msieve.args\n'
+        'echo "polynomial degree: 6"\n'
+        'echo "polyselect best E = 2.0e-12"\n'
+        'sleep 0.1\n'                       # ends on its own, saves no fb
+        'exit 0\n')
+    (bindir / "msieve").chmod(0o755)
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    args = build_parser().parse_args(
+        ["--bench-nfs", str(BENCH_N), "--bench-nfs-time", "1", "--keep",
+         "--workdir", str(tmp_path / "wd")])
+    rc = bench_nfs(args, ctx, BenchClient({"fid": None, "status": "C",
+                                           "decimal": str(BENCH_N),
+                                           "snfs": None}))
+    out = capsys.readouterr().out
+    assert rc == 0
+    wd = tmp_path / "wd" / "bench-nfs" / "gnfs"
+    spawned = (wd / "msieve.args").read_text()
+    assert "stage1_engine=cpu_gerbicz" in spawned
+    assert "gpu_cubsort" not in spawned
+    # degree 6 from the log (no fb): normalization 1.6^0, the E unchanged
+    assert "best GNFS Murphy E: 2.000e-12 (normalized, degree 6, " \
+           "msieve -np)" in out
+    assert "recommendation: GNFS (no SNFS polynomial available)" in out
+
+
+def test_bench_nfs_gnfs_death_gets_a_diagnosis(tmp_path, capsys):
+    """msieve dying well short of the limit names its exit code and last
+    log line, instead of just 'no polynomial'."""
+    bindir = _stub_score_poly(tmp_path / "bins")
+    p = bindir / "msieve"
+    p.write_text(
+        '#!/bin/sh\n'
+        'echo "expecting poly E from 9.0e-11 to > 1.2e-10"\n'
+        'echo "corrupted double-linked list"\n'
+        'exit 1\n')
+    p.chmod(0o755)
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    args = build_parser().parse_args(
+        ["--bench-nfs", str(BENCH_N), "--bench-nfs-time", "1",
+         "--workdir", str(tmp_path / "wd")])
+    rc = bench_nfs(args, ctx, BenchClient(BENCH_REC))
+    assert rc == 0
+    log = (tmp_path / "b.log").read_text()
+    assert "msieve ended on its own, rc [1]" in log
+    assert "last log line: corrupted double-linked list" in log
+    assert "recommendation: SNFS (GNFS polyselect produced no polynomial)" \
+        in capsys.readouterr().out
+
+
 def _stub_score_poly(bindir, murphy="3.0e-11"):
     """score-poly stub: the same E and skew (2) for every candidate."""
     bindir.mkdir(parents=True, exist_ok=True)

@@ -496,6 +496,18 @@ def _stub_bin(dir_, name, body):
     return p
 
 
+def test_poly_degree_from_log(tmp_path):
+    """The degree the search named, np.log's word over msieve.log's, None
+    without either."""
+    (tmp_path / "msieve.log").write_text(
+        "commencing number field sieve polynomial selection\n"
+        "polynomial degree: 6\n")
+    assert nfs._poly_degree_from_log(tmp_path) == 6
+    (tmp_path / "np.log").write_text("polynomial degree: 5\n")
+    assert nfs._poly_degree_from_log(tmp_path) == 5
+    assert nfs._poly_degree_from_log(tmp_path / "nowhere") is None
+
+
 def test_score_snfs_candidates_orders_normalizes_and_cleans(tmp_path):
     """The shared scorer normalizes by 1.6^(6-degree) (the deg-5 raw E
     outranks the deg-6 raw E yet loses normalized), replaces the skew with

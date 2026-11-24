@@ -1382,6 +1382,20 @@ def _poly_running_e_from_log(wd: Path) -> float | None:
     return best
 
 
+def _poly_degree_from_log(wd: Path) -> int | None:
+    """The degree msieve chose for this search ("polynomial degree: X"
+    near the top of the polyselect log) — the fallback when no
+    best-so-far msieve.fb was saved to read the A-coefficients from."""
+    for name in ("np.log", "msieve.log"):
+        p = wd / name
+        if not p.exists():
+            continue
+        ms = re.findall(r"polynomial degree: (\d+)", read_log(p))
+        if ms:
+            return int(ms[-1])
+    return None
+
+
 # ---------------------------------------------------------------------------
 # --bench-nfs: score the best SNFS polynomial against a timed GNFS
 # polyselect and recommend a method, without sieving anything.  The SNFS
@@ -1398,11 +1412,14 @@ BENCH_UNTIL_POLY_POLL_S = 1.0
 def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,
                           limit_s: float, until_poly: bool = False) -> dict | None:
     """A timed GNFS polyselect for --bench-nfs: msieve -np over the default
-    leading-coefficient range (sharded per card), SIGINT at limit_s, then
-    read the best-so-far score out of the shard logs.  Unlike
-    PolyselectJob there is no quality gate and no CPU-engine retry — the
-    limit is the only stop, so the returned E is precisely what the time
-    bought.
+    leading-coefficient range in one CPU-engine process, SIGINT at
+    limit_s, then read the best-so-far score out of the log.  The CPU
+    (Gerbicz) engine and not the GPU one because the fork's gpu_cubsort
+    stage 1 dies on inputs from ~252 digits up — heap corruption, before
+    the first score is even streamed — while the CPU engine runs the same
+    inputs cleanly.  Unlike PolyselectJob there is no quality gate and no
+    engine retry — the limit is the only stop, so the returned E is
+    precisely what the time bought.
 
     With until_poly (--bench-nfs-until-poly) the limit stops the search only
     once a shard log holds a polynomial: a search that has none when the
@@ -1413,28 +1430,27 @@ def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,
 
     Returns {"e", "bar", "degree", "fb", "wall_s", "waited_for_poly"}: the
     best combined E across the shards (None when nothing ran), msieve's own
-    expectation for a completed search, the winning poly's degree, the
-    merged msieve.fb text, the wall time, whether the limit was overrun
-    waiting for the first polynomial — or None when polyselect could not
-    even start."""
+    expectation for a completed search, the winning poly's degree (read
+    from the saved msieve.fb, or from the log's chosen degree when the
+    search ended without saving one), the merged msieve.fb text, the wall
+    time, whether the limit was overrun waiting for the first polynomial —
+    or None when polyselect could not even start."""
     try:
         find_bin("msieve", ctx.bin_dir)
     except BinNotFound:
         return None
     wd.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
-    procs, info = _polyselect_shard(n, ctx, wd)
-    if info["sharded"]:
-        ctx.log(f"bench: gnfs polyselect sharded across {len(procs)} GPUs, "
-                f"{fmt_dur(limit_s)} limit")
-    else:
-        ctx.log(f"bench: gnfs polyselect ({fmt_dur(limit_s)} limit)")
+    procs, _ = _polyselect_shard(n, ctx, wd, engine="cpu_gerbicz")
+    ctx.log(f"bench: gnfs polyselect, cpu engine ({fmt_dur(limit_s)} limit)")
     deadline = t0 + limit_s
     waited = False
+    self_end = False
     try:
         while True:
             if all(p.poll() is not None for _, p in procs):
-                break               # whole range searched before we stopped it
+                self_end = True     # the search ended on its own, not by us
+                break
             if time.monotonic() >= deadline:
                 # out of time: stop, unless --bench-nfs-until-poly is set
                 # and no shard has a polynomial yet
@@ -1495,11 +1511,35 @@ def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,
         degs = [int(k[1:]) for k in kv
                 if k.startswith("A") and k[1:].isdigit()]
         degree = max(degs) if degs else None
+    if degree is None:
+        # a search that died (or was stopped) before saving its best-so-far
+        # polynomial still names its degree in the log — the E above is
+        # that degree's
+        for d, _ in procs:
+            degree = _poly_degree_from_log(d)
+            if degree is not None:
+                break
     if best_e is not None:
         ctx.log(f"bench: gnfs polyselect best E {best_e:.3e}"
                 + (f" (msieve expects {bar:.3e} from a full search)"
                    if bar is not None else "")
                 + f" after {fmt_dur(wall_s)}")
+    elif self_end:
+        # ended without our SIGINT: msieve quit on its own — either it
+        # swept the whole range without finding anything, or it died; the
+        # exit code and the last log line tell which
+        codes = sorted({p.returncode for _, p in procs})
+        tail = ""
+        for name in ("np.log", "msieve.log"):
+            p = (procs[0][0] if procs else wd) / name
+            if p.exists():
+                lines = [ln for ln in read_log(p).splitlines() if ln.strip()]
+                if lines:
+                    tail = f", last log line: {lines[-1][:200]}"
+                    break
+        ctx.log(f"bench: gnfs polyselect produced no polynomial in "
+                f"{fmt_dur(wall_s)} (msieve ended on its own, "
+                f"rc {codes}{tail})")
     else:
         ctx.log(f"bench: gnfs polyselect produced no polynomial in "
                 f"{fmt_dur(wall_s)}")

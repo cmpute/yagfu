@@ -336,7 +336,9 @@ suggested polys, 7 to two decimals).
 
 `yagfu --bench-nfs N|id:FID` scores the best SNFS polynomial against a
 GNFS polyselect timed by `--bench-nfs-time` (60 s) and recommends a
-route by normalized Murphy E. `--bench-nfs-form x^n-y^n` (or `x^n+y^n`)
+route by normalized Murphy E; the polyselect runs on msieve's CPU
+engine, because the fork's GPU stage 1 dies on inputs from ~252 digits
+up before it streams a single score. `--bench-nfs-form x^n-y^n` (or `x^n+y^n`)
 names the power form N divides: its SNFS forms — Phi Polynomial Lab's
 generic rounding, cyclotomic and Aurifeuillian forms (`snfsforms.py`,
 GPL) — are then enumerated locally and ranked with whatever factordb
