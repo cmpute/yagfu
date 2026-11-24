@@ -88,7 +88,9 @@ class FactorDbClient:
                     ra = e.headers.get("Retry-After") if e.headers else None
                     if ra:
                         try:
-                            wait = max(wait, float(ra))
+                            # a huge server-side Retry-After must not park a
+                            # batch worker for hours on one rate-limit reply
+                            wait = min(max(wait, float(ra)), 300.0)
                         except ValueError:
                             pass
                     self._log(f"fdb: HTTP {e.code}; retrying in {wait:.0f}s")

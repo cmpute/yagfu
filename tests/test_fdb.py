@@ -190,3 +190,30 @@ def test_rpc_envelope_and_headers(monkeypatch):
     assert captured["data"]["jsonrpc"] == "2.0"
     assert captured["headers"]["X-fdb-user-token"] == "T"
     assert captured["headers"]["User-agent"].startswith("yagfu/")
+
+
+def test_retry_after_is_capped(monkeypatch):
+    """A 429 with a huge server-side Retry-After sleeps at most 300 s per
+    retry: a rate-limited stretch must not park a batch worker for hours
+    on one reply."""
+    import urllib.error
+
+    import yagfu.fdb as fdb_mod
+
+    sleeps = []
+    monkeypatch.setattr(fdb_mod.time, "sleep", lambda s: sleeps.append(s))
+
+    class Headers:
+        def get(self, name, default=None):
+            return "100000" if name == "Retry-After" else default
+
+    def too_many(req, timeout=None):
+        raise urllib.error.HTTPError("u", 429, "too many requests",
+                                     Headers(), None)
+
+    monkeypatch.setattr("urllib.request.urlopen", too_many)
+    c = FactorDbClient(token=None, delay=0.0, retries=2)
+    with pytest.raises(FactorDbError):
+        c.rpc("get_number", {"target": {"expr": "6"}})
+    assert len(sleeps) == 3                 # one wait per attempt (retries + 1)
+    assert all(5.0 <= s <= 300.0 for s in sleeps)

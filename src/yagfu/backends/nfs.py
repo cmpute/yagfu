@@ -1413,6 +1413,14 @@ def _poly_degree_from_log(wd: Path) -> int | None:
 #: logs for the first polynomial
 BENCH_UNTIL_POLY_POLL_S = 1.0
 
+#: how long a --bench-nfs polyselect may take to exit after its SIGINT.
+#: The bench's E already lives in the streamed logs, so a fork that sits
+#: in its shutdown (seen on this fork's CPU engine at ~308 digits with a
+#: large OpenMP pool: no exit 10 minutes after the interrupt) is killed
+#: after a minute instead of the production 2-hour cap — that costs the
+#: best-so-far msieve.fb, which the log-read fallbacks replace.
+BENCH_SIGINT_WAIT_S = 60.0
+
 #: the GNFS polyselect side of --bench-nfs is skipped past this many digits:
 #: msieve derives its stage-1 norm bound in doubles and refuses from ~309
 #: digits up ("stage 1 bound not provided"), and GNFS there is far past any
@@ -1489,7 +1497,7 @@ def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,
                     p.send_signal(signal.SIGINT)
         for _, p in procs:
             try:
-                p.wait(timeout=NP_TIMEOUT_S)
+                p.wait(timeout=BENCH_SIGINT_WAIT_S)
             except subprocess.TimeoutExpired:
                 _term_kill(p)
     except BaseException:

@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -592,6 +593,42 @@ def test_bench_nfs_route_compares_snfs_with_the_gnfs_estimate(
     # the point is that the reason names the estimate
     assert "recommendation: GNFS (normalized Murphy E ratio " \
         in out and "(GNFS estimated from the digit count)" in out
+
+
+def test_bench_nfs_sigint_does_not_wait_forever(tmp_path, capsys, monkeypatch):
+    """A polyselect that sits in its SIGINT shutdown is killed after a
+    minute, not held for the production 2-hour cap: the bench's E is in
+    the streamed log either way."""
+    monkeypatch.setattr(nfs, "BENCH_SIGINT_WAIT_S", 1.0)
+    bindir = tmp_path / "bins"
+    bindir.mkdir()
+    p = bindir / "msieve"
+    p.write_text(
+        '#!/bin/sh\n'
+        "trap '' INT\n"                  # wedged shutdown: ignore SIGINT
+        'echo "polynomial degree: 6"\n'
+        'echo "polyselect best E = 2.0e-12"\n'
+        'sleep 30\n')
+    p.chmod(0o755)
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    args = build_parser().parse_args(
+        ["--bench-nfs", str(BENCH_N), "--bench-nfs-time", "0.3",
+         "--workdir", str(tmp_path / "wd")])
+    t0 = time.monotonic()
+    rc = bench_nfs(args, ctx, BenchClient({"fid": None, "status": "C",
+                                           "decimal": str(BENCH_N),
+                                           "snfs": None}))
+    took = time.monotonic() - t0
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert took < 20                       # the stub sleeps for 30
+    # degree from the log (the stub was killed before saving an fb)
+    assert "gnfs: msieve -np polyselect, 0.3s limit, degree 6: " \
+           "E 2.000e-12" in out
+    assert "best GNFS Murphy E: 2.000e-12 (normalized, degree 6, " \
+           "msieve -np)" in out
 
 
 def _stub_score_poly(bindir, murphy="3.0e-11"):
