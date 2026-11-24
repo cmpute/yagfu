@@ -530,6 +530,70 @@ def test_bench_nfs_gnfs_death_gets_a_diagnosis(tmp_path, capsys):
         in capsys.readouterr().out
 
 
+def test_bench_nfs_estimates_gnfs_past_msieve_bound(tmp_path, capsys):
+    """A number past msieve's own stage-1 norm bound (309+ digits) skips
+    the GNFS polyselect and compares routes against the digit-count
+    estimate instead; msieve never runs."""
+    bindir = tmp_path / "bins"
+    bindir.mkdir()
+    marker = tmp_path / "spawned"
+    p = bindir / "msieve"
+    p.write_text(f'#!/bin/sh\ntouch {marker}\n')
+    p.chmod(0o755)
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    n = 3 * 10 ** 308 + 9                       # 309 digits
+    args = build_parser().parse_args(
+        ["--bench-nfs", str(n), "--bench-nfs-time", "1",
+         "--workdir", str(tmp_path / "wd")])
+    rc = bench_nfs(args, ctx, BenchClient({"fid": None, "status": "C",
+                                           "decimal": str(n), "snfs": None}))
+    out = capsys.readouterr().out
+    est = 10.0 ** (-0.058 * 309 - 2.65136)
+    assert 2.5e-21 < est < 2.9e-21              # the site's 2.67e-21 for C309
+    assert rc == 0
+    assert not marker.exists()                  # msieve never ran
+    assert "gnfs: skipped (msieve derives no stage-1 norm bound past " \
+           "308 digits)" in out
+    assert f"gnfs: estimate from the digit count: E {est:.3e} (degree 6)" \
+        in out
+    assert "best GNFS Murphy E: unavailable" in out
+    assert "best GNFS Murphy E (estimate, from the digit count): " \
+        f"{est:.3e} (degree 6)" in out
+    # no SNFS side at all: the estimate alone still recommends
+    assert "recommendation: GNFS (no SNFS polynomial available)" in out
+
+
+def test_bench_nfs_route_compares_snfs_with_the_gnfs_estimate(
+        tmp_path, capsys, monkeypatch):
+    """Past the polyselect bound the route comparison runs on the
+    estimate, and says so — the measured-vs-estimated asymmetry must not
+    hide behind a bare ratio."""
+    import yagfu.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "GNFS_POLYSELECT_MAX_DIGITS", 2)
+    bindir = _stub_score_poly(tmp_path / "bins")
+    ctx = RunContext(device="0", devices=("0",), threads=2,
+                     bin_dir=str(bindir), log_file=tmp_path / "b.log",
+                     quiet=True)
+    args = build_parser().parse_args(
+        ["--bench-nfs", str(BENCH_N), "--bench-nfs-time", "1",
+         "--workdir", str(tmp_path / "wd")])
+    rc = bench_nfs(args, ctx, BenchClient(BENCH_REC))
+    out = capsys.readouterr().out
+    assert rc == 0
+    est = 10.0 ** (-0.058 * len(str(BENCH_N)) - 2.65136)
+    assert "gnfs: skipped (msieve derives no stage-1 norm bound past " \
+           "2 digits)" in out
+    assert f"gnfs: estimate from the digit count: E {est:.3e} (degree 6)" \
+        in out
+    # at 31 digits the estimate dwarfs the stub's SNFS E, so GNFS wins —
+    # the point is that the reason names the estimate
+    assert "recommendation: GNFS (normalized Murphy E ratio " \
+        in out and "(GNFS estimated from the digit count)" in out
+
+
 def _stub_score_poly(bindir, murphy="3.0e-11"):
     """score-poly stub: the same E and skew (2) for every candidate."""
     bindir.mkdir(parents=True, exist_ok=True)

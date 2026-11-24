@@ -939,10 +939,15 @@ def _poly_coeff_max(n: int) -> int:
     """msieve's default leading-coefficient search bound (poly_skew.c
     find_poly_core): degree picked from the size, then
     coeff_max = N^(1/(degree*(degree-1))) / 3 — same float arithmetic as
-    the C, so the values match what a plain -np prints."""
+    the C, so the values match what a plain -np prints.  Past the double
+    range (~309 digits, where msieve itself refuses to derive its bounds)
+    the same bound is built from the logarithm instead."""
     digits = math.log10(n)
     degree = 4 if digits < 108 else (5 if digits < 220 else 6)
-    return int(float(n) ** (1.0 / (degree * (degree - 1))) / 3.0)
+    k = degree * (degree - 1)
+    if digits <= 308.0:
+        return int(float(n) ** (1.0 / k) / 3.0)
+    return int(10.0 ** (digits / k) / 3.0)
 
 
 def _poly_ranges(n: int, k: int) -> list[tuple[int, int] | None]:
@@ -1407,6 +1412,12 @@ def _poly_degree_from_log(wd: Path) -> int | None:
 #: how often a --bench-nfs-until-poly search past its limit checks the shard
 #: logs for the first polynomial
 BENCH_UNTIL_POLY_POLL_S = 1.0
+
+#: the GNFS polyselect side of --bench-nfs is skipped past this many digits:
+#: msieve derives its stage-1 norm bound in doubles and refuses from ~309
+#: digits up ("stage 1 bound not provided"), and GNFS there is far past any
+#: practical size (the public record sits near 250)
+GNFS_POLYSELECT_MAX_DIGITS = 308
 
 
 def bench_gnfs_polyselect(n: int, ctx: RunContext, wd: Path,

@@ -3,6 +3,7 @@ merge, interrupt salvage, retry policy — plus the quality watcher that
 SIGINTs the search when the streamed best E meets msieve's expectation.
 No GPU, no real msieve."""
 
+import math
 import signal
 import subprocess
 import time
@@ -27,6 +28,14 @@ def test_poly_coeff_max_matches_msieve():
     assert nfs._poly_coeff_max(C137) == MSIEVE_C137_TOP
     n4 = 10 ** 94 + 3                      # 95 digits -> degree 4 -> 1/12
     assert nfs._poly_coeff_max(n4) == int(float(n4) ** (1 / 12) / 3.0)
+
+
+def test_poly_coeff_max_past_the_double_range():
+    """Past ~309 digits the bound comes from the logarithm: an int either
+    way, no float conversion of the whole number to overflow on."""
+    for n in (10 ** 309 + 7, 10 ** 400 + 3):
+        assert nfs._poly_coeff_max(n) == \
+            int(10.0 ** (math.log10(n) / 30) / 3.0)
 
 
 def test_poly_ranges_split_disjoint_covering():

@@ -24,6 +24,7 @@ from .backends.nfs import (
     _parse_msieve_fb,
     _score_snfs_candidates,
     _snfs_dedupe,
+    GNFS_POLYSELECT_MAX_DIGITS,
     bench_gnfs_polyselect,
     gnfs_fb_from_text,
     gnfs_fb_text,
@@ -484,6 +485,17 @@ def _verify_devices(devices: tuple[str, ...]) -> None:
 # --bench-nfs: SNFS vs GNFS by Murphy E, no factoring
 # ---------------------------------------------------------------------------
 
+def _gnfs_e_estimate(digits: int) -> float:
+    """A GNFS Murphy E baseline from the composite's digit count alone:
+    E ~ 10^(-0.058*D - 2.65136).  Reverse-engineered from the GNFS
+    "Murphy estimate" column of cunningham.kyleaskine.com — that site's
+    value reproduces from this curve for every one of its 617 open
+    records (C216-C445), so it is an extrapolation, not a search: no
+    polyselect ran behind it and no sieving budget is calibrated.  Used
+    only where no measurement is possible (past msieve's stage-1 bound)
+    and always labelled as an estimate."""
+    return 10.0 ** (-0.058 * digits - 2.65136)
+
 def bench_nfs(args, ctx: RunContext, client: FactorDbClient) -> int:
     """Score the best SNFS polynomial against a timed GNFS polyselect and
     recommend a method, then exit.  Nothing is factored: the SNFS side is
@@ -654,17 +666,37 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
                   flush=True)
 
     # ---- GNFS side: a plain timed polyselect ----
-    b = None if args.bench_nfs_no_gnfs else \
-        bench_gnfs_polyselect(n, ctx, wd / "gnfs", limit,
-                              until_poly=args.bench_nfs_until_poly)
+    b = None
+    gnfs_note = None
+    gnfs_est = None
+    if args.bench_nfs_no_gnfs:
+        gnfs_note = "--bench-nfs-no-gnfs"
+    elif len(str(n)) > GNFS_POLYSELECT_MAX_DIGITS:
+        # msieve derives its stage-1 norm bound in doubles, which run out
+        # at ~309 digits ("stage 1 bound not provided") — and GNFS there is
+        # far past any practical size anyway.  The route comparison still
+        # runs, against a digit-count estimate instead of a measurement.
+        gnfs_note = (f"msieve derives no stage-1 norm bound past "
+                     f"{GNFS_POLYSELECT_MAX_DIGITS} digits")
+        gnfs_est = _gnfs_e_estimate(len(str(n)))
+    else:
+        try:
+            b = bench_gnfs_polyselect(n, ctx, wd / "gnfs", limit,
+                                      until_poly=args.bench_nfs_until_poly)
+        except Exception as e:
+            # the bench must not lose its SNFS side to a GNFS-side bug
+            gnfs_note = f"polyselect failed: {e}"
     gnfs_e = gnfs_deg = None
     gnfs_raw = b["e"] if b else None
     gnfs_bar = b["bar"] if b else None
     if b and gnfs_raw is not None and b["degree"]:
         gnfs_deg = b["degree"]
         gnfs_e = gnfs_raw * 1.6 ** (6 - gnfs_deg)
-    if args.bench_nfs_no_gnfs:
-        print("  gnfs: skipped (--bench-nfs-no-gnfs)", flush=True)
+    if gnfs_note is not None:
+        print(f"  gnfs: skipped ({gnfs_note})", flush=True)
+        if gnfs_est is not None:
+            print(f"  gnfs: estimate from the digit count: E {gnfs_est:.3e} "
+                  f"(degree 6)", flush=True)
     else:
         print(f"  gnfs: msieve -np polyselect, {limit:g}s limit"
               + (f", degree {gnfs_deg}" if gnfs_deg else "")
@@ -695,20 +727,28 @@ def _bench_nfs_report(args, ctx: RunContext, client: FactorDbClient,
           + (f"{gnfs_e:.3e} (normalized, degree {gnfs_deg}, "
              f"msieve -np)" if gnfs_e is not None else "unavailable"),
           flush=True)
-    if snfs_e is None and gnfs_e is None:
+    if gnfs_e is None and gnfs_est is not None:
+        print(f"  best GNFS Murphy E (estimate, from the digit count): "
+              f"{gnfs_est:.3e} (degree 6)", flush=True)
+    # the route comparison runs on the measurement, or on the digit-count
+    # estimate where nothing can be measured
+    gnfs_cmp = gnfs_e if gnfs_e is not None else gnfs_est
+    if snfs_e is None and gnfs_cmp is None:
         print("  no usable E on either side; cannot recommend", flush=True)
         return 1
     pick = why = None
     if args.bench_nfs_no_gnfs:
         pass                # the SNFS side alone: nothing to recommend against
-    elif gnfs_e is None:
+    elif gnfs_cmp is None:
         pick, why = "SNFS", "GNFS polyselect produced no polynomial"
     elif snfs_e is None:
         pick, why = "GNFS", "no SNFS polynomial available"
     else:
-        hi, lo = max(snfs_e, gnfs_e), min(snfs_e, gnfs_e)
-        pick = "SNFS" if snfs_e >= gnfs_e else "GNFS"
+        hi, lo = max(snfs_e, gnfs_cmp), min(snfs_e, gnfs_cmp)
+        pick = "SNFS" if snfs_e >= gnfs_cmp else "GNFS"
         why = f"normalized Murphy E ratio {hi / lo:.2f}x"
+        if gnfs_e is None:
+            why += " (GNFS estimated from the digit count)"
         if hi / lo < 1.15:
             why += " — too close to call, either sieves fine"
     if pick is not None:

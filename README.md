@@ -341,7 +341,12 @@ suggested polys, 7 to two decimals).
 GNFS polyselect timed by `--bench-nfs-time` (60 s) and recommends a
 route by normalized Murphy E; the polyselect runs on msieve's CPU
 engine, because the fork's GPU stage 1 dies on inputs from ~252 digits
-up before it streams a single score. `--bench-nfs-form x^n-y^n` (or `x^n+y^n`)
+up before it streams a single score.  From 309 digits up msieve itself
+derives no stage-1 norm bound any more ("stage 1 bound not provided"),
+so the GNFS side there is a digit-count estimate —
+E ~ 10^(-0.058·D − 2.65136), the curve behind cunningham.kyleaskine.com's
+"GNFS Murphy estimate" — that the route comparison runs on, labelled as
+an estimate. `--bench-nfs-form x^n-y^n` (or `x^n+y^n`)
 names the power form N divides: its SNFS forms — Phi Polynomial Lab's
 generic rounding, cyclotomic and Aurifeuillian forms (`snfsforms.py`,
 GPL) — are then enumerated locally and ranked with whatever factordb
