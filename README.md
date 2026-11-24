@@ -227,8 +227,11 @@ $ yagfu 3946068388498480527218916724621611671856950960754487550101128852810403
 
 With `--json`, each input produces one line with `n`, `complete`, `factors`
 (each with `value`/`tag`/`proven`/`source`, plus `ecm: {b1, b2, sigma, stage}`
-provenance for ECM finds), stage timings, and counters. Exit code is 0 only if
-every input factored completely.
+provenance for ECM finds), `ecm_ledger` (after each completed batch: the modulus
+worked on and the ledger's t-level after it, as `{n, t_level}` — a curve on a
+number counts for each of its divisors, so work can be credited per composite
+across a split), stage timings, and counters. Exit code is 0 only if every input
+factored completely.
 
 Ctrl+C is handled gracefully everywhere (including inside GPU backends and
 parallel cuda-sieve bands): the partial factorization found so far is printed,

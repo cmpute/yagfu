@@ -428,6 +428,8 @@ def emit(n: int, res: FactorResult, merged: list[FoundFactor] | None,
             "elapsed_s": round(elapsed, 3),
             "stages": {k: round(v, 3) for k, v in res.stages.items()},
             "counts": res.counts,
+            "ecm_ledger": [{"n": str(m), "t_level": t}
+                           for m, t in res.ecm_ledger],
             "fdb": fdb_info,
             "error": res.error,
         }

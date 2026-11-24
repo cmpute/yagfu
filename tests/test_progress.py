@@ -16,6 +16,7 @@ from yagfu.backends.ecm import (
 )
 from yagfu.backends.runner import run_cmd_progress
 from yagfu.config import RunContext, cleanup_workdir
+from yagfu.ecmledger import EcmLedger
 from yagfu.engine import Engine
 from yagfu.fmt import fmt_count, fmt_dur
 
@@ -168,6 +169,29 @@ def test_ecm_t_level_bounds_ecm_only_after_split(monkeypatch, tmp_path):
     assert not res.complete
     assert res.error == "ecm-only: c57 not fully factored by ECM"
     assert [b1 for b1, _ in calls] == [250_000]
+
+
+def test_ecm_ledger_reads_each_batch(monkeypatch, tmp_path):
+    """Each completed batch leaves a reading — the modulus it ran on and
+    the ledger's depth after it — and the readings follow the ladder
+    across a split."""
+    _fake_ecm(monkeypatch, found_on_call={1, 2})
+    res = Engine(RunContext()).factor(P1 * P2 * P3, tmp_path)
+    assert res.complete, res.error
+    moduli, depths = zip(*res.ecm_ledger)
+    assert moduli == (P1 * P2 * P3, P2 * P3)
+    assert 15.0 < depths[0] < depths[1] < 25.0
+
+
+def test_ecm_ledger_reading_is_the_ledger_depth(monkeypatch, tmp_path):
+    """A reading is what EcmLedger itself reports after the same work."""
+    _fake_ecm(monkeypatch, found_on_call=set())
+    eng = Engine(RunContext(ecm_only=True, ecm_t_level=(25.0, 30.0)))
+    res = eng.factor(P2 * P3, tmp_path)
+    ledger = EcmLedger()
+    ledger.seed_to_depth(25.0)
+    ledger.add(3, 513)                # the one batch the range asks for
+    assert res.ecm_ledger == [(P2 * P3, ledger.depth())]
 
 
 # ------------------------------------------------ stage-1 save-file handling

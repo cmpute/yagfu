@@ -80,6 +80,8 @@ class FactorResult:
     stages: dict[str, float] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     error: str | None = None
+    ecm_ledger: list[tuple[int, float]] = field(default_factory=list)
+    # completed ECM batches as (modulus worked on, ledger depth after it)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -376,6 +378,10 @@ class Engine:
             if r.error:
                 raise FactorError(f"ecm: {r.error}")
             ledger.add(j, r.curves_done)
+            if r.curves_done:
+                # a curve on m is a curve on each of its divisors: the
+                # reading lets a caller credit the depth per composite
+                res.ecm_ledger.append((m, ledger.depth()))
             rate = r.wall_s / r.curves_done if r.curves_done else 0.0
             planned = (int(CURVES[j][j]) if endless
                        else ledger.curves_for_target(j, target))

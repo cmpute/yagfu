@@ -1,10 +1,12 @@
+import json
+
 import pytest
 
 import pytest
 
 from yagfu.backends import nfs
 from yagfu.cli import (_db_factor_list, _make_ctx, bench_nfs, build_parser,
-                       factor_with_db, load_numbers)
+                       emit, factor_with_db, load_numbers)
 from yagfu.config import RunContext
 from yagfu.engine import FactorResult, FoundFactor
 
@@ -42,6 +44,14 @@ def test_ecm_t_level_bad_ranges_are_usage_errors(monkeypatch):
         with pytest.raises(SystemExit) as e:
             _make_ctx_without_gpu(monkeypatch, argv)
         assert message in str(e.value), argv
+
+
+def test_emit_json_carries_ecm_ledger(capsys):
+    res = FactorResult(n=42, ecm_ledger=[(42, 17.5), (21, 22.0)])
+    emit(42, res, None, None, 1.0, True, None, False)
+    obj = json.loads(capsys.readouterr().out)
+    assert obj["ecm_ledger"] == [{"n": "42", "t_level": 17.5},
+                                 {"n": "21", "t_level": 22.0}]
 
 
 def test_ctx_defaults():
